@@ -18,7 +18,7 @@ LEXICON: dict[str, tuple[str, ...]] = {
     # --- price action & market structure
     "trend": ("trend", "trending", "uptrend", "downtrend", "trend following", "trend-following"),
     "momentum": ("momentum", "momentum factor", "relative strength"),
-    "mean reversion": ("mean reversion", "mean-reversion", "mean reverting", "reversion to the mean", "reverting"),
+    "mean reversion": ("mean reversion", "mean-reversion", "mean reverting", "reversion to the mean", "reverting", "oversold", "overbought", "stretched", "buy the dip", "buying the dip", "fade", "fading", "snap back"),
     "support and resistance": ("support", "resistance", "support level", "resistance level"),
     "breakout": ("breakout", "break out", "breakdown", "range break"),
     "volatility": ("volatility", "vol", "volatile", "realized volatility", "implied volatility", "vix"),
@@ -30,7 +30,7 @@ LEXICON: dict[str, tuple[str, ...]] = {
     "moving average": ("moving average", "sma", "ema", "simple moving average", "exponential moving average", "golden cross", "death cross", "crossover"),
     "rsi": ("rsi", "relative strength index", "overbought", "oversold"),
     "macd": ("macd", "moving average convergence divergence", "signal line"),
-    "bollinger bands": ("bollinger", "bollinger bands", "bollinger band"),
+    "bollinger bands": ("bollinger", "bollinger bands", "bollinger band", "lower band", "upper band", "band touch"),
     "atr": ("atr", "average true range", "true range"),
     "stochastic": ("stochastic", "stochastic oscillator"),
     "candlestick patterns": ("candlestick", "doji", "engulfing", "hammer", "shooting star"),
@@ -66,7 +66,7 @@ LEXICON: dict[str, tuple[str, ...]] = {
     "options": ("option", "options", "call option", "put option", "greeks", "delta", "gamma", "theta", "vega"),
     "futures": ("futures", "futures contract", "contango", "backwardation"),
     "forex": ("forex", "fx", "currency pair", "eurusd", "eur/usd", "gbpusd", "usdjpy", "carry trade"),
-    "crypto": ("crypto", "cryptocurrency", "bitcoin", "btc", "ethereum", "eth", "defi"),
+    "crypto": ("crypto", "cryptocurrency", "cryptocurrencies", "bitcoin", "btc", "ethereum", "eth", "defi", "altcoin", "altcoins", "btcusdt", "btcusd", "ethusdt", "ethusd", "solusdt", "usdt", "stablecoin", "perpetual", "perps", "binance", "coinbase"),
     "equities": ("equity", "equities", "stock", "stocks", "shares", "s&p 500", "sp500", "nasdaq", "etf"),
     "bonds": ("bond", "bonds", "treasury", "yield curve", "interest rate", "interest rates", "fed", "central bank"),
     "market microstructure": ("microstructure", "market microstructure", "high frequency", "high-frequency", "hft", "tick data", "order flow"),
@@ -148,6 +148,32 @@ def tokenize(text: str) -> Counter[str]:
             continue
         counts[stem(token)] += 1
     return counts
+
+
+_RSI_READING = re.compile(r"\brsi\s*(?:\(\d+\))?\s*(?:at|of|is|=|:|reads|reading|around|near)?\s*(\d{1,3})(?:\.\d+)?\b", re.IGNORECASE)
+_BAND_BELOW = re.compile(r"\b(below|under|beneath|outside)\b.{0,25}\b(lower)\b.{0,15}\bband", re.IGNORECASE)
+_BAND_ABOVE = re.compile(r"\b(above|over|outside)\b.{0,25}\b(upper)\b.{0,15}\bband", re.IGNORECASE)
+
+
+def interpret(text: str) -> str:
+    """Translate indicator readings into the words traders use for them.
+
+    "RSI at 28" means oversold; "below the lower Bollinger band" is a stretched move.
+    Recall runs this on questions so a numeric description reaches the lessons
+    written in trading vocabulary.
+    """
+    extra: list[str] = []
+    for m in _RSI_READING.finditer(text):
+        value = int(m.group(1))
+        if value <= 30:
+            extra.append("oversold mean reversion")
+        elif value >= 70:
+            extra.append("overbought momentum")
+    if _BAND_BELOW.search(text):
+        extra.append("oversold stretched move mean reversion volatility")
+    if _BAND_ABOVE.search(text):
+        extra.append("overbought breakout volatility")
+    return f"{text} {' '.join(extra)}" if extra else text
 
 
 def all_concepts() -> list[str]:

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 from bigbrain.cells import Cell, Recall, Synapse
-from bigbrain.concepts import extract_concepts, tokenize
+from bigbrain.concepts import extract_concepts, interpret, tokenize
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cells (
@@ -194,6 +194,7 @@ class Brain:
     # ----------------------------------------------------------------- recall
     def recall(self, query: str, k: int = 8, spread: bool = True, reinforce: bool = True) -> list[Recall]:
         """Return the cells most relevant to ``query``, with activation spread over synapses."""
+        query = interpret(query)
         concepts = set(extract_concepts(query))
         tokens = tokenize(query)
         scores: dict[str, float] = defaultdict(float)

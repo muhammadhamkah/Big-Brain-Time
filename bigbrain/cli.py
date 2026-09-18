@@ -115,7 +115,7 @@ def cmd_learn_market(args: argparse.Namespace) -> int:
     for t in titles:
         print(f"  + {t}")
     if not args.no_backtest:
-        results = learn_backtests(brain, symbol, bars)
+        results = learn_backtests(brain, symbol, bars, source=f"backtest on {source}")
         for r in results:
             print(f"  + {r.strategy} on {symbol}: return {r.total_return:+.1%}, Sharpe {r.sharpe:.2f}, maxDD {r.max_drawdown:.1%}, trades {r.trades}")
     print(f"Learned from {len(bars)} bars of {symbol}, grew {brain.count_synapses() - before} synapses.")
@@ -378,7 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("ask", help="ask the brain a question")
     p.add_argument("question")
-    p.add_argument("-k", type=int, default=8, help="how many cells to recall")
+    p.add_argument("-k", type=int, default=10, help="how many cells to recall")
     p.add_argument("--claude", action="store_true", help="force the Claude-powered cortex")
     p.add_argument("--offline", action="store_true", help="force the offline cortex")
     p.add_argument("--model", default="claude-opus-5")

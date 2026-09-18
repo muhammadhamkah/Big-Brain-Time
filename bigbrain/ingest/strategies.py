@@ -121,6 +121,8 @@ def backtest(name: str, symbol: str, bars: Sequence[Bar], strategy: Strategy, co
 
 
 def learn_backtests(brain: Brain, symbol: str, bars: Sequence[Bar], source: str = "backtest") -> list[BacktestResult]:
+    """Run every built-in strategy and store each result as a lesson. Pass the data's source so
+    ``Brain.forget(source=...)`` can remove a dataset together with the lessons drawn from it."""
     """Run every built-in strategy on ``bars`` and store each result as a lesson cell."""
     results = []
     for name, (fn, rationale) in STRATEGIES.items():

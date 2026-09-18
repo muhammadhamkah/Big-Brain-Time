@@ -23,6 +23,16 @@ class ConceptTests(unittest.TestCase):
         self.assertEqual(stem("loss"), "loss")
 
 
+class InterpretTests(unittest.TestCase):
+    def test_rsi_readings_and_bands_become_trading_words(self):
+        from bigbrain.concepts import interpret
+        self.assertIn("oversold", interpret("BTC RSI at 28 and below its lower Bollinger band"))
+        self.assertIn("overbought", interpret("RSI(14) is 74"))
+        self.assertIn("breakout", interpret("closed above the upper band"))
+        self.assertEqual(interpret("RSI is 55, nothing special"), "RSI is 55, nothing special")
+        self.assertIn("mean reversion", extract_concepts(interpret("RSI at 28")))
+
+
 class BrainTests(unittest.TestCase):
     def setUp(self):
         self.brain = Brain()

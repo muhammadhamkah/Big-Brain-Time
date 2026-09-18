@@ -21,6 +21,14 @@ from bigbrain.brain import Brain
 # with HTTP 406 for minutes at a time, so we alternate between them.
 ARXIV_HOSTS = ("https://export.arxiv.org/api/query", "https://arxiv.org/api/query")
 ARXIV_API = ARXIV_HOSTS[0]
+
+# arXiv's edge returns 406 to some request shapes while a bare curl succeeds.
+# The minimal profile mirrors curl; later ones are tried if the edge rejects it.
+HEADER_PROFILES: tuple[dict[str, str], ...] = (
+    {"User-Agent": "bigbrain/0.1", "Accept": "*/*"},
+    {"User-Agent": "Mozilla/5.0 (compatible; bigbrain/0.1; +https://github.com/muhammadhamkah/Big-Brain-Time)", "Accept": "*/*"},
+    {"User-Agent": "bigbrain/0.1", "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.5"},
+)
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 # Categories the brain cares about: quantitative finance, plus stat/ML finance crossovers.
@@ -72,19 +80,16 @@ def fetch(
 ) -> list[Paper]:
     """Query the arXiv API, alternating hosts and backing off on throttling.
 
-    arXiv answers 403/406/415/429 when it is shedding load, from either host,
-    for windows of several minutes. Each attempt uses the next host; after the
-    first two attempts the category filter is dropped as a further fallback in
-    case the combined query itself is being rejected.
+    arXiv answers 406 to some request shapes and, when shedding load, to every
+    client on a host for minutes at a time. Each attempt rotates the host and
+    the header profile; after the first two attempts the category filter is
+    dropped as a further fallback in case the combined query is rejected.
     """
-    headers = {
-        "User-Agent": "bigbrain/0.1 (https://github.com/muhammadhamkah/Big-Brain-Time)",
-        "Accept": "application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
-    }
     delay = 2.0
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         host = hosts[attempt % len(hosts)]
+        headers = HEADER_PROFILES[attempt % len(HEADER_PROFILES)]
         cats = categories if attempt < 2 or not search else ()
         query = build_query(search, cats) if cats else (f"all:{search}" if search else build_query(None, categories))
         params = {

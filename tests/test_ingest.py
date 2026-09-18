@@ -182,7 +182,7 @@ class PaperFetchTests(unittest.TestCase):
             result = papers.fetch("momentum", max_results=1)
         self.assertEqual(len(result), 1)
         self.assertEqual(len(calls), 2)
-        self.assertTrue(all(a and "atom" in a for a in calls), "every request must send an Accept header")
+        self.assertTrue(all(calls), "every request must send an Accept header")
 
     def test_fetch_gives_up_on_404(self):
         import io, urllib.error

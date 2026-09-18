@@ -45,10 +45,28 @@ class Paper:
     url: str
 
 
+def search_term(search: str) -> str:
+    """Turn a human search into an arXiv query term.
+
+    Multi-word searches become a quoted phrase, which arXiv's grammar requires
+    (an unquoted second word is an invalid term and the edge answers 406).
+    Anything that already looks like arXiv syntax (a field prefix or quotes)
+    is passed through unchanged, so power users can write ``ti:momentum``.
+    """
+    search = " ".join(search.split())
+    if ":" in search or search.startswith('"'):
+        return search
+    if " " in search:
+        return f'all:"{search}"'
+    return f"all:{search}"
+
+
 def build_query(search: str | None, categories: tuple[str, ...] = DEFAULT_CATEGORIES) -> str:
     cats = " OR ".join(f"cat:{c}" for c in categories)
+    if search and categories:
+        return f"({cats}) AND {search_term(search)}"
     if search:
-        return f"({cats}) AND all:{search}"
+        return search_term(search)
     return cats
 
 
@@ -91,7 +109,7 @@ def fetch(
         host = hosts[attempt % len(hosts)]
         headers = HEADER_PROFILES[attempt % len(HEADER_PROFILES)]
         cats = categories if attempt < 2 or not search else ()
-        query = build_query(search, cats) if cats else (f"all:{search}" if search else build_query(None, categories))
+        query = build_query(search, cats) if (cats or search) else build_query(None, categories)
         params = {
             "search_query": query,
             "start": 0,

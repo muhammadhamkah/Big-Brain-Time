@@ -125,6 +125,15 @@ ATOM_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 class PaperTests(unittest.TestCase):
+    def test_search_terms_are_quoted_when_multi_word(self):
+        from bigbrain.ingest.papers import build_query, search_term
+        self.assertEqual(search_term("momentum"), "all:momentum")
+        self.assertEqual(search_term("mean  reversion"), 'all:"mean reversion"')
+        self.assertEqual(search_term("ti:momentum AND au:jegadeesh"), "ti:momentum AND au:jegadeesh")
+        self.assertEqual(build_query("mean reversion", ("q-fin.TR",)), '(cat:q-fin.TR) AND all:"mean reversion"')
+        self.assertEqual(build_query("mean reversion", ()), 'all:"mean reversion"')
+        self.assertEqual(build_query(None, ("q-fin.TR", "q-fin.PM")), "cat:q-fin.TR OR cat:q-fin.PM")
+
     def test_parse_atom(self):
         papers = parse_atom(ATOM_SAMPLE)
         self.assertEqual(len(papers), 1)
@@ -216,3 +225,19 @@ class PaperFetchTests(unittest.TestCase):
         self.assertIn("cat%3A", urls[0])
         self.assertNotIn("cat%3A", urls[2], "later attempts drop the category filter")
         self.assertIn("all%3Amomentum", urls[2])
+
+    def test_multi_word_search_is_quoted_in_url(self):
+        import io, urllib.error
+        from unittest import mock
+        from bigbrain.ingest import papers
+
+        urls = []
+
+        def fake_urlopen(req, timeout):
+            urls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(urllib.error.HTTPError):
+                papers.fetch("mean reversion", retries=0)
+        self.assertIn("all%3A%22mean+reversion%22", urls[0])

@@ -59,7 +59,8 @@ bigbrain learn market                                          # or synthetic da
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
 bigbrain learn file notes/*.md
 
-bigbrain trade                                                 # the brain trades the top 100 USDT pairs, 1000 USDT, learns from every trade
+bigbrain trade                                                 # the brain trades the top 100 USDT perps, long and short, 1000 USDT, learns from every trade
+bigbrain trade --market spot --book spot                       # a second book on spot (long only), separate wallet and beliefs
 bigbrain portfolio --recent 20                                 # equity, open positions, closed trades with findings
 bigbrain beliefs                                               # what it now believes about each signal in each context
 bigbrain watch --symbol BTCUSDT --interval 15m               # one market: paper trades 4 strategies, grades signals
@@ -106,13 +107,13 @@ Run it in a terminal you leave open, or with `--once` from cron every 15 minutes
 
 ### The brain trades, and learns from every trade
 
-`bigbrain trade` runs a virtual 1,000 USDT wallet across the top 100 USDT spot pairs by volume on Binance (refreshed every candle, no key needed), on 15-minute candles. Every candle, every pair:
+`bigbrain trade` runs a virtual 1,000 USDT wallet across the top 100 USDT pairs by volume on Binance (refreshed every candle, no key needed), on 15-minute candles. The default market is **perps** (USDT-margined perpetuals): the brain trades long and short, pays 0.02% maker / 0.05% taker, and is charged the exchange's real funding rate at every 00:00, 08:00 and 16:00 UTC it holds a position through. `--market spot` runs long only at 0.1% taker. Effective leverage is always one-times, so the wallet can never be liquidated. Every candle, every pair:
 
 1. It sees which signals fired (RSI oversold, band breaks, moving-average crosses, MACD flips) and the context: trend regime (50 vs 200 average), volatility bucket relative to the pair's own history, RSI, band position.
 2. It consults its **belief table**: what that signal has done in that context in its own closed trades. Positive expectancy after costs: full size. Not enough evidence: explore at half size (a brain that never tries anything never learns). Evidence says it loses: stand aside, with an occasional small re-test so a changed market can change the belief.
-3. Size is risk-based: 1% of equity at risk to a stop 2 ATR away, capped at 25% of equity; any number of positions, limited only by cash and Binance's 10 USDT minimum. Long only (spot); bearish signals are exits, not entries.
-4. **Costs**: Binance spot VIP 0 fees (0.1% taker each way, market orders) plus slippage modelled from liquidity: half the estimated spread (about 1bp for BTC, wider for thin pairs) plus impact from the order's share of the candle's volume. Stops fill at the stop, or at the open when a candle gaps through it.
-5. **Every closed trade gets a post-mortem**, win or loss: context at entry, best and worst point while open, how it exited, gross versus net. Diagnostic lenses produce findings (fought the trend, stop inside the noise, gave back an open gain, whipsaw, thesis never developed, costs ate the edge; trend aligned, dip in uptrend, rode the move, fast resolution, near miss). Each finding updates the belief table, instructive trades become post-mortem cells the brain can recall, and every ten trades per signal it rewrites a "what I have learned" lesson.
+3. Size is risk-based: 1% of equity at risk to a stop 2 ATR away, capped at 25% of equity; any number of positions, limited only by cash and Binance's 10 USDT minimum. On perps, RSI overbought, death cross and MACD turning down are short entries; on spot they are exits only.
+4. **Costs**: VIP 0 fees for the market (perps 0.05% taker, spot 0.1% taker, each way, market orders), funding on perps, and slippage modelled from liquidity: half the estimated spread (about 1bp for BTC, wider for thin pairs) plus impact from the order's share of the candle's volume. Stops fill at the stop, or at the open when a candle gaps through it.
+5. **Every closed trade gets a post-mortem**, win or loss: context at entry, best and worst point while open, how it exited, gross versus net, funding paid or received. Diagnostic lenses produce findings (fought the trend, breakout against regime, stop inside the noise, gave back an open gain, whipsaw, thesis never developed, costs ate the edge, funding drag; trend aligned, dip in uptrend, pop in downtrend, rode the move, fast resolution, near miss, funding tailwind). Each finding updates the belief table, instructive trades become post-mortem cells the brain can recall, and every ten trades per signal it rewrites a "what I have learned" lesson.
 
 `bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that now drives its decisions; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
 

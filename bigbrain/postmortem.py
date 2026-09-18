@@ -47,6 +47,8 @@ class Trade:
     mae: float  # worst unrealized return while open
     context: dict = field(default_factory=dict)
     explore: bool = False
+    side: int = 1  # +1 long, -1 short
+    funding: float = 0.0  # funding paid (positive) or received (negative), in USDT
 
 
 # ------------------------------------------------------------------- lenses
@@ -55,15 +57,20 @@ def lenses(t: Trade) -> list[tuple[str, str]]:
     ctx, out = t.context, []
     won = t.net_ret > 0
     r = ctx.get("risk_pct") or 0.0  # stop distance as a fraction of price; one R
-    mean_rev = t.signal in ("rsi_oversold", "below_lower_band")
-    trend_sig = t.signal in ("above_upper_band", "golden_cross", "macd_bullish")
+    mean_rev = t.signal in ("rsi_oversold", "below_lower_band", "rsi_overbought")
+    trend_sig = t.signal in ("above_upper_band", "golden_cross", "macd_bullish", "death_cross", "macd_bearish")
     regime = ctx.get("regime", "unknown")
+    with_trend = (regime == "uptrend") if t.side == 1 else (regime == "downtrend")
+    against = (regime == "downtrend") if t.side == 1 else (regime == "uptrend")
+    side_word = "long" if t.side == 1 else "short"
 
     if not won:
-        if mean_rev and regime == "downtrend":
-            out.append(("fought_the_trend", "entered a mean reversion long while the 50-period average was below the 200-period: buying dips in a downtrend, where stretched moves keep stretching."))
-        if trend_sig and regime == "downtrend":
-            out.append(("breakout_against_regime", "took a bullish breakout signal inside a downtrend; breakouts against the higher-timeframe trend fail more often than they follow through."))
+        if mean_rev and against:
+            out.append(("fought_the_trend", f"entered a mean reversion {side_word} against the 50/200 regime: fading a move in the direction of the prevailing trend, where stretched moves keep stretching."))
+        if trend_sig and against:
+            out.append(("breakout_against_regime", f"took a {side_word} continuation signal against the higher-timeframe trend; such signals fail more often than they follow through."))
+        if t.funding > 0 and t.funding >= abs(t.pnl) * 0.5:
+            out.append(("funding_drag", f"paid {t.funding:.2f} USDT in funding while holding the {side_word}, a large share of the loss; holding through funding times against the crowd is a cost the signal must beat."))
         if t.exit_reason == "stop" and ctx.get("vol_bucket") == "high":
             out.append(("stop_inside_noise", f"stopped out in a high-volatility regime: the stop sat {r:.2%} away while typical bars moved {ctx.get('atr_pct', 0):.2%}, so noise alone could reach it."))
         if r and t.mfe >= r and t.exit_reason != "stop":
@@ -74,15 +81,17 @@ def lenses(t: Trade) -> list[tuple[str, str]]:
             out.append(("thesis_never_developed", "price went nowhere for the whole holding period; the setup produced neither the expected move nor a clear failure, which suggests the signal carried no information here."))
         if t.gross_ret > 0 >= t.net_ret:
             out.append(("costs_ate_the_edge", f"gross return was {t.gross_ret:+.2%} but fees and slippage ({(t.fees + t.slippage) / t.notional:.2%} of notional) turned it into a loss: the move was too small for the cost of trading it."))
-        if mean_rev and ctx.get("rsi") is not None and ctx["rsi"] > 26 and t.exit_reason == "stop":
-            out.append(("shallow_oversold", f"RSI was {ctx['rsi']:.0f} at entry, barely oversold; deeper readings mark exhaustion more reliably."))
+        if mean_rev and ctx.get("rsi") is not None and t.exit_reason == "stop" and ((t.side == 1 and ctx["rsi"] > 26) or (t.side == -1 and ctx["rsi"] < 74)):
+            out.append(("shallow_extreme", f"RSI was {ctx['rsi']:.0f} at entry, barely past the threshold; deeper readings mark exhaustion more reliably."))
         if not out:
             out.append(("unexplained_loss", "no single lens explains this loss; it is within the normal variance of a positive-expectancy setup, if the setup has one."))
     else:
-        if mean_rev and regime == "uptrend":
-            out.append(("dip_in_uptrend", "bought an oversold dip inside an uptrend, where mean reversion has the trend on its side."))
-        if trend_sig and regime == "uptrend":
-            out.append(("trend_aligned", "the breakout followed the higher-timeframe trend, the setting where continuation is most likely."))
+        if mean_rev and with_trend:
+            out.append(("dip_in_uptrend" if t.side == 1 else "pop_in_downtrend", f"faded a stretched move back toward the prevailing trend, where mean reversion has the trend on its side."))
+        if trend_sig and with_trend:
+            out.append(("trend_aligned", f"the {side_word} continuation signal followed the higher-timeframe trend, the setting where continuation is most likely."))
+        if t.funding < 0 and abs(t.funding) >= abs(t.pnl) * 0.3:
+            out.append(("funding_tailwind", f"received {abs(t.funding):.2f} USDT in funding, a meaningful part of the profit: the crowd was paying to be on the other side."))
         if r and t.mfe > 2 * r and t.net_ret > 1.5 * r:
             out.append(("rode_the_move", f"held through a {t.mfe:.2%} favourable excursion and kept most of it; the exit rule let the winner run."))
         if t.bars_held <= 3:
@@ -139,16 +148,18 @@ def record(brain: Brain, t: Trade, findings: list[tuple[str, str]]) -> None:
         (t.book, t.symbol, t.signal, t.entry_time, t.entry_price, t.exit_time, t.exit_price, t.exit_reason, t.qty, t.notional, t.gross_ret, t.net_ret,
          t.pnl, t.fees, t.slippage, t.bars_held, t.mfe, t.mae, json.dumps(t.context), json.dumps([tag for tag, _ in findings]), int(t.explore)),
     )
+    brain.db.execute("UPDATE trades SET side = ?, funding = ? WHERE id = last_insert_rowid()", (t.side, t.funding))
 
 
 def narrative(t: Trade, findings: list[tuple[str, str]]) -> str:
     ctx = t.context
     verdict = "profit" if t.net_ret > 0 else "loss"
     head = (
-        f"{t.symbol} {t.signal.replace('_', ' ')} entered {t.entry_time} UTC at {t.entry_price:.6g} and closed {t.exit_time} at {t.exit_price:.6g} "
+        f"{t.symbol} {'long' if t.side == 1 else 'short'} on {t.signal.replace('_', ' ')} entered {t.entry_time} UTC at {t.entry_price:.6g} and closed {t.exit_time} at {t.exit_price:.6g} "
         f"by {t.exit_reason} after {t.bars_held} bars: a {verdict} of {t.net_ret:+.2%} net ({t.gross_ret:+.2%} gross, {t.pnl:+.2f} USDT on {t.notional:.0f} notional). "
         f"Context at entry: {ctx.get('regime', 'unknown')} regime, {ctx.get('vol_bucket', 'mid')} volatility ({ctx.get('vol20', 0):.0%} annualized), "
         f"RSI {ctx.get('rsi', 0):.0f}, stop {ctx.get('risk_pct', 0):.2%} away. While open the trade reached {t.mfe:+.2%} at best and {t.mae:+.2%} at worst."
+        + (f" Funding {'paid' if t.funding > 0 else 'received'}: {abs(t.funding):.2f} USDT." if t.funding else "")
     )
     why = " ".join(f"Finding ({tag.replace('_', ' ')}): {text}" for tag, text in findings)
     lesson = "Lesson: " + ("avoid this signal in this context, or demand a deeper reading and a wider stop." if t.net_ret <= 0 else "this signal in this context is worth taking again; keep the exit rule that captured it.")
@@ -160,7 +171,7 @@ def learn_postmortem(brain: Brain, t: Trade, findings: list[tuple[str, str]]) ->
     notable = abs(t.net_ret) >= NOTABLE_RETURN or t.exit_reason == "stop" or any(tag != "clean_win" and tag != "unexplained_loss" for tag, _ in findings)
     if not notable:
         return None
-    title = f"{t.symbol}: {'win' if t.net_ret > 0 else 'loss'} on {t.signal.replace('_', ' ')} {t.entry_time}"
+    title = f"{t.symbol}: {'win' if t.net_ret > 0 else 'loss'} on {'long' if t.side == 1 else 'short'} {t.signal.replace('_', ' ')} {t.entry_time}"
     cell, _ = brain.learn(
         "postmortem", title, narrative(t, findings), source=f"trade:{t.book}",
         extra_concepts=[t.symbol.lower(), "paper trading", "post-mortem", t.context.get("regime", "unknown")] + [tag.replace("_", " ") for tag, _ in findings],

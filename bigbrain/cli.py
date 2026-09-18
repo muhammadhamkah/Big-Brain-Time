@@ -322,10 +322,11 @@ def cmd_trade(args: argparse.Namespace) -> int:
     from bigbrain.trader import Trader
 
     brain = open_brain(args.db)
-    t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top)
+    t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top, market=args.market)
     if not args.once:
-        print(f"Trading book '{args.book}': top {args.top} USDT pairs on {args.interval} candles, wallet {t.wallet.start:.0f} USDT, "
-              f"Binance VIP0 fees plus slippage, long only, every closed trade analysed. Ctrl-C to stop.")
+        sides = "long and short, real funding rates charged" if t.market == "perps" else "long only"
+        print(f"Trading book '{args.book}' on Binance {t.market}: top {args.top} USDT pairs on {args.interval} candles, wallet {t.wallet.start:.0f} USDT, "
+              f"VIP0 fees plus slippage, {sides}, every closed trade analysed. Ctrl-C to stop.")
     try:
         t.run(once=args.once)
     except KeyboardInterrupt:
@@ -342,15 +343,16 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         return 0
     t = Trader(brain, book=args.book)
     r = t.report()
-    print(f"book {args.book}: equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}")
+    print(f"book {args.book} ({r['market']}): equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}")
     if r["open"]:
         print("open positions:")
         for p in r["open"]:
-            print(f"  {p['symbol']:12} {p['signal']:18} in @ {p['entry']:.6g}  now {p['mark']:.6g} ({p['unrealized']:+.2%})  {p['bars']} bars  stop {p['stop']:.6g}{'  exploring' if p['explore'] else ''}")
+            fund = f"  funding {p['funding']:+.2f}" if p["funding"] else ""
+            print(f"  {p['side']:5} {p['symbol']:12} {p['signal']:18} in @ {p['entry']:.6g}  now {p['mark']:.6g} ({p['unrealized']:+.2%})  {p['bars']} bars  stop {p['stop']:.6g}{fund}{'  exploring' if p['explore'] else ''}")
     if r["by_signal"]:
         print("closed trades by signal:")
         for b in r["by_signal"]:
-            print(f"  {b['signal']:18} trades {b['trades']:4}  win {b['win_rate']:.0%}  avg {b['avg_ret']:+.2%}  pnl {b['pnl']:+.2f}  fees {b['fees']:.2f}  slippage {b['slippage']:.2f}")
+            print(f"  {b['signal']:18} trades {b['trades']:4}  win {b['win_rate']:.0%}  avg {b['avg_ret']:+.2%}  pnl {b['pnl']:+.2f}  fees {b['fees']:.2f}  slippage {b['slippage']:.2f}  funding {b['funding']:+.2f}")
     if args.recent:
         print("recent closed trades:")
         for row in brain.db.execute(
@@ -540,6 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=100, help="how many USDT pairs by volume")
     p.add_argument("--interval", default="15m")
     p.add_argument("--wallet", type=float, default=1000.0, help="starting USDT (only used when the book is new)")
+    p.add_argument("--market", choices=["perps", "spot"], default="perps", help="perps: long and short with funding (default); spot: long only")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_trade)
 

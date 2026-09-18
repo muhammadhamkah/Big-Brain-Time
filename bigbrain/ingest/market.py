@@ -125,6 +125,38 @@ def fetch_binance(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 10
     raise RuntimeError(f"Binance did not return candles for {symbol}: {last}")
 
 
+# ---------------------------------------------------------- Binance perps
+FUTURES_HOST = "https://fapi.binance.com"
+
+
+def fetch_binance_futures(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 1000) -> list[Bar]:
+    """USDT-margined perpetual candles (public)."""
+    if interval not in BINANCE_INTERVALS:
+        raise ValueError(f"interval must be one of {BINANCE_INTERVALS}")
+    url = f"{FUTURES_HOST}/fapi/v1/klines?symbol={symbol.upper()}&interval={interval}&limit={min(limit, 1500)}"
+    return parse_binance_klines(json.loads(http_get(url, headers={"Accept": "application/json"}).decode("utf-8")))
+
+
+def top_usdt_perps(n: int = 100) -> list[dict]:
+    tickers = json.loads(http_get(f"{FUTURES_HOST}/fapi/v1/ticker/24hr", headers={"Accept": "application/json"}).decode("utf-8"))
+    return parse_top_usdt_pairs(tickers, n)
+
+
+def parse_funding(payload: list) -> dict[str, dict]:
+    """{symbol: {"rate": last funding rate, "next": next funding time (ms)}} from /fapi/v1/premiumIndex."""
+    out = {}
+    for row in payload:
+        try:
+            out[row["symbol"]] = {"rate": float(row.get("lastFundingRate") or 0.0), "next": int(row.get("nextFundingTime") or 0)}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def funding_rates() -> dict[str, dict]:
+    return parse_funding(json.loads(http_get(f"{FUTURES_HOST}/fapi/v1/premiumIndex", headers={"Accept": "application/json"}).decode("utf-8")))
+
+
 def fetch_stooq(symbol: str) -> list[Bar]:
     """Free daily history from Stooq, e.g. 'aapl.us', 'spy.us', '^spx', 'btc.v'."""
     url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i=d"

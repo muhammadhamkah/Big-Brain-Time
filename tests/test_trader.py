@@ -71,7 +71,7 @@ class LensTests(unittest.TestCase):
         tags = [t for t, _ in pm.lenses(self._trade())]
         self.assertIn("fought_the_trend", tags)
         self.assertIn("stop_inside_noise", tags)
-        self.assertIn("shallow_oversold", tags)
+        self.assertIn("shallow_extreme", tags)
 
     def test_costs_and_giveback(self):
         t = self._trade(exit_reason="time", gross_ret=0.0005, net_ret=-0.0015, mfe=0.04, mae=-0.002, context={"regime": "uptrend", "vol_bucket": "mid", "risk_pct": 0.03})
@@ -97,7 +97,7 @@ class TraderTests(unittest.TestCase):
                 b.quote_volume = b.volume * b.close
 
     def test_replay_trades_costs_and_learns(self):
-        t = Trader(self.brain, book="test", interval="15m", wallet=1000.0, top=5)
+        t = Trader(self.brain, book="test", interval="15m", wallet=1000.0, top=5, market="spot")
         buys = sells = 0
         for end in range(250, 900, 1):
             r = t.tick(market=market_at(self.series, end), universe=universe(self.symbols))
@@ -131,18 +131,18 @@ class TraderTests(unittest.TestCase):
             self.assertTrue(any("loss on" in h or "win on" in h for h in hits), hits)
 
     def test_state_persists_and_ticks_are_idempotent(self):
-        t = Trader(self.brain, book="persist", interval="15m", wallet=500.0, top=5)
+        t = Trader(self.brain, book="persist", interval="15m", wallet=500.0, top=5, market="spot")
         for end in range(250, 400):
             t.tick(market=market_at(self.series, end), universe=universe(self.symbols))
         before = t.report()
         again = t.tick(market=market_at(self.series, 399), universe=universe(self.symbols))
         self.assertEqual(again["events"], [])
-        t2 = Trader(self.brain, book="persist", interval="15m", wallet=999.0, top=5)  # wallet arg ignored for an existing book
+        t2 = Trader(self.brain, book="persist", interval="15m", wallet=999.0, top=5, market="spot")  # wallet arg ignored for an existing book
         self.assertAlmostEqual(t2.wallet.start, 500.0)
         self.assertAlmostEqual(t2.report()["equity"], before["equity"], places=4)
 
     def test_belief_blocks_losing_context(self):
-        t = Trader(self.brain, book="blocked", interval="15m", wallet=1000.0, top=5)
+        t = Trader(self.brain, book="blocked", interval="15m", wallet=1000.0, top=5, market="spot")
         for i in range(12):
             pm.update_belief(self.brain, pm.Trade("blocked", "X", "rsi_oversold", f"t{i}", 1, "u", 1, "stop", 1, 100, -0.02, -0.022, -2.2, 0.2, 0, 3, 0.001, -0.02, {"regime": "downtrend", "vol_bucket": "mid"}))
         skips = []
@@ -153,14 +153,77 @@ class TraderTests(unittest.TestCase):
         self.assertTrue(skips, "the brain should decline rsi oversold entries in a context it believes loses")
         self.assertIn("expectancy", skips[0]["why"])
 
+    def test_spot_never_shorts(self):
+        t = Trader(self.brain, book="spotonly", interval="15m", wallet=1000.0, top=5, market="spot")
+        for end in range(250, 700):
+            for e in t.tick(market=market_at(self.series, end), universe=universe(self.symbols))["events"]:
+                self.assertNotEqual(e["action"], "short")
+        self.assertEqual(self.brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'spotonly' AND side = -1").fetchone()[0], 0)
+
     def test_min_notional_respected(self):
         self.assertEqual(MIN_NOTIONAL, 10.0)
-        t = Trader(self.brain, book="tiny", interval="15m", wallet=12.0, top=5)
+        t = Trader(self.brain, book="tiny", interval="15m", wallet=12.0, top=5, market="spot")
         for end in range(250, 500):
             t.tick(market=market_at(self.series, end), universe=universe(self.symbols))
         rows = self.brain.db.execute("SELECT MIN(notional) FROM trades WHERE book = 'tiny'").fetchone()[0]
         if rows is not None:
             self.assertGreaterEqual(rows, MIN_NOTIONAL - 1e-9)
+
+
+def stamped(bars, start="2026-09-01 00:00"):
+    """Give synthetic bars real 15-minute UTC timestamps so funding times occur."""
+    from datetime import datetime, timedelta
+    t0 = datetime.strptime(start, "%Y-%m-%d %H:%M")
+    for i, b in enumerate(bars):
+        b.date = (t0 + timedelta(minutes=15 * i)).strftime("%Y-%m-%d %H:%M")
+    return bars
+
+
+class PerpsTests(unittest.TestCase):
+    def setUp(self):
+        self.brain = Brain()
+        self.symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+        self.series = {s: stamped(synthetic(s, n=900, seed=10 + i, vol=0.02)) for i, s in enumerate(self.symbols)}
+        for bars in self.series.values():
+            for b in bars:
+                b.quote_volume = b.volume * b.close
+        self.rates = {s: {"rate": 0.0005, "next": 0} for s in self.symbols}  # longs pay 5bp every 8h
+
+    def test_perps_trade_both_sides_and_pay_funding(self):
+        t = Trader(self.brain, book="perps", interval="15m", wallet=1000.0, top=3, market="perps", fetch_funding=lambda: self.rates)
+        actions = []
+        for end in range(250, 900):
+            r = t.tick(market=market_at(self.series, end), universe=universe(self.symbols))
+            actions += [e["action"] for e in r["events"]]
+            self.assertAlmostEqual(r["equity"], t.wallet.equity(), places=6)
+        self.assertIn("short", actions)
+        self.assertIn("cover", actions)
+        self.assertIn("buy", actions)
+        rows = self.brain.db.execute("SELECT side, funding, fees, notional, net_ret, pnl, bars_held FROM trades WHERE book = 'perps'").fetchall()
+        self.assertTrue(any(r["side"] == -1 for r in rows))
+        # futures taker fee is 0.05% per side
+        for r in rows:
+            self.assertAlmostEqual(r["fees"] / r["notional"], 0.001, delta=0.0003)
+        # with a positive rate, longs held through a funding time paid and shorts received
+        long_funded = [r for r in rows if r["side"] == 1 and r["funding"] != 0]
+        short_funded = [r for r in rows if r["side"] == -1 and r["funding"] != 0]
+        self.assertTrue(long_funded or short_funded, "some trade should have been held through 00:00/08:00/16:00 UTC")
+        self.assertTrue(all(r["funding"] > 0 for r in long_funded))
+        self.assertTrue(all(r["funding"] < 0 for r in short_funded))
+        # post-mortems name the side and the book keeps its market when reopened
+        self.assertTrue(any(" short " in c.title for c in self.brain.cells(kind="postmortem")))
+        self.assertEqual(Trader(self.brain, book="perps", market="spot").market, "perps")
+
+    def test_short_accounting(self):
+        from bigbrain.trader import Position, Wallet
+        from dataclasses import asdict
+        w = Wallet(cash=900.0, start=1000.0, peak=1000.0)
+        pos = Position(symbol="X", signal="rsi_overbought", entry_time="a", entry_price=100.0, qty=1.0, notional=100.0, stop=104.0, max_bars=10,
+                       exit_rule="rsi_cooled", context={}, explore=False, mark=95.0, side=-1)
+        w.positions[pos.key] = asdict(pos)
+        self.assertAlmostEqual(w.equity(), 900.0 + 100.0 + 5.0)  # short is up 5 USDT
+        w.positions[pos.key]["mark"] = 103.0
+        self.assertAlmostEqual(w.equity(), 900.0 + 100.0 - 3.0)
 
 
 if __name__ == "__main__":

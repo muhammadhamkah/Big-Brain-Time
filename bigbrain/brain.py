@@ -164,6 +164,11 @@ class Brain:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        for stmt in ("ALTER TABLE trades ADD COLUMN side INTEGER NOT NULL DEFAULT 1", "ALTER TABLE trades ADD COLUMN funding REAL NOT NULL DEFAULT 0"):
+            try:
+                self.db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self.db.commit()
 
     # ------------------------------------------------------------------ learn

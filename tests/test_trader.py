@@ -219,11 +219,57 @@ class PerpsTests(unittest.TestCase):
         from dataclasses import asdict
         w = Wallet(cash=900.0, start=1000.0, peak=1000.0)
         pos = Position(symbol="X", signal="rsi_overbought", entry_time="a", entry_price=100.0, qty=1.0, notional=100.0, stop=104.0, max_bars=10,
-                       exit_rule="rsi_cooled", context={}, explore=False, mark=95.0, side=-1)
+                       exit_rule="rsi_cooled", context={"risk_pct": 0.04}, explore=False, mark=95.0, side=-1, margin=100.0 / 3)
+        w.cash = 1000.0 - pos.margin
         w.positions[pos.key] = asdict(pos)
-        self.assertAlmostEqual(w.equity(), 900.0 + 100.0 + 5.0)  # short is up 5 USDT
+        self.assertAlmostEqual(w.equity(), 1000.0 + 5.0)  # short is up 5 USDT
         w.positions[pos.key]["mark"] = 103.0
-        self.assertAlmostEqual(w.equity(), 900.0 + 100.0 - 3.0)
+        self.assertAlmostEqual(w.equity(), 1000.0 - 3.0)
+        self.assertAlmostEqual(w.open_risk(), 4.0)
+        self.assertAlmostEqual(w.gross_notional(), 103.0)
+
+    def test_perps_use_margin_and_cap_open_risk(self):
+        from bigbrain.trader import MAX_OPEN_RISK
+        t = Trader(self.brain, book="lev", interval="15m", wallet=1000.0, top=3, market="perps", fetch_funding=lambda: {})
+        max_open, max_gross = 0, 0.0
+        for end in range(250, 900):
+            r = t.tick(market=market_at(self.series, end), universe=universe(self.symbols))
+            max_open = max(max_open, r["open"])
+            max_gross = max(max_gross, t.wallet.gross_notional() / max(r["equity"], 1))
+            self.assertLessEqual(t.wallet.open_risk(), MAX_OPEN_RISK * r["equity"] * 1.05)
+            self.assertGreaterEqual(t.wallet.cash, -1e-6)
+        self.assertLessEqual(max_gross, 3.05)
+        rows = self.brain.db.execute("SELECT notional FROM trades WHERE book = 'lev'").fetchall()
+        self.assertTrue(rows)
+        stored = self.brain.get_state("trader:lev")
+        for p in stored["positions"].values():
+            self.assertAlmostEqual(p["margin"], p["notional"] / 3.0, places=6)
+
+
+class DashboardTests(unittest.TestCase):
+    def test_render_reflects_live_prices_and_state(self):
+        from bigbrain import dashboard
+        brain = Brain()
+        self.assertIn("No trading book", dashboard.render(brain, "none"))
+        symbols = ["AAAUSDT", "BBBUSDT"]
+        series = {s: stamped(synthetic(s, n=500, seed=20 + i, vol=0.02)) for i, s in enumerate(symbols)}
+        t = Trader(brain, book="dash", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+        logs = []
+        for end in range(250, 500):
+            t.tick(market=market_at(series, end), universe=universe(symbols))
+        t._log("[00:00:00] test feed line")
+        brain.set_state("trader:dash", {**__import__("dataclasses").asdict(t.wallet), "market": "perps"})
+        text = dashboard.render(brain, "dash", prices={}, width=140, height=50)
+        self.assertIn("BIG BRAIN TIME", text)
+        self.assertIn("test feed line", text)
+        self.assertIn("WHAT THE BRAIN BELIEVES", text)
+        state = brain.get_state("trader:dash")
+        if state["positions"]:
+            p = next(iter(state["positions"].values()))
+            bumped = dashboard.render(brain, "dash", prices={p["symbol"]: p["entry_price"] * 1.10}, width=140, height=50)
+            self.assertNotEqual(bumped, text)
+        self.assertEqual(len(dashboard.sparkline([1, 2, 3, 4, 5, 6, 7, 8], 8)), 8)
+        self.assertEqual(dashboard.sparkline([5, 5, 5], 10), "▄▄▄")
 
 
 if __name__ == "__main__":

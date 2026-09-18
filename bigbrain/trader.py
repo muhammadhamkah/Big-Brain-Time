@@ -53,6 +53,10 @@ FUNDING_HOURS = (0, 8, 16)  # UTC funding times on Binance perps
 RISK_PER_TRADE = 0.01  # fraction of equity lost if the stop is hit
 EXPLORE_RISK = 0.005
 MAX_POSITION_FRACTION = 0.25
+MAX_OPEN_RISK = 0.10  # sum over open positions of (notional x stop distance) / equity
+LEVERAGE = {"spot": 1.0, "perps": 3.0}  # margin per position = notional / leverage; gross exposure <= equity x leverage
+MAINTENANCE_MARGIN = 0.005  # Binance tier-1 maintenance rate; equity below this x gross notional is a liquidation
+LOG_LINES = 80  # trade feed kept in state for the dashboard
 EXPLORE_PROBABILITY = 0.7  # while a (signal, context) has too little evidence
 RETEST_PROBABILITY = 0.1  # occasionally re-test a context the brain believes loses
 
@@ -102,6 +106,7 @@ class Position:
     side: int = 1
     funding: float = 0.0  # USDT paid (positive) or received (negative) so far
     last_funding_hour: str = ""  # "YYYY-MM-DD HH" of the last funding time applied
+    margin: float = 0.0  # cash posted for this position (notional / leverage)
 
     @property
     def key(self) -> str:
@@ -119,19 +124,25 @@ class Wallet:
     max_drawdown: float = 0.0
     closed: int = 0
 
+    log: list = field(default_factory=list)
+
     def open_positions(self) -> list[Position]:
         return [Position(**p) for p in self.positions.values()]
 
+    @staticmethod
+    def _unrealized(p: dict) -> float:
+        mark = p["mark"] or p["entry_price"]
+        return p.get("side", 1) * p["qty"] * (mark - p["entry_price"])
+
     def equity(self) -> float:
-        total = self.cash
-        for p in self.positions.values():
-            mark = p["mark"] or p["entry_price"]
-            side = p.get("side", 1)
-            if side == 1:
-                total += p["qty"] * mark
-            else:  # margin is held in notional; add the short's unrealized profit
-                total += p["notional"] + p["qty"] * (p["entry_price"] - mark)
-        return total
+        return self.cash + sum(p.get("margin") or p["notional"] for p in self.positions.values()) + sum(self._unrealized(p) for p in self.positions.values())
+
+    def gross_notional(self) -> float:
+        return sum(p["qty"] * (p["mark"] or p["entry_price"]) for p in self.positions.values())
+
+    def open_risk(self) -> float:
+        """USDT lost if every open stop is hit."""
+        return sum(p["notional"] * (p["context"].get("risk_pct") or 0.0) for p in self.positions.values())
 
 
 def context_for(rs: list[Reading], bars: list[Bar]) -> dict:
@@ -185,6 +196,7 @@ class Trader:
         stored = brain.get_state(self.key)
         self.market = stored.get("market", market) if stored else market  # a book keeps the market it was opened on
         self.fees = FEES[self.market]
+        self.leverage = LEVERAGE[self.market]
         self.fetch_bars = fetch_bars or (fetch_binance_futures if self.market == "perps" else fetch_binance)
         self.fetch_universe = fetch_universe or (top_usdt_perps if self.market == "perps" else top_usdt_pairs)
         self.fetch_funding = fetch_funding or (funding_rates if self.market == "perps" else (lambda: {}))
@@ -273,21 +285,26 @@ class Trader:
         if stop_pct <= 0:
             return None
         equity = self.wallet.equity()
-        notional = min(equity * risk / stop_pct, equity * MAX_POSITION_FRACTION, self.wallet.cash)
+        risk_room = equity * MAX_OPEN_RISK - self.wallet.open_risk()
+        if risk_room <= 0:
+            return {"symbol": symbol, "signal": signal, "action": "skip", "why": f"open risk already at {MAX_OPEN_RISK:.0%} of equity"}
+        exposure_room = equity * self.leverage - self.wallet.gross_notional()
+        notional = min(equity * risk / stop_pct, equity * MAX_POSITION_FRACTION, risk_room / stop_pct, exposure_room, self.wallet.cash * self.leverage * 0.98)
         if notional < MIN_NOTIONAL:
-            return {"symbol": symbol, "signal": signal, "action": "skip", "why": "not enough cash for the minimum order"}
+            return {"symbol": symbol, "signal": signal, "action": "skip", "why": "no room: cash, exposure or risk budget"}
         side = play["side"]
         slip = slippage_bps(notional, volume_24h, candle_qv) / 1e4
         fill = bar.close * (1 + side * slip)  # buying lifts the offer, selling hits the bid
         fee = notional * self.fees["taker"]
-        qty = (notional - fee) / fill
+        qty = notional / fill
+        margin = notional / self.leverage
         pos = Position(
             symbol=symbol, signal=signal, entry_time=bar.date, entry_price=fill, qty=qty, notional=notional,
             stop=fill * (1 - side * stop_pct), max_bars=play["max_bars"], exit_rule=play["exit"],
             context={**ctx, "risk_pct": stop_pct, "p_win_believed": round(b["p_win"], 3), "samples": b["samples"], "market": self.market},
-            explore=explore, mark=bar.close, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=bar.date[:13],
+            explore=explore, mark=bar.close, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=bar.date[:13], margin=margin,
         )
-        self.wallet.cash -= notional  # spot: cash becomes coins; perps: cash becomes margin
+        self.wallet.cash -= margin + fee
         self.wallet.positions[key] = asdict(pos)
         return {"symbol": symbol, "signal": signal, "action": "buy" if side == 1 else "short", "price": fill, "notional": notional, "explore": explore, "stop": pos.stop, "p_win": round(b["p_win"], 2)}
 
@@ -366,19 +383,18 @@ class Trader:
         slip = slippage_bps(gross_notional, volume_24h, candle_qv) / 1e4
         fill = price * (1 - pos.side * slip)  # a long sells into the bid, a short buys back at the offer
         fee = pos.qty * fill * self.fees["taker"]
-        if pos.side == 1:
-            proceeds = pos.qty * fill - fee
-        else:
-            proceeds = pos.notional + pos.qty * (pos.entry_price - fill) - fee  # margin back plus the short's profit
-        self.wallet.cash += proceeds
+        margin = pos.margin or pos.notional
+        trade_pnl = pos.side * pos.qty * (fill - pos.entry_price)
+        self.wallet.cash += margin + trade_pnl - fee
         self.wallet.closed += 1
         raw_entry = pos.entry_price / (1 + pos.side * pos.entry_slip / pos.notional) if pos.notional else pos.entry_price
         gross_ret = pos.side * (price / raw_entry - 1)  # the move from the pre-slippage entry, signed by side
-        net_ret = (proceeds - pos.funding) / pos.notional - 1  # funding was already taken from cash as it accrued
+        pnl = trade_pnl - fee - pos.entry_fee - pos.funding  # everything the trade cost or made, funding included
+        net_ret = pnl / pos.notional
         t = pm.Trade(
             book=self.book, symbol=pos.symbol, signal=pos.signal, entry_time=pos.entry_time, entry_price=pos.entry_price,
             exit_time=bar.date, exit_price=fill, exit_reason=reason, qty=pos.qty, notional=pos.notional,
-            gross_ret=gross_ret, net_ret=net_ret, pnl=proceeds - pos.funding - pos.notional, fees=pos.entry_fee + fee,
+            gross_ret=gross_ret, net_ret=net_ret, pnl=pnl, fees=pos.entry_fee + fee,
             slippage=pos.entry_slip + gross_notional * slip, bars_held=pos.bars_held, mfe=pos.mfe, mae=pos.mae, context=pos.context, explore=pos.explore,
             side=pos.side, funding=pos.funding,
         )
@@ -399,12 +415,31 @@ class Trader:
             if bars and len(bars) >= 2:
                 raw["mark"] = bars[-2].close
         eq = self.wallet.equity()
+        if self.wallet.positions and eq < MAINTENANCE_MARGIN * self.wallet.gross_notional():
+            self._liquidate(market)
+            eq = self.wallet.equity()
         self.wallet.peak = max(self.wallet.peak, eq)
         self.wallet.max_drawdown = min(self.wallet.max_drawdown, eq / self.wallet.peak - 1)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         self.wallet.curve.append((stamp, round(eq, 2)))
         if len(self.wallet.curve) > 20000:
             self.wallet.curve = self.wallet.curve[-20000:]
+
+    def _liquidate(self, market: dict[str, list[Bar]]) -> None:
+        """Equity fell below maintenance margin: the exchange closes everything at market."""
+        for key, raw in list(self.wallet.positions.items()):
+            bars = market.get(raw["symbol"])
+            if not bars:
+                continue
+            bar = bars[-2] if len(bars) >= 2 else bars[-1]
+            self._close(Position(**raw), bar, bar.close, "liquidation", 0.0, max(bar.quote_volume, 1.0))
+            del self.wallet.positions[key]
+        self.brain._journal("liquidation", f"book {self.book}")
+
+    def _log(self, line: str) -> None:
+        self.wallet.log.append(line)
+        if len(self.wallet.log) > LOG_LINES:
+            self.wallet.log = self.wallet.log[-LOG_LINES:]
 
     # --------------------------------------------------------------- report
     def report(self) -> dict:
@@ -415,6 +450,7 @@ class Trader:
         ).fetchall()
         return {
             "market": self.market, "equity": w.equity(), "cash": w.cash, "start": w.start, "return": w.equity() / w.start - 1, "max_drawdown": w.max_drawdown,
+            "gross_notional": w.gross_notional(), "open_risk": w.open_risk(), "leverage": self.leverage,
             "open": [{"symbol": p.symbol, "signal": p.signal, "side": "long" if p.side == 1 else "short", "entry": p.entry_price, "mark": p.mark,
                       "unrealized": (p.side * (p.mark / p.entry_price - 1)) if p.mark else 0.0, "bars": p.bars_held, "stop": p.stop, "explore": p.explore, "funding": p.funding}
                      for p in w.open_positions()],
@@ -436,22 +472,27 @@ class Trader:
         return period - (now % period) + 8
 
     def run(self, log=print, once: bool = False, sleep=time.sleep) -> None:
+        def out(line: str) -> None:
+            log(line)
+            self._log(line)
+
         while True:
             try:
                 started = time.time()
                 r = self.tick()
                 stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                log(f"[{stamp}] {r['symbols']} pairs in {time.time() - started:.0f}s | equity {r['equity']:.2f} USDT ({r['equity'] / self.wallet.start - 1:+.2%}) cash {r['cash']:.2f} open {r['open']}")
+                out(f"[{stamp}] {r['symbols']} pairs in {time.time() - started:.0f}s | equity {r['equity']:.2f} USDT ({r['equity'] / self.wallet.start - 1:+.2%}) cash {r['cash']:.2f} open {r['open']}")
                 for e in r["events"]:
                     if e["action"] in ("buy", "short"):
-                        log(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['notional']:.0f} USDT  stop {e['stop']:.6g}  p(win) {e['p_win']}{'  (exploring)' if e['explore'] else ''}")
+                        out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['notional']:.0f} USDT  stop {e['stop']:.6g}  p(win) {e['p_win']}{'  (exploring)' if e['explore'] else ''}")
                     elif e["action"] in ("sell", "cover"):
                         fund = f" funding {e['funding']:+.2f}" if e.get("funding") else ""
-                        log(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}  findings: {', '.join(e['findings'])}")
+                        out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}  findings: {', '.join(e['findings'])}")
                     elif e["action"] == "skip" and "belief" in e["why"]:
-                        log(f"    SKIP {e['symbol']:12} {e['signal']:18} {e['why']}")
+                        out(f"    SKIP {e['symbol']:12} {e['signal']:18} {e['why']}")
+                self.brain.set_state(self.key, {**asdict(self.wallet), "market": self.market})
             except Exception as exc:
-                log(f"trade error: {exc}")
+                out(f"trade error: {exc}")
             if once:
                 return
             sleep(self.seconds_until_next_close())

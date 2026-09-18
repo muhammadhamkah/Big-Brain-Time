@@ -61,6 +61,7 @@ bigbrain learn file notes/*.md
 
 bigbrain trade                                                 # the brain trades the top 100 USDT perps, long and short, 1000 USDT, learns from every trade
 bigbrain trade --market spot --book spot                       # a second book on spot (long only), separate wallet and beliefs
+bigbrain dashboard                                             # live dashboard in a second terminal: equity, positions, beliefs, feed
 bigbrain portfolio --recent 20                                 # equity, open positions, closed trades with findings
 bigbrain beliefs                                               # what it now believes about each signal in each context
 bigbrain watch --symbol BTCUSDT --interval 15m               # one market: paper trades 4 strategies, grades signals
@@ -111,7 +112,7 @@ Run it in a terminal you leave open, or with `--once` from cron every 15 minutes
 
 1. It sees which signals fired (RSI oversold, band breaks, moving-average crosses, MACD flips) and the context: trend regime (50 vs 200 average), volatility bucket relative to the pair's own history, RSI, band position.
 2. It consults its **belief table**: what that signal has done in that context in its own closed trades. Positive expectancy after costs: full size. Not enough evidence: explore at half size (a brain that never tries anything never learns). Evidence says it loses: stand aside, with an occasional small re-test so a changed market can change the belief.
-3. Size is risk-based: 1% of equity at risk to a stop 2 ATR away, capped at 25% of equity; any number of positions, limited only by cash and Binance's 10 USDT minimum. On perps, RSI overbought, death cross and MACD turning down are short entries; on spot they are exits only.
+3. Size is risk-based: 1% of equity at risk to a stop 2 ATR away, capped at 25% of equity. Any number of positions: on perps each posts margin of a third of its notional (gross exposure up to 3x the wallet), total risk at stops is capped at 10% of equity, and a liquidation check runs every candle (equity below 0.5% of gross notional closes everything, as the exchange would). On perps, RSI overbought, death cross and MACD turning down are short entries; on spot they are exits only.
 4. **Costs**: VIP 0 fees for the market (perps 0.05% taker, spot 0.1% taker, each way, market orders), funding on perps, and slippage modelled from liquidity: half the estimated spread (about 1bp for BTC, wider for thin pairs) plus impact from the order's share of the candle's volume. Stops fill at the stop, or at the open when a candle gaps through it.
 5. **Every closed trade gets a post-mortem**, win or loss: context at entry, best and worst point while open, how it exited, gross versus net, funding paid or received. Diagnostic lenses produce findings (fought the trend, breakout against regime, stop inside the noise, gave back an open gain, whipsaw, thesis never developed, costs ate the edge, funding drag; trend aligned, dip in uptrend, pop in downtrend, rode the move, fast resolution, near miss, funding tailwind). Each finding updates the belief table, instructive trades become post-mortem cells the brain can recall, and every ten trades per signal it rewrites a "what I have learned" lesson.
 
@@ -157,7 +158,8 @@ bigbrain/
   cortex.py           offline and Claude-powered answering
   watch.py            real-time watcher: signals -> calls -> graded outcomes -> scorecard lessons
   paper.py            paper trading: a virtual account per strategy, traded at candle closes, marked to market
-  trader.py           the brain trades: universe, costs, risk sizing, belief-driven entries, exits, one wallet
+  trader.py           the brain trades: universe, costs, margin and risk caps, belief-driven entries, exits, one wallet
+  dashboard.py        live terminal dashboard: equity, positions at live prices, beliefs, trades, feed
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

@@ -362,6 +362,17 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    from bigbrain import dashboard
+
+    brain = open_brain(args.db)
+    try:
+        dashboard.run(brain, book=args.book, refresh=args.refresh, once=args.once)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
 def cmd_beliefs(args: argparse.Namespace) -> int:
     from bigbrain.trader import Trader
 
@@ -550,6 +561,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--book", default="main")
     p.add_argument("--recent", type=int, default=0, metavar="N")
     p.set_defaults(func=cmd_portfolio)
+
+    p = sub.add_parser("dashboard", help="live dashboard for a trading book: equity, positions with live prices, beliefs, trades, feed")
+    p.add_argument("--book", default="main")
+    p.add_argument("--refresh", type=float, default=10.0, help="seconds between redraws")
+    p.add_argument("--once", action="store_true")
+    p.set_defaults(func=cmd_dashboard)
 
     p = sub.add_parser("beliefs", help="what the brain believes about each signal in each context, from its own trades")
     p.add_argument("--book", default="main")

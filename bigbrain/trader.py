@@ -33,6 +33,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 from bigbrain import postmortem as pm
 from bigbrain.brain import Brain
 from bigbrain.ingest import indicators as ind
@@ -202,7 +206,8 @@ class Trader:
         self.fetch_funding = fetch_funding or (funding_rates if self.market == "perps" else (lambda: {}))
         self.funding: dict[str, dict] = {}
         if stored:
-            stored.pop("market", None)
+            for extra in ("market", "interval", "last_tick"):
+                stored.pop(extra, None)
             self.wallet = Wallet(**stored)
         else:
             self.wallet = Wallet(cash=wallet, start=wallet, peak=wallet)
@@ -231,9 +236,16 @@ class Trader:
                 continue
             events += self._step_symbol(symbol, bars, volumes.get(symbol, 0.0))
             self.wallet.last_bar[symbol] = bars[-1].date
+            self._save()  # after every symbol, so an interrupt mid-tick never leaves cash and trades out of step
         self._mark_equity(market)
-        self.brain.set_state(self.key, {**asdict(self.wallet), "market": self.market})
+        self._save(last_tick=_now())
         return {"events": events, "equity": self.wallet.equity(), "cash": self.wallet.cash, "open": len(self.wallet.positions), "symbols": len(symbols)}
+
+    def _save(self, last_tick: str | None = None) -> None:
+        state = {**asdict(self.wallet), "market": self.market, "interval": self.interval}
+        prev = self.brain.get_state(self.key) or {}
+        state["last_tick"] = last_tick or prev.get("last_tick", "")
+        self.brain.set_state(self.key, state)
 
     def _fetch_all(self, symbols: list[str]) -> dict[str, list[Bar]]:
         out: dict[str, list[Bar]] = {}
@@ -490,7 +502,7 @@ class Trader:
                         out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}  findings: {', '.join(e['findings'])}")
                     elif e["action"] == "skip" and "belief" in e["why"]:
                         out(f"    SKIP {e['symbol']:12} {e['signal']:18} {e['why']}")
-                self.brain.set_state(self.key, {**asdict(self.wallet), "market": self.market})
+                self._save()
             except Exception as exc:
                 out(f"trade error: {exc}")
             if once:

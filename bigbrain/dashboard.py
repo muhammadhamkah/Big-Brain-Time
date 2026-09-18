@@ -82,8 +82,20 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
     max_dd = state.get("max_drawdown", 0.0)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    from bigbrain.watch import INTERVAL_SECONDS
+
+    interval = state.get("interval", "15m")
+    last_tick = state.get("last_tick", "")
+    status = f"{YELLOW}status unknown{RESET}"
+    if last_tick:
+        age = (datetime.now(timezone.utc) - datetime.strptime(last_tick, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)).total_seconds()
+        if age <= INTERVAL_SECONDS.get(interval, 900) * 1.5:
+            status = f"{GREEN}trader running{RESET} (last tick {age / 60:.0f} min ago)"
+        else:
+            status = f"{RED}TRADER STOPPED{RESET} (last tick {age / 3600:.1f} h ago: positions are frozen and stops cannot fire until `bigbrain trade` runs again)"
+
     lines = []
-    lines.append(f"{BOLD}{CYAN}BIG BRAIN TIME{RESET}  book {BOLD}{book}{RESET} on Binance {market}   {DIM}{now}{RESET}")
+    lines.append(f"{BOLD}{CYAN}BIG BRAIN TIME{RESET}  book {BOLD}{book}{RESET} on Binance {market} {interval}   {DIM}{now}{RESET}   {status}")
     ret_text = colour(equity - start, f"{equity / start - 1:+.2%} ({equity - start:+.2f})")
     unreal_text = colour(unreal, f"{unreal:+.2f}")
     dd_colour = RED if dd < -0.02 else ""

@@ -261,6 +261,12 @@ class DashboardTests(unittest.TestCase):
         brain.set_state("trader:dash", {**__import__("dataclasses").asdict(t.wallet), "market": "perps"})
         text = dashboard.render(brain, "dash", prices={}, width=140, height=50)
         self.assertIn("BIG BRAIN TIME", text)
+        self.assertIn("status unknown", text)
+        st = brain.get_state("trader:dash"); st["last_tick"] = "2020-01-01 00:00:00"; brain.set_state("trader:dash", st)
+        self.assertIn("TRADER STOPPED", dashboard.render(brain, "dash", prices={}, width=140, height=50))
+        from bigbrain.trader import _now
+        st["last_tick"] = _now(); brain.set_state("trader:dash", st)
+        self.assertIn("trader running", dashboard.render(brain, "dash", prices={}, width=140, height=50))
         self.assertIn("test feed line", text)
         self.assertIn("WHAT THE BRAIN BELIEVES", text)
         state = brain.get_state("trader:dash")

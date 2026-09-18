@@ -330,7 +330,9 @@ def cmd_trade(args: argparse.Namespace) -> int:
     try:
         t.run(once=args.once)
     except KeyboardInterrupt:
-        print("\nstopped")
+        print(f"\nstopped. {len(t.wallet.positions)} positions stay open in the book; run `bigbrain trade` again to manage them.")
+        sys.stdout.flush()
+        os._exit(0)  # skip waiting on fetch threads still in flight; state was saved after every symbol
     return 0
 
 

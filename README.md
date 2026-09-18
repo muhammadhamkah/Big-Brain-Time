@@ -119,6 +119,19 @@ Run it in a terminal you leave open, or with `--once` from cron every 15 minutes
 
 `bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that now drives its decisions; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
 
+### Running for months
+
+The trader only manages positions while it runs, so a long run needs a process that survives closed terminals and restarts. On a Mac:
+
+```bash
+scripts/macos-service.sh install          # launchd service: starts at login, restarts on failure, keeps the Mac awake
+scripts/macos-service.sh status
+scripts/macos-service.sh log              # follow .brain/trade.log
+scripts/macos-service.sh uninstall
+```
+
+A MacBook still sleeps when the lid closes unless it is plugged in with an external display; a Mac mini, an always-on laptop, or a small cloud server is the reliable home for a six-month run. The book is a table in `.brain/brain.db`; back that file up and the whole history comes with it. `bigbrain dashboard` works in any terminal while the service runs.
+
 ### Claude-powered cortex
 
 By default `bigbrain ask` prints a structured briefing built from the recalled cells. To have the brain *reason* over them:

@@ -24,6 +24,8 @@ USER_AGENT = "bigbrain/0.1 (trading knowledge brain; +https://github.com/muhamma
 HOST_INTERVALS: dict[str, float] = {
     "export.arxiv.org": 3.0,
     "arxiv.org": 3.0,
+    "api.binance.com": 0.15,
+    "data-api.binance.vision": 0.15,
     "www.reddit.com": 2.0,
     "oauth.reddit.com": 2.0,
     "api.github.com": 1.0,

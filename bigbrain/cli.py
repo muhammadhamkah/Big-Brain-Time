@@ -318,6 +318,62 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_trade(args: argparse.Namespace) -> int:
+    from bigbrain.trader import Trader
+
+    brain = open_brain(args.db)
+    t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top)
+    if not args.once:
+        print(f"Trading book '{args.book}': top {args.top} USDT pairs on {args.interval} candles, wallet {t.wallet.start:.0f} USDT, "
+              f"Binance VIP0 fees plus slippage, long only, every closed trade analysed. Ctrl-C to stop.")
+    try:
+        t.run(once=args.once)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+def cmd_portfolio(args: argparse.Namespace) -> int:
+    from bigbrain.trader import Trader
+
+    brain = open_brain(args.db)
+    if brain.get_state(f"trader:{args.book}") is None:
+        print(f"No trading book '{args.book}' yet. Run `bigbrain trade` first.")
+        return 0
+    t = Trader(brain, book=args.book)
+    r = t.report()
+    print(f"book {args.book}: equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}")
+    if r["open"]:
+        print("open positions:")
+        for p in r["open"]:
+            print(f"  {p['symbol']:12} {p['signal']:18} in @ {p['entry']:.6g}  now {p['mark']:.6g} ({p['unrealized']:+.2%})  {p['bars']} bars  stop {p['stop']:.6g}{'  exploring' if p['explore'] else ''}")
+    if r["by_signal"]:
+        print("closed trades by signal:")
+        for b in r["by_signal"]:
+            print(f"  {b['signal']:18} trades {b['trades']:4}  win {b['win_rate']:.0%}  avg {b['avg_ret']:+.2%}  pnl {b['pnl']:+.2f}  fees {b['fees']:.2f}  slippage {b['slippage']:.2f}")
+    if args.recent:
+        print("recent closed trades:")
+        for row in brain.db.execute(
+            "SELECT symbol, signal, entry_time, exit_time, exit_reason, net_ret, pnl, findings FROM trades WHERE book = ? ORDER BY id DESC LIMIT ?", (args.book, args.recent)
+        ):
+            print(f"  {row['symbol']:12} {row['signal']:18} {row['entry_time']} -> {row['exit_time']} {row['exit_reason']:6} {row['net_ret']:+.2%} ({row['pnl']:+.2f})  {', '.join(json.loads(row['findings']))}")
+    return 0
+
+
+def cmd_beliefs(args: argparse.Namespace) -> int:
+    from bigbrain.trader import Trader
+
+    brain = open_brain(args.db)
+    rows = Trader(brain, book=args.book).beliefs()
+    if not rows:
+        print("No beliefs yet: the brain has not closed a trade.")
+        return 0
+    print(f"{'signal':18} {'regime':10} {'vol':5} {'n':>4} {'win':>5} {'avg':>8}  verdict")
+    for b in rows:
+        print(f"{b['signal']:18} {b['regime']:10} {b['vol']:5} {b['n']:4} {b['win_rate']:5.0%} {b['avg_ret']:+8.2%}  {b['verdict']}")
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -478,6 +534,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--once", action="store_true", help="one pass, then exit (good for cron)")
     p.add_argument("--no-paper", action="store_true", help="only grade signals; do not paper trade the strategies")
     p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("trade", help="the brain trades the top USDT pairs with a virtual wallet and learns from every trade")
+    p.add_argument("--book", default="main", help="name of the trading book (separate wallets and beliefs)")
+    p.add_argument("--top", type=int, default=100, help="how many USDT pairs by volume")
+    p.add_argument("--interval", default="15m")
+    p.add_argument("--wallet", type=float, default=1000.0, help="starting USDT (only used when the book is new)")
+    p.add_argument("--once", action="store_true")
+    p.set_defaults(func=cmd_trade)
+
+    p = sub.add_parser("portfolio", help="the trading book: equity, open positions, closed trades")
+    p.add_argument("--book", default="main")
+    p.add_argument("--recent", type=int, default=0, metavar="N")
+    p.set_defaults(func=cmd_portfolio)
+
+    p = sub.add_parser("beliefs", help="what the brain believes about each signal in each context, from its own trades")
+    p.add_argument("--book", default="main")
+    p.set_defaults(func=cmd_beliefs)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

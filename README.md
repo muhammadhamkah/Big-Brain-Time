@@ -59,7 +59,10 @@ bigbrain learn market                                          # or synthetic da
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
 bigbrain learn file notes/*.md
 
-bigbrain watch --symbol BTCUSDT --interval 15m               # real time: paper trades 4 strategies, grades signals
+bigbrain trade                                                 # the brain trades the top 100 USDT pairs, 1000 USDT, learns from every trade
+bigbrain portfolio --recent 20                                 # equity, open positions, closed trades with findings
+bigbrain beliefs                                               # what it now believes about each signal in each context
+bigbrain watch --symbol BTCUSDT --interval 15m               # one market: paper trades 4 strategies, grades signals
 bigbrain paper --recent 10                                     # virtual accounts: equity, drawdown, trades
 bigbrain calls --recent 10                                     # scorecard: which signals actually work here
 bigbrain recall "position sizing in high volatility" -v
@@ -101,6 +104,18 @@ All requests are polite: one host at a time with a minimum interval between call
 
 Run it in a terminal you leave open, or with `--once` from cron every 15 minutes.
 
+### The brain trades, and learns from every trade
+
+`bigbrain trade` runs a virtual 1,000 USDT wallet across the top 100 USDT spot pairs by volume on Binance (refreshed every candle, no key needed), on 15-minute candles. Every candle, every pair:
+
+1. It sees which signals fired (RSI oversold, band breaks, moving-average crosses, MACD flips) and the context: trend regime (50 vs 200 average), volatility bucket relative to the pair's own history, RSI, band position.
+2. It consults its **belief table**: what that signal has done in that context in its own closed trades. Positive expectancy after costs: full size. Not enough evidence: explore at half size (a brain that never tries anything never learns). Evidence says it loses: stand aside, with an occasional small re-test so a changed market can change the belief.
+3. Size is risk-based: 1% of equity at risk to a stop 2 ATR away, capped at 25% of equity; any number of positions, limited only by cash and Binance's 10 USDT minimum. Long only (spot); bearish signals are exits, not entries.
+4. **Costs**: Binance spot VIP 0 fees (0.1% taker each way, market orders) plus slippage modelled from liquidity: half the estimated spread (about 1bp for BTC, wider for thin pairs) plus impact from the order's share of the candle's volume. Stops fill at the stop, or at the open when a candle gaps through it.
+5. **Every closed trade gets a post-mortem**, win or loss: context at entry, best and worst point while open, how it exited, gross versus net. Diagnostic lenses produce findings (fought the trend, stop inside the noise, gave back an open gain, whipsaw, thesis never developed, costs ate the edge; trend aligned, dip in uptrend, rode the move, fast resolution, near miss). Each finding updates the belief table, instructive trades become post-mortem cells the brain can recall, and every ten trades per signal it rewrites a "what I have learned" lesson.
+
+`bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that now drives its decisions; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
+
 ### Claude-powered cortex
 
 By default `bigbrain ask` prints a structured briefing built from the recalled cells. To have the brain *reason* over them:
@@ -141,6 +156,8 @@ bigbrain/
   cortex.py           offline and Claude-powered answering
   watch.py            real-time watcher: signals -> calls -> graded outcomes -> scorecard lessons
   paper.py            paper trading: a virtual account per strategy, traded at candle closes, marked to market
+  trader.py           the brain trades: universe, costs, risk sizing, belief-driven entries, exits, one wallet
+  postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

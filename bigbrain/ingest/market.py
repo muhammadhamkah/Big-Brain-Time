@@ -29,6 +29,7 @@ class Bar:
     low: float
     close: float
     volume: float
+    quote_volume: float = 0.0  # volume in the quote currency (USDT), when the source provides it
 
 
 def parse_csv(text: str) -> list[Bar]:
@@ -69,8 +70,45 @@ def parse_binance_klines(payload: list) -> list[Bar]:
     bars = []
     for row in payload:
         ts = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
-        bars.append(Bar(ts.strftime("%Y-%m-%d %H:%M"), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])))
+        quote = float(row[7]) if len(row) > 7 else 0.0
+        bars.append(Bar(ts.strftime("%Y-%m-%d %H:%M"), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), quote))
     return bars
+
+
+STABLE_OR_FIAT = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "GBP", "TRY", "BRL", "ARS", "UST", "USD1", "PYUSD", "AEUR", "XUSD", "USDE", "EURI", "JPY", "ZAR", "MXN", "PLN", "RON", "CZK", "UAH", "COP"}
+LEVERAGED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+
+
+def parse_top_usdt_pairs(tickers: list, n: int = 100) -> list[dict]:
+    """Top-``n`` spot USDT pairs by 24h quote volume, skipping stablecoin/fiat pairs and leveraged tokens."""
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym.endswith(LEVERAGED_SUFFIXES):
+            continue
+        base = sym[:-4]
+        if base in STABLE_OR_FIAT or not base:
+            continue
+        try:
+            qv = float(t.get("quoteVolume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qv <= 0:
+            continue
+        rows.append({"symbol": sym, "quote_volume": qv, "last": float(t.get("lastPrice") or 0.0)})
+    rows.sort(key=lambda r: -r["quote_volume"])
+    return rows[:n]
+
+
+def top_usdt_pairs(n: int = 100) -> list[dict]:
+    last: Exception | None = None
+    for host in BINANCE_HOSTS:
+        try:
+            tickers = json.loads(http_get(f"{host}/api/v3/ticker/24hr", headers={"Accept": "application/json"}).decode("utf-8"))
+            return parse_top_usdt_pairs(tickers, n)
+        except (HTTPStatusError, OSError) as exc:
+            last = exc
+    raise RuntimeError(f"Binance did not return tickers: {last}")
 
 
 def fetch_binance(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 1000) -> list[Bar]:

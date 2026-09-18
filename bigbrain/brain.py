@@ -84,6 +84,42 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     ret REAL,
     UNIQUE (symbol, interval, strategy, entry_time)
 );
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    book TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    entry_time TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    exit_time TEXT NOT NULL,
+    exit_price REAL NOT NULL,
+    exit_reason TEXT NOT NULL,
+    qty REAL NOT NULL,
+    notional REAL NOT NULL,
+    gross_ret REAL NOT NULL,
+    net_ret REAL NOT NULL,
+    pnl REAL NOT NULL,
+    fees REAL NOT NULL,
+    slippage REAL NOT NULL,
+    bars_held INTEGER NOT NULL,
+    mfe REAL NOT NULL,
+    mae REAL NOT NULL,
+    context TEXT NOT NULL,
+    findings TEXT NOT NULL,
+    explore INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS beliefs (
+    book TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    regime TEXT NOT NULL,
+    vol_bucket TEXT NOT NULL,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0,
+    sum_ret REAL NOT NULL DEFAULT 0,
+    sum_win REAL NOT NULL DEFAULT 0,
+    sum_loss REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (book, signal, regime, vol_bucket)
+);
 CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -114,6 +150,7 @@ class Brain:
         "observation": 1.0,
         "note": 1.0,
         "article": 0.9,
+        "postmortem": 0.95,
         "code": 0.8,
         "discussion": 0.7,
     }

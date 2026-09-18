@@ -261,6 +261,17 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_forget(args: argparse.Namespace) -> int:
+    brain = open_brain(args.db)
+    try:
+        n = brain.forget(source=args.source, kind=args.kind, title=args.title)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"Forgot {n} cells. Brain now has {brain.count_cells()} cells and {brain.count_synapses()} synapses.")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     brain = open_brain(args.db)
     s = brain.stats()
@@ -385,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("title", help="part of the cell title")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser("forget", help="remove cells by source, kind or title, e.g. --source synthetic")
+    p.add_argument("--source", help="substring of the source, e.g. 'synthetic', 'reddit', 'binance:BTCUSDT'")
+    p.add_argument("--kind", help="cell kind: concept, paper, observation, lesson, note, article, code, discussion")
+    p.add_argument("--title", help="substring of the title")
+    p.set_defaults(func=cmd_forget)
 
     p = sub.add_parser("stats", help="how big and how connected the brain is")
     p.add_argument("--journal", type=int, default=0, metavar="N", help="also show the last N events")

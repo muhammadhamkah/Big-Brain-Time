@@ -382,6 +382,30 @@ class Brain:
         lines.append("}")
         return "\n".join(lines)
 
+    def forget(self, source: str | None = None, kind: str | None = None, title: str | None = None) -> int:
+        """Remove cells matching a source substring, a kind, and/or a title substring. Returns cells removed."""
+        clauses, params = [], []
+        if source:
+            clauses.append("source LIKE ?"); params.append(f"%{source}%")
+        if kind:
+            clauses.append("kind = ?"); params.append(kind)
+        if title:
+            clauses.append("title LIKE ?"); params.append(f"%{title}%")
+        if not clauses:
+            raise ValueError("forget needs a source, kind or title to match")
+        where = " AND ".join(clauses)
+        ids = [r["id"] for r in self.db.execute(f"SELECT id FROM cells WHERE {where}", params)]
+        for i in range(0, len(ids), self._CHUNK):
+            chunk = ids[i : i + self._CHUNK]
+            ph = ",".join("?" * len(chunk))
+            self.db.execute(f"DELETE FROM synapses WHERE a IN ({ph}) OR b IN ({ph})", chunk + chunk)
+            self.db.execute(f"DELETE FROM cell_concepts WHERE cell_id IN ({ph})", chunk)
+            self.db.execute(f"DELETE FROM cell_tokens WHERE cell_id IN ({ph})", chunk)
+            self.db.execute(f"DELETE FROM cells WHERE id IN ({ph})", chunk)
+        self._journal("forget", f"{len(ids)} cells ({where})")
+        self.db.commit()
+        return len(ids)
+
     def close(self) -> None:
         self.db.close()
 

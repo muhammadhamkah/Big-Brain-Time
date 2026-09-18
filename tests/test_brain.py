@@ -80,6 +80,22 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(len(graph["edges"]), self.brain.count_synapses())
         self.assertIn("graph brain {", self.brain.export_dot())
 
+    def test_forget_removes_cells_and_their_links(self):
+        from bigbrain.ingest.market import learn_bars, synthetic
+        seed(self.brain, packs=False)
+        learn_bars(self.brain, "SYNTH", synthetic(n=300), source="synthetic data")
+        before = self.brain.count_cells()
+        n = self.brain.forget(source="synthetic")
+        self.assertGreater(n, 0)
+        self.assertEqual(self.brain.count_cells(), before - n)
+        self.assertEqual(self.brain.cells(kind="observation"), [])
+        dangling = self.brain.db.execute(
+            "SELECT COUNT(*) FROM synapses WHERE a NOT IN (SELECT id FROM cells) OR b NOT IN (SELECT id FROM cells)"
+        ).fetchone()[0]
+        self.assertEqual(dangling, 0)
+        with self.assertRaises(ValueError):
+            self.brain.forget()
+
     def test_persistence(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:

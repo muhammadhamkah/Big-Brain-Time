@@ -109,6 +109,8 @@ def http_get(
             conn.close()
         if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
             url = urllib.parse.urljoin(url, resp.getheader("Location"))
+            if url.startswith("http://"):  # never drop to plain http; nearly every host serves https too
+                url = "https://" + url[len("http://"):]
             continue
         if resp_headers.get("Content-Encoding", "").lower() == "gzip" or resp_headers.get("content-encoding", "").lower() == "gzip":
             body = gzip.decompress(body)

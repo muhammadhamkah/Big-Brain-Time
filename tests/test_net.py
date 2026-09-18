@@ -31,6 +31,14 @@ class NetTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 404)
         self.assertEqual(ctx.exception.body, b"nope")
 
+    def test_http_redirect_is_upgraded_to_https(self):
+        first = self._conn(status=301, location="http://feeds.example.com/x")
+        second = self._conn(body=b"ok")
+        with mock.patch.dict(net.os.environ, {"HTTPS_PROXY": "", "https_proxy": ""}, clear=False), \
+             mock.patch.object(net.http.client, "HTTPSConnection", side_effect=[first, second]) as ctor, mock.patch.object(net.time, "sleep"):
+            self.assertEqual(net.http_get("https://example.com/feed"), b"ok")
+        self.assertEqual(ctor.call_args_list[1].args[0], "feeds.example.com")
+
     def test_http_json_and_gzip(self):
         import gzip, json
         payload = gzip.compress(json.dumps({"ok": 1}).encode())

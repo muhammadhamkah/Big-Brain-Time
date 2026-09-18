@@ -75,6 +75,52 @@ class RedditTests(unittest.TestCase):
         self.assertEqual(kinds[0], "concept")
 
 
+REDDIT_RSS = """<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><title>Walk-forward results for my SMA crossover bot</title>
+<link href="https://www.reddit.com/r/algotrading/comments/xyz1/walkforward_results/" />
+<content type="html">&lt;div&gt;&lt;p&gt;Ran a 20/50 SMA crossover with walk-forward optimization on 12 futures. Sharpe 0.8 out of sample, max drawdown 18%, transaction costs included. Position sizing by ATR.&lt;/p&gt;&lt;/div&gt; submitted by /u/someone &lt;a href="x"&gt;[link]&lt;/a&gt; &lt;a href="y"&gt;[comments]&lt;/a&gt;</content>
+<updated>2026-09-15T10:00:00+00:00</updated></entry>
+<entry><title>Not a post</title><link href="https://www.reddit.com/r/algotrading/" /><content type="html">x</content></entry>
+</feed>"""
+
+REDDIT_THREAD_RSS = """<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><title>Walk-forward results for my SMA crossover bot</title><link href="https://www.reddit.com/r/algotrading/comments/xyz1/walkforward_results/" /><content type="html">&lt;p&gt;the post body again&lt;/p&gt;</content></entry>
+<entry><title>/u/quant_guy on Walk-forward results</title><link href="https://www.reddit.com/r/algotrading/comments/xyz1/walkforward_results/abc123/" /><content type="html">&lt;p&gt;An 18% drawdown on Sharpe 0.8 is about what you should expect; halve your size if you cannot stomach it, and remember out-of-sample drawdowns tend to be deeper than backtested ones.&lt;/p&gt; /u/quant_guy</content></entry>
+<entry><title>/u/lol on Walk-forward results</title><link href="https://www.reddit.com/r/algotrading/comments/xyz1/walkforward_results/def456/" /><content type="html">&lt;p&gt;nice&lt;/p&gt; /u/lol</content></entry>
+</feed>"""
+
+
+class RedditRSSTests(unittest.TestCase):
+    def test_parse_rss_listing(self):
+        posts = reddit.parse_rss_listing(REDDIT_RSS, "algotrading")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].id, "xyz1")
+        self.assertIn("walk-forward optimization", posts[0].text)
+        self.assertNotIn("submitted by", posts[0].text)
+
+    def test_parse_rss_comments_skips_post_and_short(self):
+        comments = reddit.parse_rss_comments(REDDIT_THREAD_RSS, "xyz1")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("halve your size", comments[0][1])
+
+    def test_fetch_posts_falls_back_to_rss_on_403(self):
+        from bigbrain.net import HTTPStatusError
+
+        with mock.patch.object(reddit, "http_json", side_effect=HTTPStatusError(403, "u", {}, b"")), \
+             mock.patch.object(reddit, "http_text", side_effect=[REDDIT_RSS, REDDIT_THREAD_RSS]):
+            posts = reddit.fetch_posts("algotrading")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(posts[0].comments), 1)
+        brain = Brain()
+        seed(brain)
+        titles = reddit.learn_posts(brain, posts)
+        cell = brain.find(titles[0])[0]
+        self.assertEqual(cell.kind, "discussion")
+        self.assertIn("walk-forward", cell.concepts)
+        self.assertIn("Top comments:", cell.content)
+        self.assertNotIn("points", cell.content.split("Top comments:")[1].splitlines()[1])
+
+
 class GitHubTests(unittest.TestCase):
     def test_clean_markdown(self):
         text = github.clean_markdown(README)

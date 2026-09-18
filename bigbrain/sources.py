@@ -22,7 +22,6 @@ DEFAULT_FEEDS = (
     "https://www.quantstart.com/feed/",
     "https://robotwealth.com/feed/",
     "https://alphaarchitect.com/feed/",
-    "https://www.reddit.com/r/algotrading/.rss",
 )
 
 

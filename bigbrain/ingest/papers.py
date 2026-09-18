@@ -7,6 +7,8 @@ then wires it to every strategy, indicator and observation it relates to.
 
 from __future__ import annotations
 
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -56,7 +58,19 @@ def parse_atom(xml_text: str) -> list[Paper]:
     return papers
 
 
-def fetch(search: str | None = None, max_results: int = 10, categories: tuple[str, ...] = DEFAULT_CATEGORIES, timeout: float = 30.0) -> list[Paper]:
+def fetch(
+    search: str | None = None,
+    max_results: int = 10,
+    categories: tuple[str, ...] = DEFAULT_CATEGORIES,
+    timeout: float = 30.0,
+    retries: int = 4,
+) -> list[Paper]:
+    """Query the arXiv API.
+
+    arXiv answers 406 both to requests without an ``Accept`` header and, when it
+    is shedding load, as a throttle. So we always send the header and retry
+    406/429/5xx with a growing pause.
+    """
     params = {
         "search_query": build_query(search, categories),
         "start": 0,
@@ -65,9 +79,28 @@ def fetch(search: str | None = None, max_results: int = 10, categories: tuple[st
         "sortOrder": "descending",
     }
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "bigbrain/0.1 (trading knowledge brain)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return parse_atom(resp.read().decode("utf-8"))
+    headers = {
+        "User-Agent": "bigbrain/0.1 (https://github.com/muhammadhamkah/Big-Brain-Time)",
+        "Accept": "application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+    }
+    delay = 3.0
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return parse_atom(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in (406, 429, 500, 502, 503, 504) or attempt == retries:
+                raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt == retries:
+                raise
+        time.sleep(delay)
+        delay *= 2
+    raise RuntimeError(f"arXiv request failed: {last_error}")
 
 
 def learn_papers(brain: Brain, papers: list[Paper]) -> list[str]:

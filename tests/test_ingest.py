@@ -160,3 +160,38 @@ class CortexTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaperFetchTests(unittest.TestCase):
+    def test_fetch_retries_on_406_then_succeeds(self):
+        import io, urllib.error
+        from unittest import mock
+        from bigbrain.ingest import papers
+
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(req.get_header("Accept"))
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(req.full_url, 406, "Not Acceptable", {}, io.BytesIO(b""))
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = ATOM_SAMPLE.encode()
+            return resp
+
+        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
+            result = papers.fetch("momentum", max_results=1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(a and "atom" in a for a in calls), "every request must send an Accept header")
+
+    def test_fetch_gives_up_on_404(self):
+        import io, urllib.error
+        from unittest import mock
+        from bigbrain.ingest import papers
+
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
+            with self.assertRaises(urllib.error.HTTPError):
+                papers.fetch("momentum")

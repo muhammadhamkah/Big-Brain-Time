@@ -37,8 +37,8 @@ LEXICON: dict[str, tuple[str, ...]] = {
     "chart patterns": ("head and shoulders", "double top", "double bottom", "triangle pattern", "flag pattern", "cup and handle"),
     "fibonacci": ("fibonacci", "fib retracement", "retracement"),
     # --- risk & portfolio
-    "risk management": ("risk management", "risk control", "risk limit", "risk budget", "risk per trade"),
-    "position sizing": ("position sizing", "position size", "size positions", "size a position", "how much to risk", "sizing", "kelly", "kelly criterion", "fractional kelly", "bet size"),
+    "risk management": ("risk management", "risk control", "risk limit", "risk budget", "risk per trade", "per trade", "risk more than", "never risk", "risk of ruin", "capital preservation"),
+    "position sizing": ("position sizing", "position size", "size positions", "size a position", "how much to risk", "% of equity", "percent of equity", "% of capital", "percent of capital", "% per trade", "sizing", "kelly", "kelly criterion", "fractional kelly", "bet size"),
     "stop loss": ("stop loss", "stop-loss", "stop", "trailing stop", "protective stop"),
     "take profit": ("take profit", "profit target", "price target"),
     "drawdown": ("drawdown", "max drawdown", "maximum drawdown", "underwater"),
@@ -81,12 +81,15 @@ LEXICON: dict[str, tuple[str, ...]] = {
     "tail risk": ("tail risk", "fat tails", "black swan", "crash", "kurtosis", "skew", "skewness"),
 }
 
+def _alias_pattern(alias: str) -> re.Pattern[str]:
+    # Word boundaries on both sides, except an alias that starts with a symbol
+    # such as "% per trade" may follow a digit directly ("1% per trade").
+    lead = "" if not alias[0].isalnum() else r"(?<![\w/])"
+    return re.compile(lead + re.escape(alias) + r"(?![\w/])", re.IGNORECASE)
+
+
 _ALIAS_PATTERNS: list[tuple[str, re.Pattern[str]]] = sorted(
-    (
-        (concept, re.compile(r"(?<![\w/])" + re.escape(alias) + r"(?![\w/])", re.IGNORECASE))
-        for concept, aliases in LEXICON.items()
-        for alias in aliases
-    ),
+    ((concept, _alias_pattern(alias)) for concept, aliases in LEXICON.items() for alias in aliases),
     key=lambda pair: -len(pair[1].pattern),
 )
 

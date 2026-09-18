@@ -57,6 +57,7 @@ def cmd_learn_papers(args: argparse.Namespace) -> int:
         papers = fetch(args.query, max_results=args.max)
     except Exception as exc:  # network errors are the common failure here
         print(f"Could not reach arXiv: {exc}", file=sys.stderr)
+        print("arXiv sometimes throttles with HTTP 406; wait a minute and try again.", file=sys.stderr)
         return 1
     before = brain.count_synapses()
     titles = learn_papers(brain, papers)
@@ -72,7 +73,14 @@ def cmd_learn_market(args: argparse.Namespace) -> int:
 
     brain = open_brain(args.db)
     if args.csv:
-        bars = load_csv(args.csv)
+        if not Path(args.csv).is_file():
+            print(f"No such file: {args.csv}. Point --csv at a CSV with date,open,high,low,close,volume columns.", file=sys.stderr)
+            return 1
+        try:
+            bars = load_csv(args.csv)
+        except (ValueError, KeyError) as exc:
+            print(f"Could not read {args.csv}: {exc}", file=sys.stderr)
+            return 1
         symbol = args.symbol or Path(args.csv).stem.upper()
         source = f"csv:{args.csv}"
     else:

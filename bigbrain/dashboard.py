@@ -54,14 +54,20 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
         return f"No trading book '{book}' yet. Run `bigbrain trade` first."
     prices = prices or {}
     market = state.get("market", "perps")
-    positions = list(state["positions"].values())
+    positions = [dict(p) for p in state["positions"].values()]
     for p in positions:
+        p["close_mark"] = p["mark"]
         if p["symbol"] in prices:
             p["mark"] = prices[p["symbol"]]
+    basis = "live prices" if prices else "last candle close (no live prices)"
     cash = state["cash"]
     margin = sum(p.get("margin") or p["notional"] for p in positions)
+    # two bases: the trader's own marks (last closed candle) and live ticker prices
+    unreal_close = sum(p.get("side", 1) * p["qty"] * ((p["close_mark"] or p["entry_price"]) - p["entry_price"]) for p in positions)
     unreal = sum(p.get("side", 1) * p["qty"] * ((p["mark"] or p["entry_price"]) - p["entry_price"]) for p in positions)
+    equity_close = cash + margin + unreal_close
     equity = cash + margin + unreal
+    last_candle = max(state.get("last_bar", {}).values(), default="")
     start = state["start"]
     gross = sum(p["qty"] * (p["mark"] or p["entry_price"]) for p in positions)
     open_risk = sum(p["notional"] * (p["context"].get("risk_pct") or 0) for p in positions)
@@ -82,7 +88,9 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
     unreal_text = colour(unreal, f"{unreal:+.2f}")
     dd_colour = RED if dd < -0.02 else ""
     realized_text = colour(realized, f"{realized:+.2f}")
-    lines.append(f"equity {BOLD}{equity:,.2f}{RESET} USDT  {ret_text}   cash {cash:,.2f}   margin {margin:,.2f}   unrealized {unreal_text}   drawdown {dd_colour}{dd:.2%}{RESET} (max {max_dd:.2%})")
+    close_text = colour(unreal_close, f"{unreal_close:+.2f}")
+    lines.append(f"equity {BOLD}{equity:,.2f}{RESET} USDT at {basis}  {ret_text}   drawdown {dd_colour}{dd:.2%}{RESET} (max {max_dd:.2%})")
+    lines.append(f"at last candle close ({last_candle or 'n/a'} UTC, the trader's basis): equity {equity_close:,.2f}  unrealized {close_text}   |   live: unrealized {unreal_text}   cash {cash:,.2f}   margin {margin:,.2f}")
     lines.append(f"open {len(positions)}   gross exposure {gross:,.0f} ({lev:.2f}x)   risk at stops {open_risk:,.2f} ({risk_share:.1%})   "
                  f"closed {n_closed}   realized {realized_text}   win {win_rate:.0%}   fees {fees:.2f}  slip {slip:.2f}  funding {funding:+.2f}")
     curve = [v for _, v in state.get("curve", [])]
@@ -91,7 +99,7 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
     lines.append("")
 
     # open positions
-    lines.append(f"{BOLD}OPEN POSITIONS{RESET}  {DIM}side symbol signal entry -> mark unrealized bars stop{RESET}")
+    lines.append(f"{BOLD}OPEN POSITIONS{RESET}  {DIM}side symbol signal entry -> live mark, unrealized at live, bars held, stop{RESET}")
     positions.sort(key=lambda p: -abs(p.get("side", 1) * p["qty"] * ((p["mark"] or p["entry_price"]) - p["entry_price"])))
     max_pos = max(5, (height - 22) // 2)
     for p in positions[:max_pos]:

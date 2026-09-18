@@ -481,7 +481,7 @@ class Trader:
                 started = time.time()
                 r = self.tick()
                 stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                out(f"[{stamp}] {r['symbols']} pairs in {time.time() - started:.0f}s | equity {r['equity']:.2f} USDT ({r['equity'] / self.wallet.start - 1:+.2%}) cash {r['cash']:.2f} open {r['open']}")
+                out(f"[{stamp}] {r['symbols']} pairs in {time.time() - started:.0f}s | equity at close {r['equity']:.2f} USDT ({r['equity'] / self.wallet.start - 1:+.2%}) cash {r['cash']:.2f} open {r['open']}")
                 for e in r["events"]:
                     if e["action"] in ("buy", "short"):
                         out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['notional']:.0f} USDT  stop {e['stop']:.6g}  p(win) {e['p_win']}{'  (exploring)' if e['explore'] else ''}")

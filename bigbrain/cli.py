@@ -99,6 +99,102 @@ def cmd_learn_market(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_learn_reddit(args: argparse.Namespace) -> int:
+    from bigbrain.ingest.reddit import DEFAULT_SUBREDDITS, fetch_posts, learn_posts
+
+    brain = open_brain(args.db)
+    subs = tuple(args.sub) if args.sub else DEFAULT_SUBREDDITS
+    total = 0
+    for sub in subs:
+        print(f"Reading r/{sub} (top of the {args.time}) ...")
+        try:
+            posts = fetch_posts(sub, time=args.time, limit=args.limit, min_score=args.min_score, with_comments=not args.no_comments)
+        except Exception as exc:
+            print(f"  could not read r/{sub}: {exc}", file=sys.stderr)
+            continue
+        titles = learn_posts(brain, posts)
+        for t in titles:
+            print(f"  + {t}")
+        total += len(titles)
+    print(f"Learned {total} discussions. Brain now has {brain.count_cells()} cells and {brain.count_synapses()} synapses.")
+    return 0
+
+
+def cmd_learn_github(args: argparse.Namespace) -> int:
+    from bigbrain.ingest.github import DEFAULT_QUERIES, learn_repos, search
+
+    brain = open_brain(args.db)
+    queries = tuple(args.query) if args.query else DEFAULT_QUERIES
+    if not os.environ.get("GITHUB_TOKEN"):
+        print("(no GITHUB_TOKEN set: limited to 60 requests an hour)")
+    total = 0
+    for q in queries:
+        print(f"Searching GitHub for {q!r} ...")
+        try:
+            repos = search(q, args.max)
+            titles = learn_repos(brain, repos, with_readme=not args.no_readme)
+        except Exception as exc:
+            print(f"  GitHub error: {exc}", file=sys.stderr)
+            continue
+        for t in titles:
+            print(f"  + {t}")
+        total += len(titles)
+    print(f"Learned {total} repositories. Brain now has {brain.count_cells()} cells and {brain.count_synapses()} synapses.")
+    return 0
+
+
+def cmd_learn_url(args: argparse.Namespace) -> int:
+    from bigbrain.ingest.web import learn_url
+
+    brain = open_brain(args.db)
+    ok = 0
+    for url in args.urls:
+        try:
+            title, links = learn_url(brain, url, kind=args.kind)
+            print(f"  + {title} (+{links} links)")
+            ok += 1
+        except Exception as exc:
+            print(f"  could not learn {url}: {exc}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_learn_feed(args: argparse.Namespace) -> int:
+    from bigbrain.ingest.web import learn_feed
+    from bigbrain.sources import DEFAULT_FEEDS
+
+    brain = open_brain(args.db)
+    feeds = args.urls or DEFAULT_FEEDS
+    total = 0
+    for url in feeds:
+        print(f"Reading feed {url} ...")
+        try:
+            titles = learn_feed(brain, url, max_items=args.max, follow_links=args.full)
+        except Exception as exc:
+            print(f"  could not read {url}: {exc}", file=sys.stderr)
+            continue
+        for t in titles:
+            print(f"  + {t}")
+        total += len(titles)
+    print(f"Learned {total} articles. Brain now has {brain.count_cells()} cells and {brain.count_synapses()} synapses.")
+    return 0
+
+
+def cmd_feed(args: argparse.Namespace) -> int:
+    """Go online and learn from every source the brain knows."""
+    from bigbrain.sources import run_all
+
+    brain = open_brain(args.db)
+    before = (brain.count_cells(), brain.count_synapses())
+    report = run_all(brain, quick=args.quick, log=print)
+    after = (brain.count_cells(), brain.count_synapses())
+    print()
+    for source, (n, err) in report.items():
+        status = f"{n} learned" if err is None else f"failed: {err}"
+        print(f"  {source:12} {status}")
+    print(f"\nBrain grew from {before[0]} to {after[0]} cells and from {before[1]} to {after[1]} synapses.")
+    return 0
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     from bigbrain import cortex
 
@@ -211,6 +307,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--no-backtest", action="store_true")
     p.set_defaults(func=cmd_learn_market)
+
+    p = learn.add_parser("reddit", help="read what traders discuss on Reddit")
+    p.add_argument("--sub", action="append", help="subreddit (repeatable); default is a curated set")
+    p.add_argument("--time", default="week", choices=["day", "week", "month", "year", "all"])
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--min-score", type=int, default=5)
+    p.add_argument("--no-comments", action="store_true", help="skip fetching top comments (fewer requests)")
+    p.set_defaults(func=cmd_learn_reddit)
+
+    p = learn.add_parser("github", help="read trading repositories on GitHub")
+    p.add_argument("--query", "-q", action="append", help="search query (repeatable), e.g. 'topic:backtesting'")
+    p.add_argument("--max", type=int, default=10)
+    p.add_argument("--no-readme", action="store_true")
+    p.set_defaults(func=cmd_learn_github)
+
+    p = learn.add_parser("url", help="read any web page (blog post, TradingView idea, docs)")
+    p.add_argument("urls", nargs="+")
+    p.add_argument("--kind", default="article")
+    p.set_defaults(func=cmd_learn_url)
+
+    p = learn.add_parser("feed", help="read RSS/Atom feeds (defaults to curated trading blogs)")
+    p.add_argument("urls", nargs="*")
+    p.add_argument("--max", type=int, default=20)
+    p.add_argument("--full", action="store_true", help="fetch each linked article, not just the summary")
+    p.set_defaults(func=cmd_learn_feed)
+
+    p = sub.add_parser("feed", help="go online and learn from every source: papers, Reddit, GitHub, blogs")
+    p.add_argument("--quick", action="store_true", help="fewer items per source")
+    p.set_defaults(func=cmd_feed)
 
     p = sub.add_parser("ask", help="ask the brain a question")
     p.add_argument("question")

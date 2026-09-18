@@ -73,6 +73,18 @@ class Brain:
     """A trading knowledge brain backed by SQLite."""
 
     LINK_THRESHOLD = 0.12  # minimum similarity to grow a synapse
+    # How much recall trusts each kind of knowledge. Forum talk and READMEs
+    # still surface, but a paper or a measured backtest outranks them.
+    KIND_TRUST = {
+        "concept": 1.0,
+        "paper": 1.0,
+        "lesson": 1.0,
+        "observation": 1.0,
+        "note": 1.0,
+        "article": 0.9,
+        "code": 0.8,
+        "discussion": 0.7,
+    }
     MAX_LINKS_PER_CELL = 30  # strongest links kept when a new cell arrives
     HEBBIAN_STEP = 0.05  # how much co-recall strengthens a synapse
     SPREAD_FACTOR = 0.6  # how much activation leaks across a synapse
@@ -233,7 +245,9 @@ class Brain:
                         scores[other] += gain
                         via[other].append(seed_id)
 
-        top = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
+        kinds = {r["id"]: r["kind"] for r in self.db.execute("SELECT id, kind FROM cells")} if scores else {}
+        weighted = {cid: sc * self.KIND_TRUST.get(kinds.get(cid, ""), 0.8) for cid, sc in scores.items()}
+        top = sorted(weighted.items(), key=lambda kv: -kv[1])[:k]
         results = [Recall(cell=self.get(cid), score=round(score, 4), via=via.get(cid, [])) for cid, score in top]  # type: ignore[arg-type]
         results = [r for r in results if r.cell is not None]
 

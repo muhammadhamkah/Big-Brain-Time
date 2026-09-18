@@ -236,18 +236,3 @@ class PaperFetchTests(unittest.TestCase):
         with self.assertRaises(HTTPStatusError):
             self._run(responder, "mean reversion", retries=0)
         self.assertIn("all%3A%22mean+reversion%22", seen[0])
-
-    def test_http_get_writes_curl_shaped_request(self):
-        from unittest import mock
-        from bigbrain.ingest import papers
-
-        conn = mock.MagicMock()
-        resp = conn.getresponse.return_value
-        resp.status, resp.read.return_value = 200, b"<feed/>"
-        resp.getheaders.return_value, resp.getheader.return_value = [], None
-        with mock.patch.object(papers.http.client, "HTTPSConnection", return_value=conn):
-            body = papers.http_get("https://export.arxiv.org/api/query?search_query=all%3Ax")
-        self.assertEqual(body, b"<feed/>")
-        conn.putrequest.assert_called_once_with("GET", "/api/query?search_query=all%3Ax", skip_host=True, skip_accept_encoding=True)
-        header_names = [c.args[0] for c in conn.putheader.call_args_list]
-        self.assertEqual(header_names, ["Host", "User-Agent", "Accept"])

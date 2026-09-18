@@ -39,22 +39,49 @@ No dependencies beyond Python 3.10+.
 pip install -e .            # installs the `bigbrain` command
 
 bigbrain seed               # teach the foundational curriculum (51 concept cells)
-bigbrain learn market       # synthetic OHLCV -> indicator observations + 4 strategy backtests
-bigbrain learn market --csv data/AAPL.csv --symbol AAPL   # or your own data
-bigbrain learn papers -q "momentum crypto" --max 10        # recent arXiv q-fin papers
+bigbrain feed               # go online: papers, Reddit, GitHub and blogs, all at once
+bigbrain ask "should I use trend following on BTC right now?"
+```
+
+Or feed it one sense at a time:
+
+```bash
+bigbrain learn papers -q "momentum crypto" --max 10          # recent arXiv q-fin papers
+bigbrain learn reddit --sub algotrading --sub quant --time month   # top posts and best comments
+bigbrain learn github -q "topic:backtesting" --max 10          # most-starred repos and their READMEs
+bigbrain learn feed                                            # curated quant blogs (RSS)
+bigbrain learn url https://www.tradingview.com/chart/BTCUSD/xxxx/   # any page: idea, blog post, docs
+bigbrain learn market --csv data/AAPL.csv --symbol AAPL        # your own OHLCV data
+bigbrain learn market                                          # or synthetic data for a demo
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
 bigbrain learn file notes/*.md
 
-bigbrain ask "should I use trend following on AAPL right now?"
 bigbrain recall "position sizing in high volatility" -v
 bigbrain explain "Kelly criterion"
 bigbrain stats --journal 10
 bigbrain graph --format dot -o brain.dot && dot -Tsvg brain.dot -o brain.svg
 ```
 
-The database defaults to `.brain/brain.db`; override with `--db` or `BIGBRAIN_DB`.
+The database defaults to `.brain/brain.db`; override with `--db` or `BIGBRAIN_DB`. Learning is idempotent, so running `bigbrain feed` every day only adds what is new.
 
 CSV files need `date,open,high,low,close,volume` columns (any case, oldest first or newest first).
+
+### The senses
+
+| Source | How | Cell kind | Trust |
+|---|---|---|---|
+| Built-in curriculum | 51 written lessons | concept | 1.0 |
+| arXiv | public API, quantitative finance categories | paper | 1.0 |
+| Market data | CSV or synthetic bars, indicators and backtests | observation, lesson | 1.0 |
+| Your notes and files | `learn text`, `learn file` | note | 1.0 |
+| Blogs and RSS feeds | public feeds; `--full` fetches the whole article | article | 0.9 |
+| GitHub | public API; set `GITHUB_TOKEN` for 5000 requests/hour instead of 60 | code | 0.8 |
+| Reddit | public JSON listings, no account; top posts plus best comments | discussion | 0.7 |
+| Any web page | `learn url`; works when the text is in the HTML | article | 0.9 |
+
+Trust scales a cell's recall score, so a forum thread still surfaces but a paper or a measured backtest on the same topic outranks it. TradingView has no public API and forbids scraping, so the brain reads TradingView pages only when you hand it a URL.
+
+All requests are polite: one host at a time with a minimum interval between calls, curl-shaped headers (some edges reject Python's default request shape with 406), and `HTTPS_PROXY` is honoured.
 
 ### Claude-powered cortex
 
@@ -95,18 +122,23 @@ bigbrain/
   concepts.py         trading lexicon, concept extraction, tokenizer
   cortex.py           offline and Claude-powered answering
   cli.py              the `bigbrain` command
+  net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
+  sources.py          the brain's diet: paper topics, subreddits, feeds, and `bigbrain feed`
   ingest/
     textbook.py       seed curriculum (51 concepts)
     indicators.py     SMA, EMA, RSI, MACD, Bollinger, ATR, volatility, drawdown, Sharpe
     market.py         CSV / synthetic OHLCV -> indicator observations
     strategies.py     SMA crossover, RSI mean reversion, Bollinger breakout, buy & hold + backtester
     papers.py         arXiv q-fin fetcher and parser
+    reddit.py         subreddit listings and top comments -> discussion cells
+    github.py         repository search and READMEs -> code cells
+    web.py            any page (HTML -> text) and RSS/Atom feeds -> article cells
 tests/                unittest suite (python -m unittest discover -s tests)
 ```
 
 ## Roadmap
 
-1. **More senses**: price data from live APIs, full-text PDFs, earnings transcripts, news and social sentiment, order-book data.
+1. **More senses**: price data from live APIs, full-text PDFs, earnings transcripts, news sentiment, order-book data, a scheduler so `feed` runs itself.
 2. **Smarter linking**: embedding similarity next to the lexicon, contradiction detection between cells, and confidence that decays for observations as they age.
 3. **Learning from outcomes**: track what the brain said and what the market did, so lessons get reinforced or weakened by results.
 4. **Strategy evolution**: let the brain propose parameter changes and new rule combinations, backtest them walk-forward, and keep only what survives.

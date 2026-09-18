@@ -79,6 +79,16 @@ LEXICON: dict[str, tuple[str, ...]] = {
     "market making": ("market making", "market maker", "market makers"),
     "portfolio optimization": ("portfolio optimization", "mean-variance", "mean variance", "efficient frontier", "markowitz", "risk parity"),
     "tail risk": ("tail risk", "fat tails", "black swan", "crash", "kurtosis", "skew", "skewness"),
+    # --- styles, tooling and platforms (what forums and repositories talk about)
+    "day trading": ("day trading", "daytrading", "day trader", "intraday", "scalping", "scalp", "scalper"),
+    "swing trading": ("swing trading", "swing trade", "swing trader", "position trading"),
+    "paper trading": ("paper trading", "paper trade", "demo account", "sim trading"),
+    "trading platform": ("tradingview", "pine script", "pinescript", "metatrader", "mt4", "mt5", "ninjatrader", "thinkorswim", "interactive brokers", "ibkr", "alpaca", "binance", "bybit", "coinbase", "kraken", "robinhood", "webull"),
+    "trading library": ("backtrader", "zipline", "vectorbt", "backtesting.py", "quantconnect", "lean engine", "ccxt", "ta-lib", "talib", "pandas-ta", "freqtrade", "jesse", "hummingbot", "qlib", "yfinance"),
+    "open source": ("open source", "open-source", "github", "repository", "repo", "library", "framework", "python package"),
+    "prop trading": ("prop firm", "prop trading", "funded account", "ftmo", "evaluation account"),
+    "market data": ("market data", "ohlcv", "tick data", "level 2", "candles", "historical data", "data feed", "api key", "websocket"),
+    "execution": ("execution", "order execution", "latency", "fill", "fills", "order routing", "smart order routing"),
 }
 
 def _alias_pattern(alias: str) -> re.Pattern[str]:

@@ -7,28 +7,19 @@ then wires it to every strategy, indicator and observation it relates to.
 
 from __future__ import annotations
 
-import http.client
 import random
-import ssl
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from bigbrain.brain import Brain
+from bigbrain.net import HTTPStatusError, http_get
 
 # arXiv serves the same API from both hosts; its edge intermittently rejects one
 # with HTTP 406 for minutes at a time, so we alternate between them.
 ARXIV_HOSTS = ("https://export.arxiv.org/api/query", "https://arxiv.org/api/query")
 ARXIV_API = ARXIV_HOSTS[0]
-
-# Headers are written in this exact order. arXiv's edge (Fastly) answers 406 on a
-# cache miss to the request shape Python's urllib writes (Accept-Encoding before
-# Host, plus Connection: close), while this curl-like shape reaches the origin.
-REQUEST_HEADERS: tuple[tuple[str, str], ...] = (
-    ("User-Agent", "bigbrain/0.1"),
-    ("Accept", "*/*"),
-)
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 
@@ -89,40 +80,6 @@ def parse_atom(xml_text: str) -> list[Paper]:
     return papers
 
 
-class HTTPStatusError(Exception):
-    def __init__(self, status: int, url: str, headers: dict[str, str], body: bytes) -> None:
-        super().__init__(f"HTTP {status} from {url}")
-        self.status, self.url, self.headers, self.body = status, url, headers, body
-
-
-def http_get(url: str, timeout: float = 30.0, max_redirects: int = 3) -> bytes:
-    """GET ``url`` writing headers curl-style: Host first, then REQUEST_HEADERS, nothing else."""
-    for _ in range(max_redirects + 1):
-        parts = urllib.parse.urlsplit(url)
-        if parts.scheme != "https":
-            raise ValueError(f"only https URLs are supported: {url}")
-        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout, context=ssl.create_default_context())
-        try:
-            path = parts.path + (f"?{parts.query}" if parts.query else "")
-            conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader("Host", parts.hostname)
-            for name, value in REQUEST_HEADERS:
-                conn.putheader(name, value)
-            conn.endheaders()
-            resp = conn.getresponse()
-            body = resp.read()
-            headers = {k: v for k, v in resp.getheaders()}
-        finally:
-            conn.close()
-        if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
-            url = urllib.parse.urljoin(url, resp.getheader("Location"))
-            continue
-        if resp.status != 200:
-            raise HTTPStatusError(resp.status, url, headers, body)
-        return body
-    raise HTTPStatusError(310, url, {}, b"too many redirects")
-
-
 RETRY_STATUSES = frozenset({403, 406, 415, 429, 500, 502, 503, 504})
 
 
@@ -137,12 +94,12 @@ def fetch(
     """Query the arXiv API, alternating hosts and backing off on throttling.
 
     arXiv answers 406 to requests shaped like Python's default client (see
-    ``http_get``) and, when shedding load, to every client on a host for
-    minutes at a time. Each attempt rotates the host; after the first two
+    ``bigbrain.net.http_get``) and, when shedding load, to every client on a
+    host for minutes at a time. Each attempt rotates the host; after the first two
     attempts the category filter is dropped in case the combined query is what
     is rejected.
     """
-    delay = 3.0  # arXiv asks for at least three seconds between requests
+    delay = 3.0
     last_error: str | None = None
     for attempt in range(retries + 1):
         host = hosts[attempt % len(hosts)]

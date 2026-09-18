@@ -51,6 +51,9 @@ bigbrain learn reddit --sub algotrading --sub quant --time month   # top posts a
 bigbrain learn github -q "topic:backtesting" --max 10          # most-starred repos and their READMEs
 bigbrain learn feed                                            # curated quant blogs (RSS)
 bigbrain learn url https://www.tradingview.com/chart/BTCUSD/xxxx/   # any page: idea, blog post, docs
+bigbrain learn market --from binance --symbol BTCUSDT          # 1000 daily candles, no key needed
+bigbrain learn market --from binance --symbol ETHUSDT --interval 4h
+bigbrain learn market --from stooq --symbol aapl.us            # free daily history for stocks and indices
 bigbrain learn market --csv data/AAPL.csv --symbol AAPL        # your own OHLCV data
 bigbrain learn market                                          # or synthetic data for a demo
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
@@ -76,7 +79,7 @@ CSV files need `date,open,high,low,close,volume` columns (any case, oldest first
 |---|---|---|---|
 | Built-in curriculum | 51 written lessons | concept | 1.0 |
 | arXiv | public API, quantitative finance categories | paper | 1.0 |
-| Market data | CSV or synthetic bars, indicators and backtests | observation, lesson | 1.0 |
+| Market data | Binance candles, Stooq daily history, CSV or synthetic bars; indicators and backtests | observation, lesson | 1.0 |
 | Your notes and files | `learn text`, `learn file` | note | 1.0 |
 | Blogs and RSS feeds | public feeds; `--full` fetches the whole article | article | 0.9 |
 | GitHub | public API; set `GITHUB_TOKEN` for 5000 requests/hour instead of 60 | code | 0.8 |

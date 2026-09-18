@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from bigbrain import Brain
@@ -78,6 +79,44 @@ class MarketTests(unittest.TestCase):
             bars = load_csv(path)
             self.assertEqual(len(bars), 40)
             self.assertEqual(bars[0].close, 100.5)
+
+    def test_parse_binance_klines(self):
+        from bigbrain.ingest.market import parse_binance_klines
+        payload = [[1700000000000, "37000.1", "37500", "36800", "37200.5", "1234.5", 1700086399999, "0", 10, "0", "0", "0"]]
+        bars = parse_binance_klines(payload)
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].close, 37200.5)
+        self.assertTrue(bars[0].date.startswith("2023-11-14"))
+
+    def test_fetch_binance_falls_back_to_mirror(self):
+        from unittest import mock
+        from bigbrain.ingest import market
+        from bigbrain.net import HTTPStatusError
+        payload = json.dumps([[1700000000000, "1", "2", "0.5", "1.5", "10", 0, "0", 1, "0", "0", "0"]]).encode()
+        calls = []
+
+        def fake_get(url, headers=None, **kw):
+            calls.append(url)
+            if "api.binance.com" in url:
+                raise HTTPStatusError(451, url, {}, b"restricted")
+            return payload
+
+        with mock.patch.object(market, "http_get", fake_get):
+            bars = market.fetch_binance("btcusdt", "1d", 5)
+        self.assertEqual(len(bars), 1)
+        self.assertIn("data-api.binance.vision", calls[1])
+        self.assertIn("symbol=BTCUSDT", calls[0])
+
+    def test_fetch_stooq_parses_and_rejects_empty(self):
+        from unittest import mock
+        from bigbrain.ingest import market
+        csv_text = "Date,Open,High,Low,Close,Volume\n2024-01-02,100,101,99,100.5,1000\n2024-01-03,100.5,102,100,101.5,1200\n"
+        with mock.patch.object(market, "http_get", return_value=csv_text.encode()):
+            bars = market.fetch_stooq("aapl.us")
+        self.assertEqual([b.close for b in bars], [100.5, 101.5])
+        with mock.patch.object(market, "http_get", return_value=b"No data"):
+            with self.assertRaises(RuntimeError):
+                market.fetch_stooq("nothing.xx")
 
     def test_too_few_bars(self):
         with self.assertRaises(ValueError):
@@ -161,6 +200,19 @@ class CortexTests(unittest.TestCase):
         text = answer_offline(brain, "what is the kelly criterion", recalls)
         self.assertIn("Kelly", text)
         self.assertIn("Connections", text)
+
+    def test_answer_falls_back_when_cortex_fails(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+        from bigbrain import cortex
+        brain = Brain()
+        seed(brain, packs=False)
+        err = io.StringIO()
+        with mock.patch.object(cortex, "answer_with_claude", side_effect=RuntimeError("invalid x-api-key")), redirect_stderr(err):
+            text, recalls = cortex.answer(brain, "what is drawdown", k=3, use_claude=True)
+        self.assertIn("Drawdown", text)
+        self.assertIn("cortex unavailable", err.getvalue())
 
     def test_offline_answer_on_empty_brain(self):
         text = answer_offline(Brain(), "anything", [])

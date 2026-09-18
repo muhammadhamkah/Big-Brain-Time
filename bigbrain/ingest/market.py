@@ -7,14 +7,18 @@ from ``synthetic()`` when you want to exercise the brain without real data.
 from __future__ import annotations
 
 import csv
+import io
+import json
 import math
 import random
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 from bigbrain.brain import Brain
 from bigbrain.ingest import indicators as ind
+from bigbrain.net import HTTPStatusError, http_get
 
 
 @dataclass
@@ -27,23 +31,69 @@ class Bar:
     volume: float
 
 
-def load_csv(path: str | Path) -> list[Bar]:
+def parse_csv(text: str) -> list[Bar]:
     bars: list[Bar] = []
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        cols = {c.lower().strip(): c for c in reader.fieldnames or []}
-        def col(name: str, *alts: str) -> str:
-            for n in (name, *alts):
-                if n in cols:
-                    return cols[n]
-            raise ValueError(f"CSV is missing a '{name}' column; columns are {list(cols)}")
-        d, o, h, l, c = col("date", "timestamp", "time"), col("open"), col("high"), col("low"), col("close", "adj close", "adj_close")
-        v = cols.get("volume")
-        for row in reader:
-            bars.append(Bar(row[d], float(row[o]), float(row[h]), float(row[l]), float(row[c]), float(row[v]) if v else 0.0))
+    reader = csv.DictReader(io.StringIO(text))
+    cols = {c.lower().strip(): c for c in reader.fieldnames or []}
+
+    def col(name: str, *alts: str) -> str:
+        for n in (name, *alts):
+            if n in cols:
+                return cols[n]
+        raise ValueError(f"CSV is missing a '{name}' column; columns are {list(cols)}")
+
+    d, o, h, l, c = col("date", "timestamp", "time"), col("open"), col("high"), col("low"), col("close", "adj close", "adj_close")
+    v = cols.get("volume")
+    for row in reader:
+        try:
+            bars.append(Bar(row[d], float(row[o]), float(row[h]), float(row[l]), float(row[c]), float(row[v]) if v and row[v] else 0.0))
+        except (ValueError, TypeError):
+            continue  # Stooq and others sometimes emit rows with missing numbers
     if bars and bars[0].date > bars[-1].date:
         bars.reverse()
     return bars
+
+
+def load_csv(path: str | Path) -> list[Bar]:
+    with open(path, newline="") as fh:
+        return parse_csv(fh.read())
+
+
+# ------------------------------------------------------------ online sources
+BINANCE_HOSTS = ("https://api.binance.com", "https://data-api.binance.vision")
+BINANCE_INTERVALS = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
+
+
+def parse_binance_klines(payload: list) -> list[Bar]:
+    """Binance kline rows: [open_time, open, high, low, close, volume, close_time, ...]."""
+    bars = []
+    for row in payload:
+        ts = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
+        bars.append(Bar(ts.strftime("%Y-%m-%d %H:%M"), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])))
+    return bars
+
+
+def fetch_binance(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 1000) -> list[Bar]:
+    """Public candles from Binance (no account needed). Falls back to the public data mirror."""
+    if interval not in BINANCE_INTERVALS:
+        raise ValueError(f"interval must be one of {BINANCE_INTERVALS}")
+    last: Exception | None = None
+    for host in BINANCE_HOSTS:
+        url = f"{host}/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={min(limit, 1000)}"
+        try:
+            return parse_binance_klines(json.loads(http_get(url, headers={"Accept": "application/json"}).decode("utf-8")))
+        except (HTTPStatusError, OSError) as exc:
+            last = exc
+    raise RuntimeError(f"Binance did not return candles for {symbol}: {last}")
+
+
+def fetch_stooq(symbol: str) -> list[Bar]:
+    """Free daily history from Stooq, e.g. 'aapl.us', 'spy.us', '^spx', 'btc.v'."""
+    url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i=d"
+    text = http_get(url, headers={"Accept": "text/csv,*/*"}).decode("utf-8", errors="replace")
+    if "No data" in text[:100] or "<html" in text[:200].lower():
+        raise RuntimeError(f"Stooq has no daily data for {symbol!r} (try 'aapl.us' or 'btc.v')")
+    return parse_csv(text)
 
 
 def synthetic(symbol: str = "SYNTH", n: int = 400, seed: int = 7, drift: float = 0.0004, vol: float = 0.015) -> list[Bar]:

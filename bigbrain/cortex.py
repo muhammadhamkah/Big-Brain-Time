@@ -15,6 +15,7 @@ Two modes:
 from __future__ import annotations
 
 import os
+import sys
 
 from bigbrain.brain import Brain
 from bigbrain.cells import Recall
@@ -107,5 +108,27 @@ def answer(brain: Brain, question: str, k: int = 8, use_claude: bool | None = No
     if use_claude is None:
         use_claude = is_available()
     if use_claude:
-        return answer_with_claude(brain, question, recalls, model=model), recalls
+        try:
+            return answer_with_claude(brain, question, recalls, model=model), recalls
+        except Exception as exc:  # bad key, no network, model unavailable: never lose the answer
+            reason = _explain_failure(exc)
+            print(f"(cortex unavailable: {reason}; showing the brain's recall instead)\n", file=sys.stderr)
     return answer_offline(brain, question, recalls), recalls
+
+
+def _explain_failure(exc: Exception) -> str:
+    try:
+        import anthropic
+    except ImportError:
+        return str(exc)
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "Anthropic rejected the API key; check ANTHROPIC_API_KEY or run `ant auth login`"
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return "this key is not allowed to use the model; try --model claude-sonnet-5"
+    if isinstance(exc, anthropic.RateLimitError):
+        return "rate limited; try again in a minute"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "could not reach the Anthropic API (network?)"
+    if isinstance(exc, anthropic.APIStatusError):
+        return f"API error {exc.status_code}"
+    return str(exc)

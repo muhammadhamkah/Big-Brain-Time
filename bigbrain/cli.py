@@ -71,6 +71,8 @@ def cmd_learn_market(args: argparse.Namespace) -> int:
     from bigbrain.ingest.market import learn_bars, load_csv, synthetic
     from bigbrain.ingest.strategies import learn_backtests
 
+    from bigbrain.ingest.market import fetch_binance, fetch_stooq
+
     brain = open_brain(args.db)
     if args.csv:
         if not Path(args.csv).is_file():
@@ -83,6 +85,27 @@ def cmd_learn_market(args: argparse.Namespace) -> int:
             return 1
         symbol = args.symbol or Path(args.csv).stem.upper()
         source = f"csv:{args.csv}"
+    elif getattr(args, "source", None) == "binance":
+        symbol = (args.symbol or "BTCUSDT").upper()
+        print(f"Fetching {args.limit} {args.interval} candles of {symbol} from Binance ...")
+        try:
+            bars = fetch_binance(symbol, interval=args.interval, limit=args.limit)
+        except Exception as exc:
+            print(f"Could not fetch from Binance: {exc}", file=sys.stderr)
+            return 1
+        source = f"binance:{symbol}:{args.interval}"
+    elif getattr(args, "source", None) == "stooq":
+        if not args.symbol:
+            print("Stooq needs --symbol, e.g. aapl.us, spy.us, ^spx, btc.v", file=sys.stderr)
+            return 1
+        print(f"Fetching daily history of {args.symbol} from Stooq ...")
+        try:
+            bars = fetch_stooq(args.symbol)
+        except Exception as exc:
+            print(f"Could not fetch from Stooq: {exc}", file=sys.stderr)
+            return 1
+        symbol = args.symbol.upper()
+        source = f"stooq:{args.symbol}"
     else:
         symbol = args.symbol or "SYNTH"
         bars = synthetic(symbol, n=args.bars, seed=args.seed)
@@ -303,7 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = learn.add_parser("market", help="learn from OHLCV data: indicators plus strategy backtests")
     p.add_argument("--csv", help="CSV with date,open,high,low,close,volume columns (oldest first)")
-    p.add_argument("--symbol", help="symbol name (defaults to the file name)")
+    p.add_argument("--from", dest="source", choices=["binance", "stooq"], help="fetch history online: binance (crypto, no key) or stooq (stocks, indices)")
+    p.add_argument("--interval", default="1d", help="binance candle size: 1m 5m 15m 30m 1h 4h 1d 1w (default 1d)")
+    p.add_argument("--limit", type=int, default=1000, help="binance candles to fetch (max 1000)")
+    p.add_argument("--symbol", help="symbol: BTCUSDT for binance, aapl.us / spy.us / ^spx for stooq, or a name for a CSV")
     p.add_argument("--bars", type=int, default=400, help="bars of synthetic data when no CSV is given")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--no-backtest", action="store_true")

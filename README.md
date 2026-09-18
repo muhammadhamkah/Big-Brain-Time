@@ -38,8 +38,8 @@ No dependencies beyond Python 3.10+.
 ```bash
 pip install -e .            # installs the `bigbrain` command
 
-bigbrain seed               # teach the foundational curriculum (51 concept cells)
-bigbrain feed               # go online: papers, Reddit, GitHub and blogs, all at once
+bigbrain seed               # curriculum plus every knowledge pack (hundreds of written lessons)
+bigbrain feed               # go online: papers, Reddit, GitHub, blogs, reference pages; 10 workers
 bigbrain ask "should I use trend following on BTC right now?"
 ```
 
@@ -62,7 +62,11 @@ bigbrain stats --journal 10
 bigbrain graph --format dot -o brain.dot && dot -Tsvg brain.dot -o brain.svg
 ```
 
-The database defaults to `.brain/brain.db`; override with `--db` or `BIGBRAIN_DB`. Learning is idempotent, so running `bigbrain feed` every day only adds what is new.
+The database defaults to `.brain/brain.db`; override with `--db` or `BIGBRAIN_DB`. Learning is idempotent, so running `bigbrain feed` every day only adds what is new. `feed` fetches from up to ten sources at once (`--workers`), while staying polite to each host.
+
+### Knowledge packs
+
+`bigbrain/knowledge/` holds written knowledge, one module per domain: technical analysis, risk management, quantitative strategies, microstructure and execution, options and volatility, futures and macro, forex, crypto, research methodology, and trading psychology and history. Each pack is 35-40 dense lessons plus curated sources for that domain (feeds, subreddits, GitHub queries, arXiv topics, reference pages). `bigbrain seed` learns every pack; `bigbrain feed` reads every pack's sources. Adding a domain is adding a file.
 
 CSV files need `date,open,high,low,close,volume` columns (any case, oldest first or newest first).
 
@@ -123,7 +127,8 @@ bigbrain/
   cortex.py           offline and Claude-powered answering
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
-  sources.py          the brain's diet: paper topics, subreddits, feeds, and `bigbrain feed`
+  sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel
+  knowledge/          knowledge packs: written lessons and curated sources per domain
   ingest/
     textbook.py       seed curriculum (51 concepts)
     indicators.py     SMA, EMA, RSI, MACD, Bollinger, ATR, volatility, drawdown, Sharpe

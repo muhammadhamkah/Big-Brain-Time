@@ -64,14 +64,17 @@ class BrainTests(unittest.TestCase):
         self.assertGreaterEqual(self.brain.get(a).activations, 2)
 
     def test_seed_is_idempotent_and_connected(self):
-        self.assertEqual(seed(self.brain), len(CURRICULUM))
-        self.assertEqual(seed(self.brain), 0)
+        from bigbrain.ingest.textbook import all_titles
+        self.assertEqual(seed(self.brain, packs=False), len(CURRICULUM))
+        self.assertEqual(seed(self.brain, packs=False), 0)
         stats = self.brain.stats()
         self.assertEqual(stats["cells"], len(CURRICULUM))
+        self.assertGreaterEqual(len(all_titles()), len(CURRICULUM))
+        self.assertEqual(len(all_titles()), len(set(all_titles())), "lesson titles must be unique across packs")
         self.assertGreater(stats["synapses"], len(CURRICULUM))  # every concept links to more than one other
 
     def test_export_graph(self):
-        seed(self.brain)
+        seed(self.brain, packs=False)
         graph = self.brain.export_graph()
         self.assertEqual(len(graph["nodes"]), len(CURRICULUM))
         self.assertEqual(len(graph["edges"]), self.brain.count_synapses())

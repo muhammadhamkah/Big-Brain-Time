@@ -184,18 +184,30 @@ class WebTests(unittest.TestCase):
 class SourcesTests(unittest.TestCase):
     def test_run_all_keeps_going_when_a_source_fails(self):
         from bigbrain import sources
+        from bigbrain.ingest import Item
         brain = Brain()
-        with mock.patch.object(sources.time, "sleep"), \
-             mock.patch("bigbrain.ingest.papers.fetch", side_effect=RuntimeError("arxiv down")), \
+        with mock.patch("bigbrain.ingest.papers.fetch", side_effect=RuntimeError("arxiv down")), \
              mock.patch("bigbrain.ingest.reddit.fetch_posts", return_value=[]), \
-             mock.patch("bigbrain.ingest.github.search", return_value=[]), \
-             mock.patch("bigbrain.ingest.web.learn_feed", return_value=["x"]):
-            report = sources.run_all(brain, quick=True)
-        self.assertEqual(report["curriculum"][0], 51)
+             mock.patch("bigbrain.ingest.github.fetch_repos", return_value=[]), \
+             mock.patch("bigbrain.ingest.web.feed_items", return_value=[Item("article", "Vol targeting", "Scaling position size inversely with volatility keeps risk constant. " * 3, "https://x")]):
+            report = sources.run_all(brain, quick=True, workers=4)
+        self.assertGreaterEqual(report["curriculum"][0], 51)
         self.assertEqual(report["papers"][0], 0)
         self.assertIn("arxiv down", report["papers"][1])
         self.assertEqual(report["reddit"], (0, None))
         self.assertEqual(report["feeds"][0], 3)
+        self.assertEqual(len(brain.find("Vol targeting")), 1, "identical items from several feeds merge into one cell")
+
+    def test_build_jobs_merges_pack_sources(self):
+        from bigbrain import sources
+        with mock.patch("bigbrain.knowledge.merged_sources", return_value={"feeds": ["https://example.com/feed"], "subreddits": ["algotrading", "newsub"], "github_queries": [], "arxiv_topics": ["momentum"], "urls": ["https://example.com/ref"]}):
+            jobs = sources.build_jobs(quick=False)
+        names = [(j.group, j.name) for j in jobs]
+        self.assertIn(("feeds", "https://example.com/feed"), names)
+        self.assertIn(("reddit", "r/newsub"), names)
+        self.assertIn(("pages", "https://example.com/ref"), names)
+        self.assertEqual(sum(1 for g, n in names if g == "papers" and n == "momentum"), 1)
+        self.assertEqual(sum(1 for g, n in names if g == "reddit" and n == "r/algotrading"), 1)
 
 
 if __name__ == "__main__":

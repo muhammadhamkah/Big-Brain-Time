@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 
 from bigbrain.brain import Brain
+from bigbrain.ingest import Item, learn_items
 from bigbrain.net import HTTPStatusError, http_get, http_json
 
 API = "https://api.github.com"
@@ -97,17 +98,30 @@ def render(repo: Repo) -> str:
     return f"{body}\n\nRepository: {repo.url}"
 
 
-def learn_repos(brain: Brain, repos: list[Repo], with_readme: bool = True) -> list[str]:
-    learned = []
+def fetch_repos(query: str, max_results: int = 10, with_readme: bool = True) -> list[Repo]:
+    repos = search(query, max_results)
+    if with_readme:
+        for repo in repos:
+            if not repo.readme:
+                repo.readme = fetch_readme(repo)
+    return repos
+
+
+def items(repos: list[Repo]) -> list[Item]:
+    out = []
     for repo in repos:
-        if with_readme and not repo.readme:
-            repo.readme = fetch_readme(repo)
         body = render(repo)
-        if len(body) < 150:
-            continue
-        cell, _ = brain.learn("code", repo.full_name, body, source=repo.url or f"github:{repo.full_name}", extra_concepts=["open source"])
-        learned.append(cell.title)
-    return learned
+        if len(body) >= 150:
+            out.append(Item("code", repo.full_name, body, source=repo.url or f"github:{repo.full_name}", extra_concepts=["open source"]))
+    return out
+
+
+def learn_repos(brain: Brain, repos: list[Repo], with_readme: bool = True) -> list[str]:
+    if with_readme:
+        for repo in repos:
+            if not repo.readme:
+                repo.readme = fetch_readme(repo)
+    return learn_items(brain, items(repos))
 
 
 def learn_github(brain: Brain, queries: tuple[str, ...] = DEFAULT_QUERIES, max_results: int = 10, with_readme: bool = True) -> dict[str, list[str]]:

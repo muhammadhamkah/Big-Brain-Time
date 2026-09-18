@@ -17,6 +17,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 from bigbrain.brain import Brain
+from bigbrain.ingest import Item, learn_items
 from bigbrain.net import http_text
 
 MAX_CONTENT = 6000  # characters kept per learned page
@@ -85,19 +86,28 @@ def fetch_page(url: str) -> Page:
     return extract(url, http_text(url, headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}))
 
 
-def learn_page(brain: Brain, page: Page, kind: str = "article") -> tuple[str, int]:
-    """Teach the brain a page. Returns (title, links created)."""
+def page_item(page: Page, kind: str = "article") -> Item:
     body = page.text[:MAX_CONTENT]
     if page.description and page.description not in body:
         body = f"{page.description}\n\n{body}"
     if len(body) < 200:
         raise ValueError(f"{page.url} has too little readable text (is it rendered by JavaScript?)")
-    cell, synapses = brain.learn(kind, page.title[:200], f"{body}\n\nSource: {page.url}", source=page.url)
+    return Item(kind, page.title[:200], f"{body}\n\nSource: {page.url}", source=page.url)
+
+
+def learn_page(brain: Brain, page: Page, kind: str = "article") -> tuple[str, int]:
+    """Teach the brain a page. Returns (title, links created)."""
+    item = page_item(page, kind)
+    cell, synapses = brain.learn(item.kind, item.title, item.content, source=item.source)
     return cell.title, len(synapses)
 
 
 def learn_url(brain: Brain, url: str, kind: str = "article") -> tuple[str, int]:
     return learn_page(brain, fetch_page(url), kind=kind)
+
+
+def url_item(url: str, kind: str = "article") -> Item:
+    return page_item(fetch_page(url), kind)
 
 
 # ------------------------------------------------------------------ RSS / Atom
@@ -142,10 +152,10 @@ def _strip_tags(text: str) -> str:
     return " ".join("".join(parser.chunks).split())
 
 
-def learn_feed(brain: Brain, feed_url: str, max_items: int = 20, follow_links: bool = False) -> list[str]:
-    """Learn every item in a feed. With ``follow_links`` the full article is fetched too."""
+def feed_items(feed_url: str, max_items: int = 20, follow_links: bool = False) -> list[Item]:
+    """Items for every entry in a feed. With ``follow_links`` the full article is fetched too."""
     items = parse_feed(http_text(feed_url, headers={"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.5"}))
-    learned: list[str] = []
+    out: list[Item] = []
     for item in items[:max_items]:
         body = item.summary
         if follow_links and item.link:
@@ -155,6 +165,9 @@ def learn_feed(brain: Brain, feed_url: str, max_items: int = 20, follow_links: b
                 pass
         if len(body) < 120:
             continue
-        cell, _ = brain.learn("article", item.title[:200], f"{body}\n\nSource: {item.link or feed_url}", source=item.link or feed_url)
-        learned.append(cell.title)
-    return learned
+        out.append(Item("article", item.title[:200], f"{body}\n\nSource: {item.link or feed_url}", source=item.link or feed_url))
+    return out
+
+
+def learn_feed(brain: Brain, feed_url: str, max_items: int = 20, follow_links: bool = False) -> list[str]:
+    return learn_items(brain, feed_items(feed_url, max_items, follow_links))

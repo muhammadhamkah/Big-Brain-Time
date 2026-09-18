@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 from bigbrain.brain import Brain
+from bigbrain.ingest import Item, learn_items
 from bigbrain.net import HTTPStatusError, http_json, http_text
 
 DEFAULT_SUBREDDITS = ("algotrading", "quant", "quantfinance", "Daytrading", "options", "stocks", "Forex", "CryptoCurrency", "investing")
@@ -158,15 +159,17 @@ def render(post: Post) -> str:
     return "\n\n".join(parts)
 
 
-def learn_posts(brain: Brain, posts: list[Post], min_chars: int = 200) -> list[str]:
-    learned = []
+def items(posts: list[Post], min_chars: int = 200) -> list[Item]:
+    out = []
     for post in posts:
         body = render(post)
-        if len(body) < min_chars:
-            continue
-        cell, _ = brain.learn("discussion", post.title[:200], body, source=f"reddit:r/{post.subreddit}")
-        learned.append(cell.title)
-    return learned
+        if len(body) >= min_chars:
+            out.append(Item("discussion", post.title[:200], body, source=f"reddit:r/{post.subreddit}"))
+    return out
+
+
+def learn_posts(brain: Brain, posts: list[Post], min_chars: int = 200) -> list[str]:
+    return learn_items(brain, items(posts, min_chars))
 
 
 def learn_subreddits(brain: Brain, subreddits: tuple[str, ...] = DEFAULT_SUBREDDITS, time: str = "week", limit: int = 25, min_score: int = 5, with_comments: bool = True) -> dict[str, list[str]]:

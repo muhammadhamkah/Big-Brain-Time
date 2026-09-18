@@ -65,9 +65,20 @@ CURRICULUM: list[tuple[str, str]] = [
 ]
 
 
-def seed(brain: Brain) -> int:
-    """Teach the curriculum. Returns the number of new cells created."""
+def all_titles() -> list[str]:
+    from bigbrain.knowledge import all_lessons
+
+    return [t for t, _ in CURRICULUM] + [t for _, t, _ in all_lessons()]
+
+
+def seed(brain: Brain, packs: bool = True) -> int:
+    """Teach the curriculum and every knowledge pack. Returns the number of new cells created."""
     before = brain.count_cells()
     for title, text in CURRICULUM:
         brain.learn("concept", title, text, source="bigbrain curriculum")
+    if packs:
+        from bigbrain.knowledge import all_lessons
+
+        for domain, title, text in all_lessons():
+            brain.learn("concept", title, text, source=f"bigbrain knowledge: {domain}")
     return brain.count_cells() - before

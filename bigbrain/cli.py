@@ -24,7 +24,7 @@ def cmd_seed(args: argparse.Namespace) -> int:
     from bigbrain.ingest.textbook import seed
 
     brain = open_brain(args.db)
-    n = seed(brain)
+    n = seed(brain, packs=not args.no_packs)
     print(f"Seeded {n} new concept cells. Brain now has {brain.count_cells()} cells and {brain.count_synapses()} synapses.")
     return 0
 
@@ -185,7 +185,7 @@ def cmd_feed(args: argparse.Namespace) -> int:
 
     brain = open_brain(args.db)
     before = (brain.count_cells(), brain.count_synapses())
-    report = run_all(brain, quick=args.quick, log=print)
+    report = run_all(brain, quick=args.quick, workers=args.workers, log=print)
     after = (brain.count_cells(), brain.count_synapses())
     print()
     for source, (n, err) in report.items():
@@ -278,7 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"bigbrain {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("seed", help="teach the brain the foundational trading curriculum")
+    p = sub.add_parser("seed", help="teach the brain the curriculum and every knowledge pack")
+    p.add_argument("--no-packs", action="store_true", help="only the 51 core lessons")
     p.set_defaults(func=cmd_seed)
 
     learn = sub.add_parser("learn", help="feed the brain knowledge").add_subparsers(dest="source", required=True)
@@ -335,6 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("feed", help="go online and learn from every source: papers, Reddit, GitHub, blogs")
     p.add_argument("--quick", action="store_true", help="fewer items per source")
+    p.add_argument("--workers", type=int, default=10, help="parallel fetchers (default 10)")
     p.set_defaults(func=cmd_feed)
 
     p = sub.add_parser("ask", help="ask the brain a question")

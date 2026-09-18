@@ -42,13 +42,14 @@ class HTTPStatusError(Exception):
 
 
 def _wait_for_host(host: str) -> None:
+    """Reserve the next slot for ``host`` and sleep until it. Threads on different hosts never wait on each other."""
     with _lock:
         interval = HOST_INTERVALS.get(host, DEFAULT_INTERVAL)
-        last = _last_request.get(host, 0.0)
-        pause = interval - (time.monotonic() - last)
-        if pause > 0:
-            time.sleep(pause)
-        _last_request[host] = time.monotonic()
+        now = time.monotonic()
+        slot = max(now, _last_request.get(host, 0.0) + interval)
+        _last_request[host] = slot
+    if slot > now:
+        time.sleep(slot - now)
 
 
 def _proxy_for(host: str) -> tuple[str, int] | None:

@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from bigbrain.brain import Brain
+from bigbrain.ingest import Item, learn_items
 from bigbrain.net import HTTPStatusError, http_get
 
 # arXiv serves the same API from both hosts; its edge intermittently rejects one
@@ -129,12 +130,15 @@ def fetch(
     raise RuntimeError(f"arXiv rejected every attempt on {len(hosts)} hosts; last error: {last_error}")
 
 
-def learn_papers(brain: Brain, papers: list[Paper]) -> list[str]:
-    """Teach the brain each paper. Returns the titles learned."""
-    learned = []
+def items(papers: list[Paper]) -> list[Item]:
+    out = []
     for p in papers:
         by = ", ".join(p.authors[:3]) + (" et al." if len(p.authors) > 3 else "")
         content = f"{p.abstract}\n\nAuthors: {by}. Published {p.published}. {p.url}"
-        cell, _ = brain.learn("paper", p.title, content, source=f"arXiv:{p.id}")
-        learned.append(cell.title)
-    return learned
+        out.append(Item("paper", p.title, content, source=f"arXiv:{p.id}"))
+    return out
+
+
+def learn_papers(brain: Brain, papers: list[Paper]) -> list[str]:
+    """Teach the brain each paper. Returns the titles learned."""
+    return learn_items(brain, items(papers))

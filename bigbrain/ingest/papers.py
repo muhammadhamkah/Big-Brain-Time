@@ -85,7 +85,7 @@ def fetch(
     the header profile; after the first two attempts the category filter is
     dropped as a further fallback in case the combined query is rejected.
     """
-    delay = 2.0
+    delay = 3.0  # arXiv asks for at least three seconds between requests
     last_error: str | None = None
     for attempt in range(retries + 1):
         host = hosts[attempt % len(hosts)]

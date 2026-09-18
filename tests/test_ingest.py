@@ -172,72 +172,82 @@ if __name__ == "__main__":
 
 
 class PaperFetchTests(unittest.TestCase):
-    def test_fetch_retries_on_406_then_succeeds(self):
-        import io, urllib.error
+    def _run(self, responder, *args, **kwargs):
         from unittest import mock
         from bigbrain.ingest import papers
 
-        calls = []
+        urls = []
 
-        def fake_urlopen(req, timeout):
-            calls.append(req.get_header("Accept"))
-            if len(calls) == 1:
-                raise urllib.error.HTTPError(req.full_url, 406, "Not Acceptable", {}, io.BytesIO(b""))
-            resp = mock.MagicMock()
-            resp.__enter__.return_value.read.return_value = ATOM_SAMPLE.encode()
-            return resp
+        def fake_get(url, timeout=30.0):
+            urls.append(url)
+            return responder(url, len(urls))
 
-        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
-            result = papers.fetch("momentum", max_results=1)
+        with mock.patch.object(papers, "http_get", fake_get), mock.patch.object(papers.time, "sleep"):
+            return papers.fetch(*args, **kwargs), urls
+
+    def test_fetch_retries_on_406_then_succeeds(self):
+        from bigbrain.ingest.papers import HTTPStatusError
+
+        def responder(url, n):
+            if n == 1:
+                raise HTTPStatusError(406, url, {}, b"")
+            return ATOM_SAMPLE.encode()
+
+        result, urls = self._run(responder, "momentum", max_results=1)
         self.assertEqual(len(result), 1)
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(all(calls), "every request must send an Accept header")
+        self.assertEqual(len(urls), 2)
 
     def test_fetch_gives_up_on_404(self):
-        import io, urllib.error
-        from unittest import mock
-        from bigbrain.ingest import papers
+        from bigbrain.ingest.papers import HTTPStatusError
 
-        def fake_urlopen(req, timeout):
-            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+        def responder(url, n):
+            raise HTTPStatusError(404, url, {}, b"")
 
-        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
-            with self.assertRaises(urllib.error.HTTPError):
-                papers.fetch("momentum")
+        with self.assertRaises(HTTPStatusError):
+            self._run(responder, "momentum")
 
     def test_fetch_alternates_hosts_and_simplifies_query(self):
-        import io, urllib.error
-        from unittest import mock
-        from bigbrain.ingest import papers
+        from bigbrain.ingest.papers import HTTPStatusError
 
-        urls = []
+        seen = []
 
-        def fake_urlopen(req, timeout):
-            urls.append(req.full_url)
-            raise urllib.error.HTTPError(req.full_url, 406, "Not Acceptable", {}, io.BytesIO(b""))
+        def responder(url, n):
+            seen.append(url)
+            raise HTTPStatusError(406, url, {}, b"")
 
-        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
-            with self.assertRaises(RuntimeError):
-                papers.fetch("momentum", retries=3)
-        self.assertEqual(len(urls), 4)
-        self.assertTrue(urls[0].startswith("https://export.arxiv.org/"))
-        self.assertTrue(urls[1].startswith("https://arxiv.org/"))
-        self.assertIn("cat%3A", urls[0])
-        self.assertNotIn("cat%3A", urls[2], "later attempts drop the category filter")
-        self.assertIn("all%3Amomentum", urls[2])
+        with self.assertRaises(RuntimeError):
+            self._run(responder, "momentum", retries=3)
+        self.assertEqual(len(seen), 4)
+        self.assertTrue(seen[0].startswith("https://export.arxiv.org/"))
+        self.assertTrue(seen[1].startswith("https://arxiv.org/"))
+        self.assertIn("cat%3A", seen[0])
+        self.assertNotIn("cat%3A", seen[2], "later attempts drop the category filter")
+        self.assertIn("all%3Amomentum", seen[2])
 
     def test_multi_word_search_is_quoted_in_url(self):
-        import io, urllib.error
+        from bigbrain.ingest.papers import HTTPStatusError
+
+        seen = []
+
+        def responder(url, n):
+            seen.append(url)
+            raise HTTPStatusError(404, url, {}, b"")
+
+        with self.assertRaises(HTTPStatusError):
+            self._run(responder, "mean reversion", retries=0)
+        self.assertIn("all%3A%22mean+reversion%22", seen[0])
+
+    def test_http_get_writes_curl_shaped_request(self):
         from unittest import mock
         from bigbrain.ingest import papers
 
-        urls = []
-
-        def fake_urlopen(req, timeout):
-            urls.append(req.full_url)
-            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
-
-        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen):
-            with self.assertRaises(urllib.error.HTTPError):
-                papers.fetch("mean reversion", retries=0)
-        self.assertIn("all%3A%22mean+reversion%22", urls[0])
+        conn = mock.MagicMock()
+        resp = conn.getresponse.return_value
+        resp.status, resp.read.return_value = 200, b"<feed/>"
+        resp.getheaders.return_value, resp.getheader.return_value = [], None
+        with mock.patch.object(papers.http.client, "HTTPSConnection", return_value=conn):
+            body = papers.http_get("https://export.arxiv.org/api/query?search_query=all%3Ax")
+        self.assertEqual(body, b"<feed/>")
+        conn.putrequest.assert_called_once_with("GET", "/api/query?search_query=all%3Ax", skip_host=True, skip_accept_encoding=True)
+        header_names = [c.args[0] for c in conn.putheader.call_args_list]
+        self.assertEqual(header_names, ["Host", "User-Agent", "Accept"])

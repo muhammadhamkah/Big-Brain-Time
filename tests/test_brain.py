@@ -45,14 +45,14 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(self.brain.count_cells(), 1)
 
     def test_recall_ranks_direct_match_first_and_spreads(self):
-        seed(self.brain)
+        seed(self.brain, packs=False)
         results = self.brain.recall("how much should I risk per trade when volatility is high", k=5)
         titles = [r.cell.title for r in results]
         self.assertIn("Position sizing", titles[:3])
         self.assertTrue(any(r.via for r in results), "activation should spread across synapses")
 
     def test_recall_reinforces_links(self):
-        seed(self.brain)
+        seed(self.brain, packs=False)
         first = self.brain.recall("kelly criterion position sizing", k=3)
         a, b = first[0].cell.id, first[1].cell.id
         before = self.brain._get_synapse(a, b)
@@ -95,3 +95,16 @@ class BrainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KnowledgePackTests(unittest.TestCase):
+    def test_full_seed_is_dense_and_recall_reaches_pack_lessons(self):
+        from bigbrain.ingest.textbook import all_titles
+        brain = Brain()
+        n = seed(brain)
+        self.assertEqual(n, len(all_titles()))
+        self.assertGreater(brain.count_synapses() / n, 10, "each lesson should link to many others")
+        titles = [r.cell.title for r in brain.recall("how do I compute the implied move before earnings from option prices", k=5)]
+        self.assertTrue(any("implied move" in t.lower() or "earnings" in t.lower() for t in titles), titles)
+        titles = [r.cell.title for r in brain.recall("what happened to LTCM and what does it teach about leverage", k=5)]
+        self.assertTrue(any("LTCM" in t or "Long-Term Capital" in t for t in titles), titles)

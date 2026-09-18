@@ -51,7 +51,7 @@ class RedditTests(unittest.TestCase):
 
     def test_learn_posts_links_to_curriculum(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         with mock.patch.object(reddit, "http_json", side_effect=[LISTING, COMMENTS]):
             posts = reddit.fetch_posts("algotrading", min_score=5)
         self.assertEqual(len(posts), 1)
@@ -64,15 +64,20 @@ class RedditTests(unittest.TestCase):
         neighbors = [c.title for c, _ in brain.neighbors(cell.id, limit=30)]
         self.assertIn("Mean reversion", neighbors)
 
-    def test_discussions_rank_below_concepts(self):
+    def test_discussions_are_discounted_by_trust(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         with mock.patch.object(reddit, "http_json", side_effect=[LISTING, COMMENTS]):
             reddit.learn_posts(brain, reddit.fetch_posts("algotrading"))
-        results = brain.recall("mean reversion with leverage and no stop loss", k=5)
-        kinds = [r.cell.kind for r in results]
-        self.assertIn("discussion", kinds)
-        self.assertEqual(kinds[0], "concept")
+        query = "mean reversion with leverage and no stop loss"
+        trusted = {r.cell.id: r.score for r in brain.recall(query, k=6, reinforce=False)}
+        with mock.patch.dict(Brain.KIND_TRUST, {"discussion": 1.0}):
+            flat = {r.cell.id: r.score for r in brain.recall(query, k=6, reinforce=False)}
+        post = brain.cells(kind="discussion")[0]
+        self.assertIn(post.id, trusted)
+        self.assertAlmostEqual(trusted[post.id], flat[post.id] * Brain.KIND_TRUST["discussion"], places=3)
+        concept = brain.find("Mean reversion")[0]
+        self.assertAlmostEqual(trusted[concept.id], flat[concept.id], places=3)
 
 
 REDDIT_RSS = """<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
@@ -130,7 +135,7 @@ class GitHubTests(unittest.TestCase):
 
     def test_learn_repos(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         with mock.patch.object(github, "http_json", return_value=SEARCH), mock.patch.object(github, "http_get", return_value=README.encode()):
             repos = github.search("topic:backtesting")
             titles = github.learn_repos(brain, repos)
@@ -155,7 +160,7 @@ class WebTests(unittest.TestCase):
 
     def test_learn_url(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         with mock.patch.object(web, "http_text", return_value=HTML):
             title, links = web.learn_url(brain, "https://example.com/tf")
         self.assertGreater(links, 0)
@@ -174,7 +179,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(items[0].link, "https://example.com/vol")
         self.assertIn("Scaling position size", items[0].summary)
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         with mock.patch.object(web, "http_text", return_value=RSS):
             titles = web.learn_feed(brain, "https://example.com/feed")
         self.assertEqual(titles, ["Volatility targeting explained"])

@@ -87,7 +87,8 @@ class Brain:
     }
     MAX_LINKS_PER_CELL = 30  # strongest links kept when a new cell arrives
     HEBBIAN_STEP = 0.05  # how much co-recall strengthens a synapse
-    SPREAD_FACTOR = 0.6  # how much activation leaks across a synapse
+    SPREAD_FACTOR = 0.3  # how much activation leaks across a synapse
+    MAX_SPREAD_GAIN = 0.25  # cap on what one cell can collect from spreading
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
@@ -116,7 +117,8 @@ class Brain:
 
         text = f"{title}\n{content}"
         concepts = list(dict.fromkeys([*extract_concepts(text), *extra_concepts]))
-        tokens = tokenize(text)
+        # Title terms count three times: a title says what a cell is about more than any body sentence.
+        tokens = tokenize(text) + tokenize(title) + tokenize(title)
         cell.concepts = concepts
 
         self.db.execute(
@@ -151,11 +153,9 @@ class Brain:
                 " AND cell_id != ? GROUP BY cell_id",
                 (*own_concepts, cell.id),
             ).fetchall()
+            counts = self._concept_counts([row["cell_id"] for row in rows])
             for row in rows:
-                other_count = self.db.execute(
-                    "SELECT COUNT(*) FROM cell_concepts WHERE cell_id = ?", (row["cell_id"],)
-                ).fetchone()[0]
-                union = len(own_concepts) + other_count - row["shared"]
+                union = len(own_concepts) + counts.get(row["cell_id"], 0) - row["shared"]
                 candidates[row["cell_id"]] = row["shared"] / union if union else 0.0
 
         # Vocabulary similarity (tf-idf cosine) for cells sharing informative terms.
@@ -174,9 +174,10 @@ class Brain:
                 w = self._idf(df.get(row["token"], 0), n_cells)
                 dots[row["cell_id"]] += own_vec[row["token"]] * row["tf"] * w
             if dots:
-                norms = self._norms(dots.keys(), n_cells)
-                for cid, dot in dots.items():
-                    cosine = dot / (own_norm * norms.get(cid, 1.0))
+                strongest = sorted(dots, key=lambda cid: -dots[cid])[: self.MAX_LINKS_PER_CELL * 4]
+                norms = self._norms(strongest, n_cells)
+                for cid in strongest:
+                    cosine = dots[cid] / (own_norm * norms.get(cid, 1.0))
                     candidates[cid] = 0.6 * candidates.get(cid, 0.0) + 0.4 * cosine if cid in candidates else 0.4 * cosine
 
         ranked = sorted(candidates.items(), key=lambda kv: -kv[1])[: self.MAX_LINKS_PER_CELL]
@@ -210,15 +211,27 @@ class Brain:
             ).fetchall()
             concepts |= {r["concept"] for r in rows}
 
+        # Channel 1: concept overlap, weighted by how rare each concept is. A concept
+        # shared by five cells says far more than one shared by a hundred.
+        concept_scores: dict[str, float] = defaultdict(float)
         if concepts:
             placeholders = ",".join("?" * len(concepts))
-            rows = self.db.execute(
-                f"SELECT cell_id, COUNT(*) AS shared FROM cell_concepts WHERE concept IN ({placeholders}) GROUP BY cell_id",
-                tuple(concepts),
-            ).fetchall()
-            for row in rows:
-                scores[row["cell_id"]] += 0.6 * row["shared"] / len(concepts)
+            df_c = {
+                r["concept"]: r["n"]
+                for r in self.db.execute(
+                    f"SELECT concept, COUNT(*) AS n FROM cell_concepts WHERE concept IN ({placeholders}) GROUP BY concept",
+                    tuple(concepts),
+                )
+            }
+            weight = {c: self._idf(df_c.get(c, 0), n_cells) for c in concepts}
+            total = sum(weight.values()) or 1.0
+            for r in self.db.execute(
+                f"SELECT cell_id, concept FROM cell_concepts WHERE concept IN ({placeholders})", tuple(concepts)
+            ):
+                concept_scores[r["cell_id"]] += weight[r["concept"]] / total
 
+        # Channel 2: vocabulary (tf-idf cosine), normalized so the best lexical match scores 1.
+        lexical_scores: dict[str, float] = {}
         if tokens:
             df = self._doc_freq(tokens.keys())
             q_vec = {t: tf * self._idf(df.get(t, 0), n_cells) for t, tf in tokens.items()}
@@ -230,20 +243,29 @@ class Brain:
             dots: dict[str, float] = defaultdict(float)
             for row in rows:
                 dots[row["cell_id"]] += q_vec[row["token"]] * row["tf"] * self._idf(df.get(row["token"], 0), n_cells)
-            norms = self._norms(dots.keys(), n_cells)
-            for cid, dot in dots.items():
-                scores[cid] += 0.4 * dot / (q_norm * norms.get(cid, 1.0))
+            strongest = sorted(dots, key=lambda cid: -dots[cid])[: max(k * 8, 40)]
+            norms = self._norms(strongest, n_cells)
+            cosines = {cid: dots[cid] / (q_norm * norms.get(cid, 1.0)) for cid in strongest}
+            best = max(cosines.values(), default=0.0) or 1.0
+            lexical_scores = {cid: c / best for cid, c in cosines.items()}
 
+        for cid in set(concept_scores) | set(lexical_scores):
+            scores[cid] = 0.5 * concept_scores.get(cid, 0.0) + 0.5 * lexical_scores.get(cid, 0.0)
+
+        # Spreading activation: each seed wakes its strongest neighbours a little.
         via: dict[str, list[str]] = defaultdict(list)
         if spread and scores:
             seeds = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
+            gains: dict[str, float] = defaultdict(float)
             for seed_id, seed_score in seeds:
-                for syn in self.synapses_of(seed_id):
+                for syn in self.synapses_of(seed_id)[:10]:
                     other = syn.other(seed_id)
                     gain = self.SPREAD_FACTOR * seed_score * syn.weight
                     if gain > 0.01:
-                        scores[other] += gain
+                        gains[other] += gain
                         via[other].append(seed_id)
+            for cid, gain in gains.items():
+                scores[cid] += min(gain, self.MAX_SPREAD_GAIN)  # a neighbour can be woken, not outrank a direct hit
 
         kinds = {r["id"]: r["kind"] for r in self.db.execute("SELECT id, kind FROM cells")} if scores else {}
         weighted = {cid: sc * self.KIND_TRUST.get(kinds.get(cid, ""), 0.8) for cid, sc in scores.items()}
@@ -378,27 +400,45 @@ class Brain:
         )
         return Synapse(a, b, weight, reason)
 
+    _CHUNK = 500  # SQLite bound-parameter safety
+
     def _doc_freq(self, terms: Iterable[str]) -> dict[str, int]:
-        terms = list(terms)
-        if not terms:
-            return {}
-        placeholders = ",".join("?" * len(terms))
-        rows = self.db.execute(
-            f"SELECT token, COUNT(*) AS n FROM cell_tokens WHERE token IN ({placeholders}) GROUP BY token", terms
-        ).fetchall()
-        return {r["token"]: r["n"] for r in rows}
+        terms = list(dict.fromkeys(terms))
+        out: dict[str, int] = {}
+        for i in range(0, len(terms), self._CHUNK):
+            chunk = terms[i : i + self._CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            for r in self.db.execute(
+                f"SELECT token, COUNT(*) AS n FROM cell_tokens WHERE token IN ({placeholders}) GROUP BY token", chunk
+            ):
+                out[r["token"]] = r["n"]
+        return out
+
+    def _concept_counts(self, cell_ids: list[str]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for i in range(0, len(cell_ids), self._CHUNK):
+            chunk = cell_ids[i : i + self._CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            for r in self.db.execute(
+                f"SELECT cell_id, COUNT(*) AS n FROM cell_concepts WHERE cell_id IN ({placeholders}) GROUP BY cell_id", chunk
+            ):
+                out[r["cell_id"]] = r["n"]
+        return out
 
     def _norms(self, cell_ids: Iterable[str], n_cells: int) -> dict[str, float]:
+        """tf-idf vector norms for the given cells, loaded in two batched queries."""
         cell_ids = list(cell_ids)
-        norms: dict[str, float] = {}
-        for cid in cell_ids:
-            row = self.db.execute("SELECT tokens FROM cells WHERE id = ?", (cid,)).fetchone()
-            if row is None:
-                continue
-            toks: dict[str, int] = json.loads(row[0])
-            df = self._doc_freq(toks.keys())
-            norms[cid] = math.sqrt(sum((tf * self._idf(df.get(t, 0), n_cells)) ** 2 for t, tf in toks.items())) or 1.0
-        return norms
+        token_maps: dict[str, dict[str, int]] = {}
+        for i in range(0, len(cell_ids), self._CHUNK):
+            chunk = cell_ids[i : i + self._CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            for r in self.db.execute(f"SELECT id, tokens FROM cells WHERE id IN ({placeholders})", chunk):
+                token_maps[r["id"]] = json.loads(r["tokens"])
+        df = self._doc_freq(t for toks in token_maps.values() for t in toks)
+        return {
+            cid: math.sqrt(sum((tf * self._idf(df.get(t, 0), n_cells)) ** 2 for t, tf in toks.items())) or 1.0
+            for cid, toks in token_maps.items()
+        }
 
     @staticmethod
     def _idf(df: int, n: int) -> float:

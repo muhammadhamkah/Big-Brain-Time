@@ -59,7 +59,7 @@ class MarketTests(unittest.TestCase):
 
     def test_learn_bars_creates_linked_observations(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         titles = learn_bars(brain, "TEST", synthetic(n=300))
         self.assertGreaterEqual(len(titles), 4)
         cell = brain.find("TEST: RSI")[0]
@@ -100,7 +100,7 @@ class StrategyTests(unittest.TestCase):
 
     def test_learn_backtests_creates_lessons(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         results = learn_backtests(brain, "SYN", synthetic(n=300))
         self.assertEqual(len(results), len(STRATEGIES))
         lessons = brain.cells(kind="lesson")
@@ -143,7 +143,7 @@ class PaperTests(unittest.TestCase):
 
     def test_learn_papers_links_to_curriculum(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         titles = learn_papers(brain, parse_atom(ATOM_SAMPLE))
         cell = brain.find(titles[0])[0]
         self.assertEqual(cell.kind, "paper")
@@ -156,7 +156,7 @@ class PaperTests(unittest.TestCase):
 class CortexTests(unittest.TestCase):
     def test_offline_answer_mentions_top_cell(self):
         brain = Brain()
-        seed(brain)
+        seed(brain, packs=False)
         recalls = brain.recall("what is the kelly criterion", k=4)
         text = answer_offline(brain, "what is the kelly criterion", recalls)
         self.assertIn("Kelly", text)

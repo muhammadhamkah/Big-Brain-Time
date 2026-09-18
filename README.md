@@ -117,7 +117,9 @@ Run it in a terminal you leave open, or with `--once` from cron every 15 minutes
 4. **Costs**: VIP 0 fees for the market (perps 0.05% taker, spot 0.1% taker, each way, market orders), funding on perps, and slippage modelled from liquidity: half the estimated spread (about 1bp for BTC, wider for thin pairs) plus impact from the order's share of the candle's volume. Stops fill at the stop, or at the open when a candle gaps through it.
 5. **Every closed trade gets a post-mortem**, win or loss: context at entry, best and worst point while open, how it exited, gross versus net, funding paid or received. Diagnostic lenses produce findings (fought the trend, breakout against regime, stop inside the noise, gave back an open gain, whipsaw, thesis never developed, costs ate the edge, funding drag; trend aligned, dip in uptrend, pop in downtrend, rode the move, fast resolution, near miss, funding tailwind). Each finding updates the belief table, instructive trades become post-mortem cells the brain can recall, and every ten trades per signal it rewrites a "what I have learned" lesson.
 
-`bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that now drives its decisions; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
+6. **Exit learning.** Every position keeps its bar path. When it closes, the brain replays that path under five exit styles (the signal's rule, take profit at 1R or 2R, break-even after 1R, trailing stop after 1R) and records what each would have returned net of costs. Once a signal has twenty trades, if a style beats the rule by at least 0.1% per trade it becomes that signal's live exit; if it stops winning, the policy reverts. The replay and the live position share one step function, so what was measured is exactly what is then done.
+
+`bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that now drives its decisions and the exit policies; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
 
 ### Running for months
 
@@ -175,6 +177,7 @@ bigbrain/
   trader.py           the brain trades: universe, costs, margin and risk caps, belief-driven entries, exits, one wallet
   dashboard.py        live terminal dashboard: equity, positions at live prices, beliefs, trades, feed
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
+  exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

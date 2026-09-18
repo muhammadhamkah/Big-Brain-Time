@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+from bigbrain import exits
 from bigbrain import postmortem as pm
 from bigbrain.brain import Brain
 from bigbrain.ingest import indicators as ind
@@ -111,6 +112,11 @@ class Position:
     funding: float = 0.0  # USDT paid (positive) or received (negative) so far
     last_funding_hour: str = ""  # "YYYY-MM-DD HH" of the last funding time applied
     margin: float = 0.0  # cash posted for this position (notional / leverage)
+    path: list = field(default_factory=list)  # [(high, low, close)] per bar since entry, for exit learning
+    exit_variant: str = "rule"  # the exit policy this position runs under
+    exit_armed: bool = False
+    exit_best: float = 0.0
+    exit_target: float | None = None
 
     @property
     def key(self) -> str:
@@ -310,11 +316,14 @@ class Trader:
         fee = notional * self.fees["taker"]
         qty = notional / fill
         margin = notional / self.leverage
+        variant = exits.current_policy(self.brain, self.book).get(signal, "rule")
+        est = exits.init_state(variant, fill, side, stop_pct)
         pos = Position(
             symbol=symbol, signal=signal, entry_time=bar.date, entry_price=fill, qty=qty, notional=notional,
             stop=fill * (1 - side * stop_pct), max_bars=play["max_bars"], exit_rule=play["exit"],
-            context={**ctx, "risk_pct": stop_pct, "p_win_believed": round(b["p_win"], 3), "samples": b["samples"], "market": self.market},
+            context={**ctx, "risk_pct": stop_pct, "p_win_believed": round(b["p_win"], 3), "samples": b["samples"], "market": self.market, "exit_variant": variant},
             explore=explore, mark=bar.close, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=bar.date[:13], margin=margin,
+            exit_variant=variant, exit_best=est.best, exit_target=est.target,
         )
         self.wallet.cash -= margin + fee
         self.wallet.positions[key] = asdict(pos)
@@ -335,11 +344,19 @@ class Trader:
                 pos.mae = min(pos.mae, 1 - bar.high / pos.entry_price)
             pos.mark = bar.close
             self._apply_funding(pos, bar)
+            pos.path.append((bar.high, bar.low, bar.close))
+            if len(pos.path) > 200:
+                pos.path = pos.path[-200:]
+            risk_pct = pos.context.get("risk_pct") or 0.0
+            est = exits.ExitState(stop=pos.stop, best=pos.exit_best or pos.entry_price, armed=pos.exit_armed, target=pos.exit_target)
+            hit, px = exits.step(pos.exit_variant, est, pos.entry_price, pos.side, risk_pct, bar.high, bar.low)
+            pos.stop, pos.exit_best, pos.exit_armed = est.stop, est.best, est.armed
             reason, price = None, bar.close
-            if pos.side == 1 and bar.low <= pos.stop:
-                reason, price = "stop", min(bar.open, pos.stop)
-            elif pos.side == -1 and bar.high >= pos.stop:
-                reason, price = "stop", max(bar.open, pos.stop)
+            if hit in ("stop", "trail"):
+                reason = hit
+                price = (min(bar.open, px) if pos.side == 1 else max(bar.open, px))  # a gap through the stop fills at the open
+            elif hit == "target":
+                reason, price = "target", px
             elif self._exit_rule_hit(pos.exit_rule, cur, fired):
                 reason = "signal"
             elif pos.bars_held >= pos.max_bars:
@@ -413,6 +430,14 @@ class Trader:
         findings = pm.lenses(t)
         pm.update_belief(self.brain, t)
         pm.record(self.brain, t, findings)
+        cost_ratio = (t.fees + t.slippage) / pos.notional if pos.notional else 0.0
+        variants = exits.simulate(pos.path, pos.entry_price, pos.side, pos.context.get("risk_pct") or 0.0, price, cost_ratio)
+        variants["rule"] = net_ret  # what actually happened, funding included
+        exits.record(self.brain, self.book, pos.signal, variants)
+        self.brain.db.execute("UPDATE trades SET variants = ? WHERE id = (SELECT MAX(id) FROM trades WHERE book = ?)", (json.dumps(variants), self.book))
+        changed = exits.update_policy(self.brain, self.book, pos.signal)
+        if changed:
+            self._log(f"    EXIT POLICY {pos.signal}: {changed[0]} -> {changed[1]} (learned from {exits.stats(self.brain, self.book, pos.signal)['rule'][0]} trades)")
         cell = pm.learn_postmortem(self.brain, t, findings)
         n_signal = self.brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = ? AND signal = ?", (self.book, pos.signal)).fetchone()[0]
         if n_signal % 10 == 0:

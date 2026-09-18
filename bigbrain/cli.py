@@ -403,6 +403,14 @@ def cmd_beliefs(args: argparse.Namespace) -> int:
     print(f"{'signal':18} {'regime':10} {'vol':5} {'n':>4} {'win':>5} {'avg':>8}  verdict")
     for b in rows:
         print(f"{b['signal']:18} {b['regime']:10} {b['vol']:5} {b['n']:4} {b['win_rate']:5.0%} {b['avg_ret']:+8.2%}  {b['verdict']}")
+    from bigbrain import exits
+
+    pol = exits.describe(brain, args.book)
+    if pol:
+        print("\nexit policies (net average per trade under each exit style, measured on the brain's own trades):")
+        for p in pol:
+            ranking = "  ".join(f"{v} {avg:+.2%}" for v, (n, avg) in sorted(p["stats"].items(), key=lambda kv: -kv[1][1]))
+            print(f"  {p['signal']:18} uses {p['policy']:13} ({p['trades']} trades)  {ranking}")
     return 0
 
 

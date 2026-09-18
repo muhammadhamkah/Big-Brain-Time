@@ -143,6 +143,18 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
         lines.append(f"  {DIM}no closed trades yet{RESET}")
     lines.append("")
 
+    # exit policies
+    from bigbrain import exits as _exits
+
+    pol = [p for p in _exits.describe(brain, book) if p["trades"] >= 5]
+    if pol:
+        lines.append(f"{BOLD}EXIT LEARNING{RESET}  {DIM}per signal: live exit style, and the best measured alternative{RESET}")
+        for p in pol[:4]:
+            best_text = colour(p["best_avg"], f"{p['best']} {p['best_avg']:+.2%}")
+            rule_text = colour(p["rule_avg"], f"{p['rule_avg']:+.2%}")
+            lines.append(f"  {p['signal']:18} exits by {p['policy']:13} rule avg {rule_text}  best {best_text}  ({p['trades']} trades)")
+        lines.append("")
+
     # recent closed trades
     lines.append(f"{BOLD}RECENT CLOSED TRADES{RESET}")
     rows = brain.db.execute("SELECT symbol, signal, side, exit_time, exit_reason, net_ret, pnl, findings FROM trades WHERE book = ? ORDER BY id DESC LIMIT 6", (book,)).fetchall()

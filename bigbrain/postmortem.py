@@ -73,7 +73,7 @@ def lenses(t: Trade) -> list[tuple[str, str]]:
             out.append(("funding_drag", f"paid {t.funding:.2f} USDT in funding while holding the {side_word}, a large share of the loss; holding through funding times against the crowd is a cost the signal must beat."))
         if t.exit_reason == "stop" and ctx.get("vol_bucket") == "high":
             out.append(("stop_inside_noise", f"stopped out in a high-volatility regime: the stop sat {r:.2%} away while typical bars moved {ctx.get('atr_pct', 0):.2%}, so noise alone could reach it."))
-        if r and t.mfe >= r and t.exit_reason != "stop":
+        if r and t.mfe >= r and t.exit_reason not in ("stop", "trail", "target"):
             out.append(("gave_back_open_gain", f"the trade was up {t.mfe:.2%} (more than one R) before closing at {t.net_ret:+.2%}: no partial exit or trailing stop protected the gain."))
         if t.bars_held <= 2 and t.exit_reason in ("stop", "opposite"):
             out.append(("whipsaw", "reversed within two bars of entry: the signal fired on a spike that immediately unwound."))

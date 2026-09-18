@@ -120,6 +120,14 @@ CREATE TABLE IF NOT EXISTS beliefs (
     sum_loss REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (book, signal, regime, vol_bucket)
 );
+CREATE TABLE IF NOT EXISTS exit_stats (
+    book TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    n INTEGER NOT NULL DEFAULT 0,
+    sum_ret REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (book, signal, variant)
+);
 CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -164,7 +172,8 @@ class Brain:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        for stmt in ("ALTER TABLE trades ADD COLUMN side INTEGER NOT NULL DEFAULT 1", "ALTER TABLE trades ADD COLUMN funding REAL NOT NULL DEFAULT 0"):
+        for stmt in ("ALTER TABLE trades ADD COLUMN side INTEGER NOT NULL DEFAULT 1", "ALTER TABLE trades ADD COLUMN funding REAL NOT NULL DEFAULT 0",
+                     "ALTER TABLE trades ADD COLUMN variants TEXT NOT NULL DEFAULT '{}'"):
             try:
                 self.db.execute(stmt)
             except sqlite3.OperationalError:

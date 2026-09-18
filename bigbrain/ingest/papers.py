@@ -86,7 +86,7 @@ def fetch(
     dropped as a further fallback in case the combined query is rejected.
     """
     delay = 2.0
-    last_error: Exception | None = None
+    last_error: str | None = None
     for attempt in range(retries + 1):
         host = hosts[attempt % len(hosts)]
         headers = HEADER_PROFILES[attempt % len(HEADER_PROFILES)]
@@ -105,11 +105,12 @@ def fetch(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return parse_atom(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            last_error = exc
+            body = exc.read(600).decode("utf-8", errors="replace").strip()
+            last_error = f"HTTP {exc.code} from {url}\n  response headers: {dict(exc.headers)}\n  response body: {body!r}"
             if exc.code not in (403, 406, 415, 429, 500, 502, 503, 504):
                 raise
         except (urllib.error.URLError, TimeoutError) as exc:
-            last_error = exc
+            last_error = f"{exc} from {url}"
         if attempt == retries:
             break
         time.sleep(delay + random.uniform(0, delay / 2))

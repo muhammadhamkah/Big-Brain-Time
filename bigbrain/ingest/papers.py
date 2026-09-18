@@ -7,6 +7,7 @@ then wires it to every strategy, indicator and observation it relates to.
 
 from __future__ import annotations
 
+import random
 import time
 import urllib.error
 import urllib.parse
@@ -16,7 +17,10 @@ from dataclasses import dataclass
 
 from bigbrain.brain import Brain
 
-ARXIV_API = "https://export.arxiv.org/api/query"
+# arXiv serves the same API from both hosts; its edge intermittently rejects one
+# with HTTP 406 for minutes at a time, so we alternate between them.
+ARXIV_HOSTS = ("https://export.arxiv.org/api/query", "https://arxiv.org/api/query")
+ARXIV_API = ARXIV_HOSTS[0]
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 # Categories the brain cares about: quantitative finance, plus stat/ML finance crossovers.
@@ -63,44 +67,49 @@ def fetch(
     max_results: int = 10,
     categories: tuple[str, ...] = DEFAULT_CATEGORIES,
     timeout: float = 30.0,
-    retries: int = 4,
+    retries: int = 6,
+    hosts: tuple[str, ...] = ARXIV_HOSTS,
 ) -> list[Paper]:
-    """Query the arXiv API.
+    """Query the arXiv API, alternating hosts and backing off on throttling.
 
-    arXiv answers 406 both to requests without an ``Accept`` header and, when it
-    is shedding load, as a throttle. So we always send the header and retry
-    406/429/5xx with a growing pause.
+    arXiv answers 403/406/415/429 when it is shedding load, from either host,
+    for windows of several minutes. Each attempt uses the next host; after the
+    first two attempts the category filter is dropped as a further fallback in
+    case the combined query itself is being rejected.
     """
-    params = {
-        "search_query": build_query(search, categories),
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
     headers = {
         "User-Agent": "bigbrain/0.1 (https://github.com/muhammadhamkah/Big-Brain-Time)",
         "Accept": "application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
     }
-    delay = 3.0
+    delay = 2.0
     last_error: Exception | None = None
     for attempt in range(retries + 1):
+        host = hosts[attempt % len(hosts)]
+        cats = categories if attempt < 2 or not search else ()
+        query = build_query(search, cats) if cats else (f"all:{search}" if search else build_query(None, categories))
+        params = {
+            "search_query": query,
+            "start": 0,
+            "max_results": max_results,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        url = f"{host}?{urllib.parse.urlencode(params)}"
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return parse_atom(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code not in (406, 429, 500, 502, 503, 504) or attempt == retries:
+            if exc.code not in (403, 406, 415, 429, 500, 502, 503, 504):
                 raise
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError) as exc:
             last_error = exc
-            if attempt == retries:
-                raise
-        time.sleep(delay)
-        delay *= 2
-    raise RuntimeError(f"arXiv request failed: {last_error}")
+        if attempt == retries:
+            break
+        time.sleep(delay + random.uniform(0, delay / 2))
+        delay = min(delay * 2, 30.0)
+    raise RuntimeError(f"arXiv rejected every attempt on {len(hosts)} hosts; last error: {last_error}")
 
 
 def learn_papers(brain: Brain, papers: list[Paper]) -> list[str]:

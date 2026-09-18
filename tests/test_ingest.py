@@ -195,3 +195,24 @@ class PaperFetchTests(unittest.TestCase):
         with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
             with self.assertRaises(urllib.error.HTTPError):
                 papers.fetch("momentum")
+
+    def test_fetch_alternates_hosts_and_simplifies_query(self):
+        import io, urllib.error
+        from unittest import mock
+        from bigbrain.ingest import papers
+
+        urls = []
+
+        def fake_urlopen(req, timeout):
+            urls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 406, "Not Acceptable", {}, io.BytesIO(b""))
+
+        with mock.patch.object(papers.urllib.request, "urlopen", fake_urlopen), mock.patch.object(papers.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                papers.fetch("momentum", retries=3)
+        self.assertEqual(len(urls), 4)
+        self.assertTrue(urls[0].startswith("https://export.arxiv.org/"))
+        self.assertTrue(urls[1].startswith("https://arxiv.org/"))
+        self.assertIn("cat%3A", urls[0])
+        self.assertNotIn("cat%3A", urls[2], "later attempts drop the category filter")
+        self.assertIn("all%3Amomentum", urls[2])

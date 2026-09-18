@@ -58,7 +58,13 @@ def format_context(brain: Brain, recalls: list[Recall]) -> str:
 def answer_offline(brain: Brain, question: str, recalls: list[Recall]) -> str:
     if not recalls:
         return "The brain has not learned anything relevant yet. Feed it: `bigbrain seed`, `bigbrain learn papers`, `bigbrain learn market`."
-    lines = [f"Question: {question}", "", "What the brain knows (strongest first):"]
+    from bigbrain.watch import live_context
+
+    lines = [f"Question: {question}"]
+    live = live_context(brain)
+    if live:
+        lines += ["", "Live (from the watcher):"] + [f"  {l}" for l in live]
+    lines += ["", "What the brain knows (strongest first):"]
     for i, r in enumerate(recalls, 1):
         how = "direct match" if not r.via else f"reached through {len(r.via)} linked cell(s)"
         lines.append(f"{i}. {r.cell.title} [{r.cell.kind}, score {r.score:.2f}, {how}]")
@@ -82,7 +88,12 @@ def answer_with_claude(brain: Brain, question: str, recalls: list[Recall], model
     import anthropic
 
     client = anthropic.Anthropic()
+    from bigbrain.watch import live_context
+
     context = format_context(brain, recalls) or "(the brain has recalled nothing relevant)"
+    live = live_context(brain)
+    if live:
+        context = "Live market state from the watcher:\n" + "\n".join(live) + "\n\n" + context
     with client.beta.messages.stream(
         model=model,
         max_tokens=16000,

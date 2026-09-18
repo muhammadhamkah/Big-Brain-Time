@@ -272,6 +272,48 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    from bigbrain.watch import Watcher
+
+    brain = open_brain(args.db)
+    w = Watcher(brain, symbol=args.symbol, interval=args.interval, horizon=args.horizon)
+    if not args.once:
+        print(f"Watching {w.symbol} on the {args.interval} chart; grading each signal {args.horizon} bars later. Ctrl-C to stop.")
+    try:
+        w.run(once=args.once)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+def cmd_calls(args: argparse.Namespace) -> int:
+    from bigbrain.watch import Watcher
+
+    brain = open_brain(args.db)
+    rows = brain.db.execute("SELECT DISTINCT symbol, interval FROM calls ORDER BY symbol, interval").fetchall()
+    if not rows:
+        print("No calls yet. Run `bigbrain watch` first.")
+        return 0
+    for r in rows:
+        if args.symbol and r["symbol"] != args.symbol.upper():
+            continue
+        w = Watcher(brain, r["symbol"], r["interval"])
+        print(f"{r['symbol']} {r['interval']}")
+        for c in w.scorecard():
+            rate = f"{c['hit_rate']:.0%}" if c["hit_rate"] is not None else "  -"
+            avg = f"{c['avg_return']:+.2%}" if c["avg_return"] is not None else "   -  "
+            print(f"  {c['signal']:18} fired {c['fired']:3}  graded {c['graded']:3}  hit rate {rate:>4}  avg move {avg}  pending {c['pending']}")
+        if args.recent:
+            print("  recent calls:")
+            for c in brain.db.execute(
+                "SELECT signal, bar_time, price, hit, outcome_return FROM calls WHERE symbol = ? AND interval = ? ORDER BY bar_time DESC LIMIT ?",
+                (r["symbol"], r["interval"], args.recent),
+            ):
+                status = "pending" if c["hit"] is None else ("hit" if c["hit"] else "miss") + f" ({c['outcome_return']:+.2%})"
+                print(f"    {c['bar_time']}  {c['signal']:18} @ {c['price']:.2f}  {status}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     brain = open_brain(args.db)
     s = brain.stats()
@@ -396,6 +438,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("title", help="part of the cell title")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser("watch", help="watch a market at each candle close, record signals as calls, grade them")
+    p.add_argument("--symbol", default="BTCUSDT")
+    p.add_argument("--interval", default="15m", help="1m 5m 15m 30m 1h 4h 1d 1w")
+    p.add_argument("--horizon", type=int, default=12, help="bars to wait before grading a call (12 x 15m = 3 hours)")
+    p.add_argument("--once", action="store_true", help="one pass, then exit (good for cron)")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("calls", help="scorecard of live signals and how they turned out")
+    p.add_argument("--symbol")
+    p.add_argument("--recent", type=int, default=0, metavar="N", help="also list the last N calls")
+    p.set_defaults(func=cmd_calls)
 
     p = sub.add_parser("forget", help="remove cells by source, kind or title, e.g. --source synthetic")
     p.add_argument("--source", help="substring of the source, e.g. 'synthetic', 'reddit', 'binance:BTCUSDT'")

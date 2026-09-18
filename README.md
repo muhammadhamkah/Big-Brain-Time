@@ -59,6 +59,8 @@ bigbrain learn market                                          # or synthetic da
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
 bigbrain learn file notes/*.md
 
+bigbrain watch --symbol BTCUSDT --interval 15m               # real time: signals become graded calls
+bigbrain calls --recent 10                                     # scorecard: which signals actually work here
 bigbrain recall "position sizing in high volatility" -v
 bigbrain explain "Kelly criterion"
 bigbrain stats --journal 10
@@ -89,6 +91,12 @@ CSV files need `date,open,high,low,close,volume` columns (any case, oldest first
 Trust scales a cell's recall score, so a forum thread still surfaces but a paper or a measured backtest on the same topic outranks it. TradingView has no public API and forbids scraping, so the brain reads TradingView pages only when you hand it a URL.
 
 All requests are polite: one host at a time with a minimum interval between calls, curl-shaped headers (some edges reject Python's default request shape with 406), and `HTTPS_PROXY` is honoured.
+
+### Watching a market in real time
+
+`bigbrain watch` polls a symbol at every candle close (Binance, no key), recomputes the indicators, and turns each event into a *call* with an explicit hypothesis: RSI crossing below 30 says "up within 12 bars", a death cross says "down", and so on. When the horizon has passed, the call is graded against what the market did. After five graded calls per signal the running scorecard becomes a lesson cell ("on BTCUSDT 15m, RSI oversold fired 14 times, 43% hit rate, average move -0.3%: hypothesis refuted so far"), so the brain learns which signals mean something on this market at this timeframe. `ask` shows the live state of every watched market. This is the outcome loop: knowledge that is checked against reality gains or loses weight.
+
+Run it in a terminal you leave open, or with `--once` from cron every 15 minutes.
 
 ### Claude-powered cortex
 
@@ -128,6 +136,7 @@ bigbrain/
   cells.py            Cell, Synapse, Recall dataclasses
   concepts.py         trading lexicon, concept extraction, tokenizer
   cortex.py           offline and Claude-powered answering
+  watch.py            real-time watcher: signals -> calls -> graded outcomes -> scorecard lessons
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

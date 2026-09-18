@@ -66,6 +66,24 @@ CREATE TABLE IF NOT EXISTS journal (
     event TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    bar_time TEXT NOT NULL,
+    price REAL NOT NULL,
+    horizon INTEGER NOT NULL,
+    graded_at TEXT,
+    outcome_return REAL,
+    hit INTEGER,
+    UNIQUE (symbol, interval, signal, bar_time)
+);
 """
 
 
@@ -406,6 +424,18 @@ class Brain:
         self._journal("forget", f"{len(ids)} cells ({where})")
         self.db.commit()
         return len(ids)
+
+    # ------------------------------------------------------------ state
+    def get_state(self, key: str, default=None):
+        row = self.db.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_state(self, key: str, value) -> None:
+        self.db.execute(
+            "INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(value)),
+        )
+        self.db.commit()
 
     def close(self) -> None:
         self.db.close()

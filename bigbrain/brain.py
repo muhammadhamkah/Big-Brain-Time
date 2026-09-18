@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    entry_time TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    exit_time TEXT,
+    exit_price REAL,
+    qty REAL NOT NULL,
+    pnl REAL,
+    ret REAL,
+    UNIQUE (symbol, interval, strategy, entry_time)
+);
 CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,

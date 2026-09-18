@@ -59,7 +59,8 @@ bigbrain learn market                                          # or synthetic da
 bigbrain learn text "Turtle rules" "The Turtles bought 20-day breakouts and sized by ATR..."
 bigbrain learn file notes/*.md
 
-bigbrain watch --symbol BTCUSDT --interval 15m               # real time: signals become graded calls
+bigbrain watch --symbol BTCUSDT --interval 15m               # real time: paper trades 4 strategies, grades signals
+bigbrain paper --recent 10                                     # virtual accounts: equity, drawdown, trades
 bigbrain calls --recent 10                                     # scorecard: which signals actually work here
 bigbrain recall "position sizing in high volatility" -v
 bigbrain explain "Kelly criterion"
@@ -95,6 +96,8 @@ All requests are polite: one host at a time with a minimum interval between call
 ### Watching a market in real time
 
 `bigbrain watch` polls a symbol at every candle close (Binance, no key), recomputes the indicators, and turns each event into a *call* with an explicit hypothesis: RSI crossing below 30 says "up within 12 bars", a death cross says "down", and so on. When the horizon has passed, the call is graded against what the market did. After five graded calls per signal the running scorecard becomes a lesson cell ("on BTCUSDT 15m, RSI oversold fired 14 times, 43% hit rate, average move -0.3%: hypothesis refuted so far"), so the brain learns which signals mean something on this market at this timeframe. `ask` shows the live state of every watched market. This is the outcome loop: knowledge that is checked against reality gains or loses weight.
+
+**Paper trading.** The watcher also runs every built-in strategy on a virtual account of 10,000 per strategy. At each closed candle the rule is re-evaluated; when its target position changes, the account trades at that close and pays 0.1% per side, the same assumptions the backtester makes, so a candle-by-candle replay reproduces the backtest exactly (there is a test for that). Open positions are marked to market every candle, so drawdown is measured on real equity. Every ten closed trades the running record becomes a lesson: equity, Sharpe, win rate, drawdown, against buy and hold over the same candles. `bigbrain paper` shows the accounts. No real orders are ever sent.
 
 Run it in a terminal you leave open, or with `--once` from cron every 15 minutes.
 
@@ -137,6 +140,7 @@ bigbrain/
   concepts.py         trading lexicon, concept extraction, tokenizer
   cortex.py           offline and Claude-powered answering
   watch.py            real-time watcher: signals -> calls -> graded outcomes -> scorecard lessons
+  paper.py            paper trading: a virtual account per strategy, traded at candle closes, marked to market
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

@@ -91,12 +91,15 @@ def detect(prev: Reading, cur: Reading) -> list[str]:
 
 
 class Watcher:
-    def __init__(self, brain: Brain, symbol: str = "BTCUSDT", interval: str = "15m", horizon: int = 12, lookback: int = 300, fetch=fetch_binance) -> None:
+    def __init__(self, brain: Brain, symbol: str = "BTCUSDT", interval: str = "15m", horizon: int = 12, lookback: int = 300, fetch=fetch_binance, paper: bool = True) -> None:
         if interval not in INTERVAL_SECONDS:
             raise ValueError(f"interval must be one of {list(INTERVAL_SECONDS)}")
         self.brain, self.symbol, self.interval, self.horizon, self.lookback = brain, symbol.upper(), interval, horizon, lookback
         self.fetch = fetch
         self.key = f"watch:{self.symbol}:{self.interval}"
+        from bigbrain.paper import PaperTrader
+
+        self.paper = PaperTrader(brain, self.symbol, interval) if paper else None
 
     # ----------------------------------------------------------------- tick
     def tick(self, bars: list[Bar] | None = None) -> dict:
@@ -116,7 +119,8 @@ class Watcher:
                 self._record_call(sig, cur)
             self.brain.set_state(self.key, {**cur.as_dict(), "symbol": self.symbol, "interval": self.interval, "updated": _now()})
         graded = self._grade(bars)
-        return {"bar_time": cur.bar_time, "close": cur.close, "rsi": cur.rsi, "fired": fired, "graded": graded, "new_bar": cur.bar_time != last_seen}
+        trades = self.paper.step(bars) if self.paper else []
+        return {"bar_time": cur.bar_time, "close": cur.close, "rsi": cur.rsi, "fired": fired, "graded": graded, "trades": trades, "new_bar": cur.bar_time != last_seen}
 
     def _record_call(self, signal: str, cur: Reading) -> None:
         direction, description = SIGNALS[signal]
@@ -209,8 +213,12 @@ class Watcher:
                 stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 fired = ", ".join(result["fired"]) or "no new signal"
                 graded = "".join(f"  graded {g['signal']}: {'hit' if g['hit'] else 'miss'} ({g['return']:+.2%})" for g in result["graded"])
+                trades = "".join(
+                    f"  paper {t['strategy']}: {t['action']} @ {t['price']:.2f}" + (f" ({t['ret']:+.2%})" if "ret" in t else "")
+                    for t in result.get("trades", [])
+                )
                 rsi = f"{result['rsi']:.1f}" if result["rsi"] is not None else "n/a"
-                log(f"[{stamp}] {self.symbol} {self.interval} close {result['close']:.2f} rsi {rsi} | {fired}{graded}")
+                log(f"[{stamp}] {self.symbol} {self.interval} close {result['close']:.2f} rsi {rsi} | {fired}{graded}{trades}")
             except Exception as exc:
                 log(f"watch error: {exc}")
             if once:

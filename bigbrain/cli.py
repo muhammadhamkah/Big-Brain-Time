@@ -276,13 +276,45 @@ def cmd_watch(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
     brain = open_brain(args.db)
-    w = Watcher(brain, symbol=args.symbol, interval=args.interval, horizon=args.horizon)
+    w = Watcher(brain, symbol=args.symbol, interval=args.interval, horizon=args.horizon, paper=not args.no_paper)
     if not args.once:
-        print(f"Watching {w.symbol} on the {args.interval} chart; grading each signal {args.horizon} bars later. Ctrl-C to stop.")
+        extra = "" if args.no_paper else f" Paper trading {len(w.paper.strategies)} strategies with virtual accounts."
+        print(f"Watching {w.symbol} on the {args.interval} chart; grading each signal {args.horizon} bars later.{extra} Ctrl-C to stop.")
     try:
         w.run(once=args.once)
     except KeyboardInterrupt:
         print("\nstopped")
+    return 0
+
+
+def cmd_paper(args: argparse.Namespace) -> int:
+    from bigbrain.paper import STARTING_EQUITY, PaperTrader
+
+    brain = open_brain(args.db)
+    rows = brain.db.execute("SELECT key FROM state WHERE key LIKE 'paper:%'").fetchall()
+    if not rows:
+        print("No paper trading yet. Run `bigbrain watch` first.")
+        return 0
+    for r in rows:
+        _, symbol, interval = r["key"].split(":")
+        if args.symbol and symbol != args.symbol.upper():
+            continue
+        pt = PaperTrader(brain, symbol, interval)
+        live = brain.get_state(f"watch:{symbol}:{interval}", {})
+        price = live.get("close")
+        print(f"{symbol} {interval}  (virtual accounts start at {STARTING_EQUITY:,.0f}; last close {price:.2f})" if price else f"{symbol} {interval}")
+        for s in pt.report(price):
+            pos = f"long from {s['entry_price']:.2f}" if s["in_position"] else "flat"
+            wr = f"{s['win_rate']:.0%}" if s["win_rate"] is not None else "  -"
+            print(f"  {s['strategy']:20} equity {s['equity']:>10,.2f}  {s['return']:+7.2%}  maxDD {s['max_drawdown']:6.1%}  trades {s['trades']:3}  win {wr:>4}  {pos}")
+        if args.recent:
+            print("  recent trades:")
+            for t in brain.db.execute(
+                "SELECT strategy, entry_time, entry_price, exit_time, exit_price, ret FROM paper_trades WHERE symbol = ? AND interval = ? ORDER BY entry_time DESC LIMIT ?",
+                (symbol, interval, args.recent),
+            ):
+                status = f"closed {t['exit_time']} @ {t['exit_price']:.2f} ({t['ret']:+.2%})" if t["exit_time"] else "open"
+                print(f"    {t['strategy']:20} in {t['entry_time']} @ {t['entry_price']:.2f}  {status}")
     return 0
 
 
@@ -444,7 +476,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", default="15m", help="1m 5m 15m 30m 1h 4h 1d 1w")
     p.add_argument("--horizon", type=int, default=12, help="bars to wait before grading a call (12 x 15m = 3 hours)")
     p.add_argument("--once", action="store_true", help="one pass, then exit (good for cron)")
+    p.add_argument("--no-paper", action="store_true", help="only grade signals; do not paper trade the strategies")
     p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
+    p.add_argument("--symbol")
+    p.add_argument("--recent", type=int, default=0, metavar="N", help="also list the last N trades")
+    p.set_defaults(func=cmd_paper)
 
     p = sub.add_parser("calls", help="scorecard of live signals and how they turned out")
     p.add_argument("--symbol")

@@ -323,6 +323,9 @@ def cmd_trade(args: argparse.Namespace) -> int:
 
     brain = open_brain(args.db)
     t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top, market=args.market)
+    if args.reset:
+        r = t.reset(wallet=args.wallet)
+        print(f"Reset book '{args.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT (learning kept).")
     if not args.once:
         sides = "long and short, real funding rates charged" if t.market == "perps" else "long only"
         print(f"Trading book '{args.book}' on Binance {t.market}: top {args.top} USDT pairs on {args.interval} candles, wallet {t.wallet.start:.0f} USDT, "
@@ -333,6 +336,20 @@ def cmd_trade(args: argparse.Namespace) -> int:
         print(f"\nstopped. {len(t.wallet.positions)} positions stay open in the book; run `bigbrain trade` again to manage them.")
         sys.stdout.flush()
         os._exit(0)  # skip waiting on fetch threads still in flight; state was saved after every symbol
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    from bigbrain.trader import Trader
+
+    brain = open_brain(args.db)
+    if brain.get_state(f"trader:{args.book}") is None:
+        print(f"No trading book '{args.book}' to reset.")
+        return 0
+    r = Trader(brain, book=args.book).reset(wallet=args.wallet, forget=args.forget)
+    kept = f"history forgotten ({r['forgot_cells']} post-mortem cells removed)" if args.forget else "trades, beliefs and post-mortems kept"
+    print(f"Reset book '{args.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT, {kept}.")
+    print("If the trader is running, stop it (Ctrl-C) and start it again so it picks up the fresh book.")
     return 0
 
 
@@ -556,8 +573,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", default="15m")
     p.add_argument("--wallet", type=float, default=1000.0, help="starting USDT (only used when the book is new)")
     p.add_argument("--market", choices=["perps", "spot"], default="perps", help="perps: long and short with funding (default); spot: long only")
+    p.add_argument("--reset", action="store_true", help="close all positions and restart the wallet before trading (learning kept)")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_trade)
+
+    p = sub.add_parser("reset", help="close all positions and restart a book's wallet; --forget also erases its history and beliefs")
+    p.add_argument("--book", default="main")
+    p.add_argument("--wallet", type=float, default=None, help="new starting USDT (default: the book's original)")
+    p.add_argument("--forget", action="store_true", help="also erase trades, beliefs and post-mortem cells for this book")
+    p.set_defaults(func=cmd_reset)
 
     p = sub.add_parser("portfolio", help="the trading book: equity, open positions, closed trades")
     p.add_argument("--book", default="main")

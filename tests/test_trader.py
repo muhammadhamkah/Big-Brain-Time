@@ -246,6 +246,30 @@ class PerpsTests(unittest.TestCase):
             self.assertAlmostEqual(p["margin"], p["notional"] / 3.0, places=6)
 
 
+class ResetTests(unittest.TestCase):
+    def test_reset_keeps_or_forgets_learning(self):
+        brain = Brain()
+        symbols = ["AAAUSDT", "BBBUSDT"]
+        series = {s: stamped(synthetic(s, n=600, seed=30 + i, vol=0.02)) for i, s in enumerate(symbols)}
+        t = Trader(brain, book="r", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+        for end in range(250, 600):
+            t.tick(market=market_at(series, end), universe=universe(symbols))
+        trades_before = brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'r'").fetchone()[0]
+        self.assertGreater(trades_before, 0)
+        r = t.reset(wallet=500.0)
+        self.assertEqual(t.wallet.positions, {})
+        self.assertAlmostEqual(t.wallet.cash, 500.0)
+        self.assertAlmostEqual(t.wallet.equity(), 500.0)
+        self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'r'").fetchone()[0], trades_before)
+        reopened = Trader(brain, book="r")
+        self.assertEqual(reopened.wallet.positions, {})
+        self.assertAlmostEqual(reopened.wallet.start, 500.0)
+        reopened.reset(forget=True)
+        self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'r'").fetchone()[0], 0)
+        self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs WHERE book = 'r'").fetchone()[0], 0)
+        self.assertEqual([c for c in brain.cells(kind="postmortem") if c.source == "trade:r"], [])
+
+
 class DashboardTests(unittest.TestCase):
     def test_render_reflects_live_prices_and_state(self):
         from bigbrain import dashboard

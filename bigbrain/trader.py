@@ -453,6 +453,25 @@ class Trader:
         if len(self.wallet.log) > LOG_LINES:
             self.wallet.log = self.wallet.log[-LOG_LINES:]
 
+    # ---------------------------------------------------------------- reset
+    def reset(self, wallet: float | None = None, forget: bool = False) -> dict:
+        """Close every position without a post-mortem and start the wallet again.
+
+        With ``forget`` the book's trade history, beliefs and post-mortem cells are
+        erased too; otherwise what the brain learned is kept and only the money resets."""
+        n_positions = len(self.wallet.positions)
+        start = wallet if wallet is not None else self.wallet.start
+        self.wallet = Wallet(cash=start, start=start, peak=start)
+        removed = 0
+        if forget:
+            self.brain.db.execute("DELETE FROM trades WHERE book = ?", (self.book,))
+            self.brain.db.execute("DELETE FROM beliefs WHERE book = ?", (self.book,))
+            removed = self.brain.forget(source=f"trade:{self.book}")
+        self._save(last_tick="")
+        self.brain._journal("reset", f"book {self.book}: closed {n_positions} positions, wallet {start:.0f}" + (", history forgotten" if forget else ""))
+        self.brain.db.commit()
+        return {"positions_closed": n_positions, "wallet": start, "forgot_cells": removed}
+
     # --------------------------------------------------------------- report
     def report(self) -> dict:
         w = self.wallet

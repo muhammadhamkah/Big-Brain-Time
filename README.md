@@ -64,6 +64,7 @@ bigbrain trade --market spot --book spot                       # a second book o
 bigbrain dashboard                                             # live dashboard in a second terminal: equity, positions, beliefs, feed
 bigbrain portfolio --recent 20                                 # equity, open positions, closed trades with findings
 bigbrain beliefs                                               # what it now believes about each signal in each context
+bigbrain reset                                                 # close everything, wallet back to start, learning kept (--forget wipes it)
 bigbrain watch --symbol BTCUSDT --interval 15m               # one market: paper trades 4 strategies, grades signals
 bigbrain paper --recent 10                                     # virtual accounts: equity, drawdown, trades
 bigbrain calls --recent 10                                     # scorecard: which signals actually work here

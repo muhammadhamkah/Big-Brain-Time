@@ -393,7 +393,7 @@ class Trader:
     def _save(self, last_tick: str | None = None) -> None:
         state = {**asdict(self.wallet), "market": self.market, "interval": self.interval, "frozen": self.frozen}
         prev = self.brain.get_state(self.key) or {}
-        state["last_tick"] = last_tick or prev.get("last_tick", "")
+        state["last_tick"] = prev.get("last_tick", "") if last_tick is None else last_tick  # "" clears it (reset)
         self.brain.set_state(self.key, state)
 
     def _fetch_all(self, symbols: list[str]) -> dict[str, list[Bar]]:

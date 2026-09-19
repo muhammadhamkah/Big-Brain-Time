@@ -409,6 +409,7 @@ class ResetTests(unittest.TestCase):
         self.assertAlmostEqual(t.wallet.cash, 500.0)
         self.assertAlmostEqual(t.wallet.equity(), 500.0)
         self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'r'").fetchone()[0], trades_before)
+        self.assertEqual(brain.get_state("trader:r")["last_tick"], "")  # a reset book has not ticked yet; the dashboard must not show the old time
         reopened = Trader(brain, book="r")
         self.assertEqual(reopened.wallet.positions, {})
         self.assertAlmostEqual(reopened.wallet.start, 500.0)

@@ -318,7 +318,9 @@ class IntegrityTests(unittest.TestCase):
         from unittest import mock
         from bigbrain import trader as tr
         import os
-        fake = f"{os.getpid()} python -m bigbrain.cli trade\n4242 /Users/x/.venv/bin/python -m bigbrain.cli trade --book main\n4243 /Users/x/.venv/bin/bigbrain dashboard\n4244 grep bigbrain trade\n"
+        fake = (f"{os.getpid()} python -m bigbrain.cli trade\n{os.getppid()} /usr/bin/caffeinate -s /x/.venv/bin/python -m bigbrain.cli trade\n"
+                f"4242 /Users/x/.venv/bin/python -m bigbrain.cli trade --book main\n4243 /Users/x/.venv/bin/bigbrain dashboard\n4244 grep bigbrain trade\n"
+                f"4245 /usr/bin/caffeinate -s /x/.venv/bin/python -m bigbrain.cli trade\n4246 /bin/sh -c bigbrain trade\n")
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake)):
             others = Trader.other_traders()
         self.assertEqual([pid for pid, _ in others], [4242])
@@ -405,9 +407,14 @@ class ResetTests(unittest.TestCase):
         reopened = Trader(brain, book="r")
         self.assertEqual(reopened.wallet.positions, {})
         self.assertAlmostEqual(reopened.wallet.start, 500.0)
+        from bigbrain import exits
+        self.assertGreater(brain.db.execute("SELECT COUNT(*) FROM exit_stats WHERE book = 'r'").fetchone()[0], 0)
+        brain.set_state(exits.policy_key("r"), {"rsi_oversold": "tp_1R"})
         reopened.reset(forget=True)
         self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'r'").fetchone()[0], 0)
         self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs WHERE book = 'r'").fetchone()[0], 0)
+        self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats WHERE book = 'r'").fetchone()[0], 0)
+        self.assertEqual(exits.current_policy(brain, "r"), {})
         self.assertEqual([c for c in brain.cells(kind="postmortem") if c.source == "trade:r"], [])
 
 

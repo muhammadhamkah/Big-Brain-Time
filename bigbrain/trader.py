@@ -551,15 +551,19 @@ class Trader:
         except Exception:
             return []
         found = []
+        me, parent = os.getpid(), os.getppid()
         for line in out.splitlines():
             line = line.strip()
             if not line:
                 continue
             pid_str, _, cmd = line.partition(" ")
-            if not pid_str.isdigit() or int(pid_str) == os.getpid():
-                continue
-            if _TRADER_CMD.search(cmd) and not cmd.lstrip().startswith("grep") and " grep " not in cmd:
-                found.append((int(pid_str), cmd.strip()))
+            if not pid_str.isdigit() or int(pid_str) in (me, parent):
+                continue  # ourselves, or the wrapper that launched us (caffeinate, a shell)
+            cmd = cmd.strip()
+            if "caffeinate" in cmd or cmd.startswith("grep") or " grep " in cmd or "/bin/sh -c" in cmd or "/bin/bash -c" in cmd:
+                continue  # wrappers and shells mention the command without being a trader
+            if _TRADER_CMD.search(cmd):
+                found.append((int(pid_str), cmd))
         return found
 
     def acquire_lock(self) -> None:
@@ -622,6 +626,8 @@ class Trader:
         if forget:
             self.brain.db.execute("DELETE FROM trades WHERE book = ?", (self.book,))
             self.brain.db.execute("DELETE FROM beliefs WHERE book = ?", (self.book,))
+            self.brain.db.execute("DELETE FROM exit_stats WHERE book = ?", (self.book,))
+            self.brain.db.execute("DELETE FROM state WHERE key = ?", (exits.policy_key(self.book),))
             removed = self.brain.forget(source=f"trade:{self.book}")
         self._save(last_tick="")
         self.brain._journal("reset", f"book {self.book}: closed {n_positions} positions, wallet {start:.0f}" + (", history forgotten" if forget else ""))

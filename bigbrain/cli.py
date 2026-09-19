@@ -381,6 +381,17 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    brain = open_brain(args.db)
+    before = brain.size_report()["bytes"]
+    n = brain.prune(args.kind, args.days)
+    brain.checkpoint()
+    brain.db.execute("VACUUM")
+    after = brain.size_report()["bytes"]
+    print(f"forgot {n} {args.kind} cells older than {args.days} days; database {before / 1e6:.1f} MB -> {after / 1e6:.1f} MB")
+    return 0
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
     """Remove duplicate trade records (already done on open) and rebuild beliefs from the trade log."""
     from bigbrain.trader import Trader
@@ -501,6 +512,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print("kinds: " + ", ".join(f"{k}={v}" for k, v in sorted(s["kinds"].items())))
     print("top concepts: " + ", ".join(f"{k} ({v})" for k, v in s["top_concepts"].items()))
     print("hubs: " + ", ".join(f"{t} ({d})" for t, d in s["hubs"]))
+    size = brain.size_report()
+    rows = size["rows"]
+    print(f"database: {size['bytes'] / 1e6:.1f} MB on disk; trades {rows['trades']}, post-mortems {size['cells_by_kind'].get('postmortem', 0)}, "
+          f"index rows {rows['cell_tokens']}, synapses {rows['synapses']}")
     if args.journal:
         print("\nrecent activity:")
         for _, event, detail in brain.journal(args.journal):
@@ -648,6 +663,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("file", nargs="?")
     p.add_argument("--from-github", action="store_true")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("prune", help="forget old post-mortem cells and compact the database (the trader does this daily at 60 days)")
+    p.add_argument("--days", type=int, default=60)
+    p.add_argument("--kind", default="postmortem")
+    p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("repair", help="rebuild a book's beliefs and exit statistics from its trade log")
     p.add_argument("--book", default="main")

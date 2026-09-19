@@ -22,6 +22,7 @@ import math
 import re
 import sqlite3
 import time
+from pathlib import Path
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -510,6 +511,44 @@ class Brain:
         self._journal("forget", f"{len(ids)} cells ({where})")
         self.db.commit()
         return len(ids)
+
+    # ------------------------------------------------------------ upkeep
+    def size_report(self) -> dict:
+        """Row counts per table and the size of the database file, for watching growth."""
+        tables = ("cells", "synapses", "cell_tokens", "cell_concepts", "trades", "beliefs", "exit_stats", "calls", "paper_trades", "journal", "state")
+        counts = {t: self.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
+        size = 0
+        if self.path != ":memory:":
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    size += Path(self.path + suffix).stat().st_size
+                except OSError:
+                    pass
+        kinds = {r["kind"]: r["n"] for r in self.db.execute("SELECT kind, COUNT(*) AS n FROM cells GROUP BY kind")}
+        return {"bytes": size, "rows": counts, "cells_by_kind": kinds}
+
+    def prune(self, kind: str = "postmortem", older_than_days: int = 60) -> int:
+        """Forget cells of a kind older than N days. Their lessons already live in beliefs and summaries."""
+        cutoff = time.time() - older_than_days * 86400
+        ids = [r["id"] for r in self.db.execute("SELECT id FROM cells WHERE kind = ? AND created_at < ?", (kind, cutoff))]
+        if not ids:
+            return 0
+        for i in range(0, len(ids), self._CHUNK):
+            chunk = ids[i : i + self._CHUNK]
+            ph = ",".join("?" * len(chunk))
+            self.db.execute(f"DELETE FROM synapses WHERE a IN ({ph}) OR b IN ({ph})", chunk + chunk)
+            self.db.execute(f"DELETE FROM cell_concepts WHERE cell_id IN ({ph})", chunk)
+            self.db.execute(f"DELETE FROM cell_tokens WHERE cell_id IN ({ph})", chunk)
+            self.db.execute(f"DELETE FROM cells WHERE id IN ({ph})", chunk)
+        self.db.execute("DELETE FROM journal WHERE ts < ?", (cutoff,))
+        self._journal("prune", f"{len(ids)} {kind} cells older than {older_than_days} days")
+        self.db.commit()
+        return len(ids)
+
+    def checkpoint(self) -> None:
+        """Fold the write-ahead log back into the main file so the file on disk stays compact."""
+        if self.path != ":memory:":
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # ------------------------------------------------------------ state
     def get_state(self, key: str, default=None):

@@ -39,6 +39,10 @@ def snapshot(db_path: str | Path, out_dir: str | Path, keep: int = 14) -> Path:
         dst = sqlite3.connect(str(tmp_path))
         with dst:
             src.backup(dst)  # online backup: safe while the trader is writing
+        try:
+            src.execute("PRAGMA wal_checkpoint(PASSIVE)")  # keep the on-disk file compact
+        except sqlite3.OperationalError:
+            pass
         src.close(); dst.close()
         with open(tmp_path, "rb") as fin, gzip.open(target, "wb", compresslevel=6) as fout:
             shutil.copyfileobj(fin, fout)

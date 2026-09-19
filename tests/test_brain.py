@@ -121,6 +121,19 @@ class BrainTests(unittest.TestCase):
             self.assertEqual(reader.get_state("k"), 1)
             reader.close(); writer.close()
 
+    def test_prune_and_size_report(self):
+        seed(self.brain, packs=False)
+        old, _ = self.brain.learn("postmortem", "Old loss", "A loss that taught the brain about stops inside noise long ago.")
+        self.brain.db.execute("UPDATE cells SET created_at = created_at - 100 * 86400 WHERE id = ?", (old.id,))
+        self.brain.learn("postmortem", "Fresh loss", "A recent loss the brain should still remember.")
+        report = self.brain.size_report()
+        self.assertEqual(report["cells_by_kind"]["postmortem"], 2)
+        self.assertEqual(self.brain.prune("postmortem", 60), 1)
+        self.assertIsNone(self.brain.get(old.id))
+        self.assertEqual(len(self.brain.find("Fresh loss")), 1)
+        dangling = self.brain.db.execute("SELECT COUNT(*) FROM cell_tokens WHERE cell_id NOT IN (SELECT id FROM cells)").fetchone()[0]
+        self.assertEqual(dangling, 0)
+
     def test_persistence(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:

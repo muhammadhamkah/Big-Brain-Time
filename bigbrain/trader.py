@@ -257,7 +257,22 @@ class Trader:
             self._save()  # after every symbol, so an interrupt mid-tick never leaves cash and trades out of step
         self._mark_equity(market)
         self._save(last_tick=_now())
+        self._upkeep()
         return {"events": events, "equity": self.wallet.equity(), "cash": self.wallet.cash, "open": len(self.wallet.positions), "symbols": len(symbols)}
+
+    PRUNE_AFTER_DAYS = 60
+
+    def _upkeep(self) -> None:
+        """Once a day: drop post-mortem cells older than PRUNE_AFTER_DAYS and compact the file."""
+        last = self.brain.get_state("upkeep:last", "")
+        today = _now()[:10]
+        if last == today:
+            return
+        pruned = self.brain.prune("postmortem", self.PRUNE_AFTER_DAYS)
+        self.brain.checkpoint()
+        self.brain.set_state("upkeep:last", today)
+        if pruned:
+            self._log(f"    upkeep: forgot {pruned} post-mortems older than {self.PRUNE_AFTER_DAYS} days (their lessons live on in beliefs)")
 
     def _save(self, last_tick: str | None = None) -> None:
         state = {**asdict(self.wallet), "market": self.market, "interval": self.interval}

@@ -113,7 +113,7 @@ class PaperTrader:
             if len(acct.curve) > MAX_CURVE:
                 acct.curve = acct.curve[-MAX_CURVE:]
             acct.last_bar = last.date
-        self.brain.db.commit()
+        self.brain.commit()
         self._save(accounts)
         return events
 

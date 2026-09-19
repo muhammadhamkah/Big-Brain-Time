@@ -137,7 +137,7 @@ class Watcher:
             source=f"watch:{self.symbol}:{self.interval}",
             extra_concepts=[self.symbol.lower(), "live signal"],
         )
-        self.brain.db.commit()
+        self.brain.commit()
 
     # ---------------------------------------------------------------- grade
     def _grade(self, bars: list[Bar]) -> list[dict]:
@@ -159,7 +159,7 @@ class Watcher:
             )
             graded.append({"signal": row["signal"], "bar_time": row["bar_time"], "return": ret, "hit": bool(hit)})
         if graded:
-            self.brain.db.commit()
+            self.brain.commit()
             for sig in {g["signal"] for g in graded}:
                 self._update_scorecard(sig)
         return graded

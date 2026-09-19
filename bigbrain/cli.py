@@ -322,21 +322,33 @@ def cmd_trade(args: argparse.Namespace) -> int:
     from bigbrain.trader import Trader
 
     brain = open_brain(args.db)
-    t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top, market=args.market)
+    t = Trader(brain, book=args.book, interval=args.interval, wallet=args.wallet, top=args.top, market=args.market, frozen=args.frozen)
+    companions = ()
+    if args.with_frozen:
+        if args.frozen:
+            print("--with-frozen runs a frozen companion beside an adaptive book; drop --frozen.", file=sys.stderr)
+            return 2
+        # the baseline: same market, interval, universe, starting capital, risk limits and inputs; no learning
+        companions = (Trader(brain, book=f"{args.book}-frozen", interval=args.interval, wallet=t.wallet.start, top=args.top, market=t.market, frozen=True),)
     if args.reset:
-        r = t.reset(wallet=args.wallet)
-        print(f"Reset book '{args.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT (learning kept).")
+        for b in (t, *companions):
+            r = b.reset(wallet=args.wallet)
+            print(f"Reset book '{b.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT (learning kept).")
     if not args.once:
         sides = "long and short, real funding rates charged" if t.market == "perps" else "long only"
+        mode = "FROZEN baseline: fixed rules, fixed size, no learning" if t.frozen else "adaptive: beliefs, exit learning, post-mortems"
         print(f"Trading book '{args.book}' on Binance {t.market}: top {args.top} USDT pairs on {args.interval} candles, wallet {t.wallet.start:.0f} USDT, "
-              f"VIP0 fees plus slippage, {sides}, every closed trade analysed. Ctrl-C to stop.")
+              f"VIP0 fees plus slippage, fills at the live bid/ask, {sides}. {mode}. Ctrl-C to stop.")
+        if companions:
+            print(f"Companion book '{companions[0].book}' runs frozen on the same candles, quotes and funding: the baseline the learning must beat.")
     try:
-        t.run(once=args.once)
+        t.run(once=args.once, companions=companions)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        t.release_lock()
+        for b in (t, *companions):
+            b.release_lock()
         print(f"\nstopped. {len(t.wallet.positions)} positions stay open in the book; run `bigbrain trade` again to manage them.")
         sys.stdout.flush()
         os._exit(0)  # skip waiting on fetch threads still in flight; state was saved after every symbol
@@ -425,12 +437,15 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         return 0
     t = Trader(brain, book=args.book)
     r = t.report()
-    print(f"book {args.book} ({r['market']}): equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}")
+    mode = ", frozen baseline" if r["frozen"] else ""
+    print(f"book {args.book} ({r['market']}{mode}): equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}"
+          + (f", {r['pending']} orders queued for the next open" if r["pending"] else "") + (f", {r['shadows']} shadows scoring exits" if r["shadows"] else ""))
     if r["open"]:
         print("open positions:")
         for p in r["open"]:
             fund = f"  funding {p['funding']:+.2f}" if p["funding"] else ""
-            print(f"  {p['side']:5} {p['symbol']:12} {p['signal']:18} in @ {p['entry']:.6g}  now {p['mark']:.6g} ({p['unrealized']:+.2%})  {p['bars']} bars  stop {p['stop']:.6g}{fund}{'  exploring' if p['explore'] else ''}")
+            leaving = f"  exiting at next open ({p['pending_exit']})" if p.get("pending_exit") else ""
+            print(f"  {p['side']:5} {p['symbol']:12} {p['signal']:18} in @ {p['entry']:.6g}  now {p['mark']:.6g} ({p['unrealized']:+.2%})  {p['bars']} bars  stop {p['stop']:.6g}{fund}{'  exploring' if p['explore'] else ''}{leaving}")
     if r["by_signal"]:
         print("closed trades by signal:")
         for b in r["by_signal"]:
@@ -458,14 +473,18 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 def cmd_beliefs(args: argparse.Namespace) -> int:
     from bigbrain.trader import Trader
 
+    from bigbrain import postmortem as pm
+
     brain = open_brain(args.db)
     rows = Trader(brain, book=args.book).beliefs()
     if not rows:
         print("No beliefs yet: the brain has not closed a trade.")
         return 0
-    print(f"{'signal':18} {'regime':10} {'vol':5} {'n':>4} {'win':>5} {'avg':>8}  verdict")
+    print(f"full size needs {pm.FULL_SIZE_SAMPLES} trades over {pm.MIN_BLOCKS}+ separate days with the mean minus one standard error above zero (days, not trades, are the independent evidence)")
+    print(f"{'signal':18} {'regime':10} {'vol':5} {'n':>4} {'days':>4} {'win':>5} {'avg':>8} {'se':>7}  verdict")
     for b in rows:
-        print(f"{b['signal']:18} {b['regime']:10} {b['vol']:5} {b['n']:4} {b['win_rate']:5.0%} {b['avg_ret']:+8.2%}  {b['verdict']}")
+        se = f"{b['stderr']:7.2%}" if b["stderr"] != float("inf") else "      -"
+        print(f"{b['signal']:18} {b['regime']:10} {b['vol']:5} {b['n']:4} {b['blocks']:4} {b['win_rate']:5.0%} {b['avg_ret']:+8.2%} {se}  {b['verdict']}")
     from bigbrain import exits
 
     pol = exits.describe(brain, args.book)
@@ -474,6 +493,11 @@ def cmd_beliefs(args: argparse.Namespace) -> int:
         for p in pol:
             ranking = "  ".join(f"{v} {avg:+.2%}" for v, (n, avg) in sorted(p["stats"].items(), key=lambda kv: -kv[1][1]))
             print(f"  {p['signal']:18} uses {p['policy']:13} ({p['trades']} trades)  {ranking}")
+    log = brain.get_state(f"policy_log:{args.book}", []) or []
+    if log:
+        print("\npolicy changes (every adoption and reversal, with the evidence at the time):")
+        for e in log[-12:]:
+            print(f"  {e['at']}  {e['signal']:18} {e['from']} -> {e['to']}  rule {e['rule_avg']:+.2%} vs {e['best_avg']:+.2%} over {e['trades']} trades")
     return 0
 
 
@@ -649,6 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet", type=float, default=1000.0, help="starting USDT (only used when the book is new)")
     p.add_argument("--market", choices=["perps", "spot"], default="perps", help="perps: long and short with funding (default); spot: long only")
     p.add_argument("--reset", action="store_true", help="close all positions and restart the wallet before trading (learning kept)")
+    p.add_argument("--frozen", action="store_true", help="baseline book: same signals and rules, fixed size, no beliefs, no exit learning")
+    p.add_argument("--with-frozen", action="store_true", help="also run a frozen companion book (<book>-frozen) on identical inputs, to measure what the learning adds")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_trade)
 

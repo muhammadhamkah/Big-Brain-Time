@@ -130,15 +130,18 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
 
     # beliefs
     beliefs = brain.db.execute("SELECT signal, regime, vol_bucket, wins, losses, sum_ret FROM beliefs WHERE book = ? ORDER BY wins + losses DESC LIMIT 6", (book,)).fetchall()
-    lines.append(f"{BOLD}WHAT THE BRAIN BELIEVES{RESET}  {DIM}signal / regime / vol: n, win rate, avg net{RESET}")
+    lines.append(f"{BOLD}WHAT THE BRAIN BELIEVES{RESET}  {DIM}signal / regime / vol: n trades over d days, win rate, avg net; the verdict the trader acts on{RESET}")
     if beliefs:
+        from bigbrain import postmortem as pm
+
+        shades = {"full": f"{GREEN}full size{RESET}", "half": f"{GREEN}half size{RESET}", "avoid": f"{RED}avoid{RESET}", "explore": f"{YELLOW}exploring{RESET}"}
         for b in beliefs:
             n = b["wins"] + b["losses"]
             avg = b["sum_ret"] / n
-            verdict = f"{GREEN}trade{RESET}" if n >= 8 and avg > 0 else f"{RED}avoid{RESET}" if n >= 8 else f"{YELLOW}exploring{RESET}"
+            belief = pm.belief(brain, book, b["signal"], b["regime"], b["vol_bucket"])
             avg_text = colour(avg, f"{avg:+.2%}")
             wr = b["wins"] / n
-            lines.append(f"  {b['signal']:18} {b['regime']:9} {b['vol_bucket']:4}  n {n:3}  win {wr:4.0%}  avg {avg_text}  {verdict}")
+            lines.append(f"  {b['signal']:18} {b['regime']:9} {b['vol_bucket']:4}  n {n:3} / {belief['blocks']:2}d  win {wr:4.0%}  avg {avg_text}  {shades[pm.verdict(belief)]}")
     else:
         lines.append(f"  {DIM}no closed trades yet{RESET}")
     lines.append("")

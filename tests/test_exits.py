@@ -66,11 +66,17 @@ class LiveTests(unittest.TestCase):
         t = Trader(brain, book="ex", interval="15m", wallet=1000.0, top=3, market="perps", fetch_funding=lambda: {})
         for end in range(250, 1200):
             t.tick(market=market_at(series, end), universe=universe(symbols))
-        rows = brain.db.execute("SELECT variants, exit_reason FROM trades WHERE book = 'ex'").fetchall()
+        rows = brain.db.execute("SELECT symbol, signal, entry_time, variants, exit_reason FROM trades WHERE book = 'ex'").fetchall()
         self.assertTrue(rows)
+        scored = 0
         for r in rows:
             v = json.loads(r["variants"])
-            self.assertEqual(set(v), set(exits.VARIANTS))
+            if v:
+                self.assertEqual(set(v), set(exits.VARIANTS))
+                scored += 1
+            else:  # closed by a learned exit: its shadow is still running the original rule, and will score it later
+                self.assertIn(f"{r['symbol']}:{r['signal']}:{r['entry_time']}", t.wallet.shadows)
+        self.assertGreater(scored, 0)
         self.assertTrue(brain.db.execute("SELECT COUNT(*) FROM exit_stats WHERE book = 'ex'").fetchone()[0] > 0)
         # force a policy and check new positions run under it
         brain.set_state(exits.policy_key("ex"), {"rsi_oversold": "trail_1R", "macd_bullish": "tp_1R", "macd_bearish": "tp_1R", "below_lower_band": "tp_1R", "above_upper_band": "tp_1R", "golden_cross": "tp_1R", "death_cross": "tp_1R", "rsi_overbought": "tp_1R"})

@@ -22,6 +22,7 @@ from bigbrain.brain import Brain
 PRIOR_WINS = 2.0  # pseudo-counts: the textbook prior before any evidence
 PRIOR_LOSSES = 2.0
 MIN_SAMPLES = 8  # below this the trader is still exploring the (signal, context) cell
+FULL_SIZE_SAMPLES = 20  # full size needs this many trades AND a lower confidence bound above zero
 NOTABLE_RETURN = 0.01  # trades beyond +-1% net, or stopped out, get their own post-mortem cell
 
 
@@ -108,27 +109,62 @@ def update_belief(brain: Brain, t: Trade) -> None:
     ctx = t.context
     won = t.net_ret > 0
     brain.db.execute(
-        "INSERT INTO beliefs (book, signal, regime, vol_bucket, wins, losses, sum_ret, sum_win, sum_loss) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO beliefs (book, signal, regime, vol_bucket, wins, losses, sum_ret, sum_win, sum_loss, sum_sq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(book, signal, regime, vol_bucket) DO UPDATE SET wins = wins + excluded.wins, losses = losses + excluded.losses,"
-        " sum_ret = sum_ret + excluded.sum_ret, sum_win = sum_win + excluded.sum_win, sum_loss = sum_loss + excluded.sum_loss",
-        (t.book, t.signal, ctx.get("regime", "unknown"), ctx.get("vol_bucket", "mid"), int(won), int(not won), t.net_ret, t.net_ret if won else 0.0, t.net_ret if not won else 0.0),
+        " sum_ret = sum_ret + excluded.sum_ret, sum_win = sum_win + excluded.sum_win, sum_loss = sum_loss + excluded.sum_loss, sum_sq = sum_sq + excluded.sum_sq",
+        (t.book, t.signal, ctx.get("regime", "unknown"), ctx.get("vol_bucket", "mid"), int(won), int(not won), t.net_ret, t.net_ret if won else 0.0,
+         t.net_ret if not won else 0.0, t.net_ret * t.net_ret),
     )
+
+
+MIN_BLOCKS = 4  # independent-ish time blocks (UTC days) needed before a verdict; simultaneous crypto trades are one observation, not many
+
+
+def _block_stats(brain: Brain, book: str, signal: str, regime: str | None, vol_bucket: str | None) -> tuple[int, float, float, int]:
+    """(trades, mean, block standard error, blocks) from the trade log, grouping trades by UTC day of exit.
+
+    Trades closed on the same day move together (one market, many pairs), so the uncertainty is
+    measured across days, not across trades. Only trades recorded under the current results version count."""
+    q = "SELECT net_ret, exit_time, context FROM trades WHERE book = ? AND signal = ? AND model_version = ?"
+    rows = brain.db.execute(q, (book, signal, brain.RESULTS_VERSION)).fetchall()
+    rets, blocks = [], {}
+    for r in rows:
+        if regime is not None:
+            ctx = json.loads(r["context"])
+            if ctx.get("regime") != regime or ctx.get("vol_bucket") != vol_bucket:
+                continue
+        rets.append(r["net_ret"])
+        blocks.setdefault(r["exit_time"][:10], []).append(r["net_ret"])
+    n = len(rets)
+    if n == 0:
+        return 0, 0.0, float("inf"), 0
+    mean = sum(rets) / n
+    means = [sum(v) / len(v) for v in blocks.values()]
+    k = len(means)
+    if k < MIN_BLOCKS:
+        return n, mean, float("inf"), k
+    bm = sum(means) / k
+    var = sum((m - bm) ** 2 for m in means) / (k - 1)
+    return n, mean, (var / k) ** 0.5, k
 
 
 def belief(brain: Brain, book: str, signal: str, regime: str, vol_bucket: str) -> dict:
     """What the brain believes about a signal in a context: win probability, expectancy, and how much evidence it has.
 
+    Win probability blends the belief tallies with a prior; expectancy and its uncertainty come
+    from the trade log, with uncertainty measured across time blocks (see ``_block_stats``).
     Falls back from the exact context to the signal across all contexts, then to the prior."""
     exact = brain.db.execute(
-        "SELECT wins, losses, sum_ret, sum_win, sum_loss FROM beliefs WHERE book = ? AND signal = ? AND regime = ? AND vol_bucket = ?",
+        "SELECT wins, losses, sum_ret, sum_win, sum_loss, sum_sq FROM beliefs WHERE book = ? AND signal = ? AND regime = ? AND vol_bucket = ?",
         (book, signal, regime, vol_bucket),
     ).fetchone()
     broad = brain.db.execute(
-        "SELECT SUM(wins) AS wins, SUM(losses) AS losses, SUM(sum_ret) AS sum_ret, SUM(sum_win) AS sum_win, SUM(sum_loss) AS sum_loss FROM beliefs WHERE book = ? AND signal = ?",
+        "SELECT SUM(wins) AS wins, SUM(losses) AS losses, SUM(sum_ret) AS sum_ret, SUM(sum_win) AS sum_win, SUM(sum_loss) AS sum_loss, SUM(sum_sq) AS sum_sq"
+        " FROM beliefs WHERE book = ? AND signal = ?",
         (book, signal),
     ).fetchone()
-    ew, el, er = (exact["wins"], exact["losses"], exact["sum_ret"]) if exact else (0, 0, 0.0)
-    bw, bl, br = (broad["wins"] or 0, broad["losses"] or 0, broad["sum_ret"] or 0.0)
+    ew, el, er, esq = (exact["wins"], exact["losses"], exact["sum_ret"], exact["sum_sq"]) if exact else (0, 0, 0.0, 0.0)
+    bw, bl, br, bsq = (broad["wins"] or 0, broad["losses"] or 0, broad["sum_ret"] or 0.0, broad["sum_sq"] or 0.0)
     n_exact, n_broad = ew + el, bw + bl
     # Blend: the exact context dominates once it has samples; the broad record fills in before that.
     w_exact = min(1.0, n_exact / MIN_SAMPLES)
@@ -136,19 +172,43 @@ def belief(brain: Brain, book: str, signal: str, regime: str, vol_bucket: str) -
     losses = PRIOR_LOSSES + w_exact * el + (1 - w_exact) * (bl * min(1.0, n_broad / MIN_SAMPLES))
     p_win = wins / (wins + losses)
     n_eff = n_exact if n_exact >= MIN_SAMPLES else max(n_exact, min(n_broad, MIN_SAMPLES - 1))
-    expectancy = (er / n_exact) if n_exact >= MIN_SAMPLES else (br / n_broad if n_broad else 0.0)
-    return {"p_win": p_win, "expectancy": expectancy, "samples": n_eff, "exact_samples": n_exact, "broad_samples": n_broad}
+    if n_exact >= MIN_SAMPLES:
+        n, expectancy, stderr, blocks = _block_stats(brain, book, signal, regime, vol_bucket)
+    else:
+        n, expectancy, stderr, blocks = _block_stats(brain, book, signal, None, None)
+    if n == 0:
+        expectancy = (er / n_exact) if n_exact else (br / n_broad if n_broad else 0.0)
+    return {"p_win": p_win, "expectancy": expectancy, "stderr": stderr, "samples": n_eff, "blocks": blocks, "exact_samples": n_exact, "broad_samples": n_broad}
+
+
+def verdict(b: dict) -> str:
+    """What the evidence supports: 'explore' (too little), 'half' (positive but not proven),
+    'full' (enough trades and the mean minus one standard error is above zero), or 'avoid'
+    (enough trades and the mean plus one standard error is below zero)."""
+    n, mean, se, blocks = b["samples"], b["expectancy"], b["stderr"], b.get("blocks", 0)
+    if n < MIN_SAMPLES:
+        return "explore"
+    if blocks < MIN_BLOCKS:
+        return "half" if mean > 0 else "explore"  # not enough independent days to call it either way
+    if mean + se < 0:
+        return "avoid"
+    if n >= FULL_SIZE_SAMPLES and mean - se > 0:
+        return "full"
+    return "half"
 
 
 # ---------------------------------------------------------------- records
-def record(brain: Brain, t: Trade, findings: list[tuple[str, str]]) -> None:
-    brain.db.execute(
+def record(brain: Brain, t: Trade, findings: list[tuple[str, str]], variants: dict | None = None) -> bool:
+    """Write the trade. Returns False if an identical trade was already recorded (nothing is touched then)."""
+    cur = brain.db.execute(
         "INSERT OR IGNORE INTO trades (book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl,"
-        " fees, slippage, bars_held, mfe, mae, context, findings, explore) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " fees, slippage, bars_held, mfe, mae, context, findings, explore, side, funding, variants, model_version)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (t.book, t.symbol, t.signal, t.entry_time, t.entry_price, t.exit_time, t.exit_price, t.exit_reason, t.qty, t.notional, t.gross_ret, t.net_ret,
-         t.pnl, t.fees, t.slippage, t.bars_held, t.mfe, t.mae, json.dumps(t.context), json.dumps([tag for tag, _ in findings]), int(t.explore)),
+         t.pnl, t.fees, t.slippage, t.bars_held, t.mfe, t.mae, json.dumps(t.context), json.dumps([tag for tag, _ in findings]), int(t.explore),
+         t.side, t.funding, json.dumps(variants or {}), brain.RESULTS_VERSION),
     )
-    brain.db.execute("UPDATE trades SET side = ?, funding = ? WHERE id = last_insert_rowid()", (t.side, t.funding))
+    return cur.rowcount == 1
 
 
 def narrative(t: Trade, findings: list[tuple[str, str]]) -> str:

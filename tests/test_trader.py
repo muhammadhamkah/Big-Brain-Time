@@ -143,8 +143,11 @@ class TraderTests(unittest.TestCase):
 
     def test_belief_blocks_losing_context(self):
         t = Trader(self.brain, book="blocked", interval="15m", wallet=1000.0, top=5, market="spot")
-        for i in range(12):
-            pm.update_belief(self.brain, pm.Trade("blocked", "X", "rsi_oversold", f"t{i}", 1, "u", 1, "stop", 1, 100, -0.02, -0.022, -2.2, 0.2, 0, 3, 0.001, -0.02, {"regime": "downtrend", "vol_bucket": "mid"}))
+        for i in range(12):  # twelve losses spread over six days: enough independent evidence to call the context a loser
+            tr = pm.Trade("blocked", "X", "rsi_oversold", f"2026-08-{1 + i:02d} 00:00", 1, f"2026-08-{1 + i // 2:02d} 04:00", 1, "stop", 1, 100, -0.02, -0.022, -2.2, 0.2, 0, 3, 0.001, -0.02, {"regime": "downtrend", "vol_bucket": "mid"})
+            pm.record(self.brain, tr, [])
+            pm.update_belief(self.brain, tr)
+        self.assertEqual(pm.verdict(pm.belief(self.brain, "blocked", "rsi_oversold", "downtrend", "mid")), "avoid")
         skips = []
         for end in range(250, 900):
             for e in t.tick(market=market_at(self.series, end), universe=universe(self.symbols))["events"]:
@@ -306,7 +309,7 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual(beliefs_before, beliefs_after)
             # a pre-existing duplicate row is removed when the brain opens
             brain.db.execute("DROP INDEX trades_unique")
-            brain.db.execute("INSERT INTO trades SELECT NULL, book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl, fees, slippage, bars_held, mfe, mae, context, findings, explore, side, funding, variants FROM trades WHERE id = ?", (row["id"],))
+            brain.db.execute("INSERT INTO trades SELECT NULL, book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl, fees, slippage, bars_held, mfe, mae, context, findings, explore, side, funding, variants, model_version FROM trades WHERE id = ?", (row["id"],))
             brain.db.commit()
             self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0], n + 1)
             brain.close()
@@ -321,10 +324,12 @@ class IntegrityTests(unittest.TestCase):
         fake = (f"{os.getpid()} python -m bigbrain.cli trade\n{os.getppid()} /usr/bin/caffeinate -s /x/.venv/bin/python -m bigbrain.cli trade\n"
                 f"4242 /Users/x/.venv/bin/python -m bigbrain.cli trade --book main\n4243 /Users/x/.venv/bin/bigbrain dashboard\n4244 grep bigbrain trade\n"
                 f"4245 /usr/bin/caffeinate -s /x/.venv/bin/python -m bigbrain.cli trade\n4246 /bin/sh -c bigbrain trade\n")
-        with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake)):
-            others = Trader.other_traders()
-        self.assertEqual([pid for pid, _ in others], [4242])
         brain = Brain()
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake)):
+            others = Trader(brain, book="main", market="spot").other_traders()
+            self.assertEqual([pid for pid, _ in others], [4242])
+            # a trader on another book is not a conflict: that is how a frozen baseline runs beside the adaptive book
+            self.assertEqual(Trader(brain, book="main-frozen", market="spot").other_traders(), [])
         t = Trader(brain, book="p", market="spot")
         with mock.patch.object(Trader, "other_traders", return_value=[(4242, "python -m bigbrain.cli trade")]):
             with self.assertRaises(RuntimeError):

@@ -48,15 +48,23 @@ def init_state(variant: str, entry: float, side: int, risk_pct: float) -> ExitSt
     return st
 
 
-def step(variant: str, st: ExitState, entry: float, side: int, risk_pct: float, high: float, low: float) -> tuple[str | None, float | None]:
+def step(variant: str, st: ExitState, entry: float, side: int, risk_pct: float, high: float, low: float, open_: float | None = None) -> tuple[str | None, float | None]:
     """Advance one bar. Returns (exit reason, exit price) if the variant exits on this bar.
 
-    Stops are checked before targets, the conservative assumption when both are touched in one bar."""
+    Stops are checked before targets, the conservative assumption when both are touched in one
+    bar. A bar that opens beyond the stop or target fills at the open (a gap), exactly as the live
+    trader does, so replayed variants and live positions see the same prices."""
     stop_hit = (low <= st.stop) if side == 1 else (high >= st.stop)
     if stop_hit:
-        return ("stop" if not st.armed else "trail"), st.stop
+        price = st.stop
+        if open_ is not None and ((side == 1 and open_ < st.stop) or (side == -1 and open_ > st.stop)):
+            price = open_
+        return ("stop" if not st.armed else "trail"), price
     if st.target is not None and ((high >= st.target) if side == 1 else (low <= st.target)):
-        return "target", st.target
+        price = st.target
+        if open_ is not None and ((side == 1 and open_ > st.target) or (side == -1 and open_ < st.target)):
+            price = open_
+        return "target", price
     favourable = high if side == 1 else low
     if (side == 1 and favourable > st.best) or (side == -1 and favourable < st.best):
         st.best = favourable
@@ -72,25 +80,28 @@ def step(variant: str, st: ExitState, entry: float, side: int, risk_pct: float, 
     return None, None
 
 
-def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: float, cost_ratio: float) -> dict[str, float]:
+def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: float, cost_ratio: float, funding_path: list | None = None) -> dict[str, float]:
     """Net return each variant would have produced on this trade's path.
 
-    ``path`` is [(high, low, close), ...] for every bar after entry; ``actual_exit`` is
-    the price the rule exited at (used when a variant never triggers); ``cost_ratio``
-    is fees plus slippage as a fraction of notional, charged to every variant alike."""
+    ``path`` is [(open, high, low, close), ...] for every bar after entry (older records may
+    carry (high, low, close)); ``actual_exit`` is the price the signal's own rule exited at
+    (used when a variant never triggers); ``cost_ratio`` is fees plus slippage as a fraction
+    of notional, charged to every variant alike."""
     out: dict[str, float] = {}
+    n = len(path)
     for variant in VARIANTS:
-        if variant == "rule":
-            price = actual_exit
-        else:
+        price, exit_bar = actual_exit, n - 1
+        if variant != "rule":
             st = init_state(variant, entry, side, risk_pct)
-            price = actual_exit
-            for high, low, _close in path:
-                reason, px = step(variant, st, entry, side, risk_pct, high, low)
+            for i, bar in enumerate(path):
+                open_, high, low = (bar[0], bar[1], bar[2]) if len(bar) == 4 else (None, bar[0], bar[1])
+                reason, px = step(variant, st, entry, side, risk_pct, high, low, open_)
                 if reason:
-                    price = px
+                    price, exit_bar = px, i
                     break
-        out[variant] = side * (price / entry - 1) - cost_ratio
+        # funding accrued up to this variant's own exit bar (cumulative fraction of notional; longs pay positive rates)
+        funding = funding_path[min(exit_bar, len(funding_path) - 1)] if funding_path else 0.0
+        out[variant] = side * (price / entry - 1) - cost_ratio - funding
     return out
 
 
@@ -133,6 +144,12 @@ def update_policy(brain: Brain, book: str, signal: str) -> tuple[str, str] | Non
         return None
     policy[signal] = best_variant
     brain.set_state(policy_key(book), policy)
+    log = brain.get_state(f"policy_log:{book}", []) or []
+    from datetime import datetime, timezone
+
+    log.append({"at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "signal": signal, "from": old, "to": best_variant,
+                "rule_avg": st["rule"][1], "best_avg": best_avg, "trades": st["rule"][0]})
+    brain.set_state(f"policy_log:{book}", log[-500:])
     title = f"Exit policy: {signal.replace('_', ' ')} ({book})"
     brain.forget(title=title)
     ranking = ", ".join(f"{v} {avg:+.2%} over {n} trades" for v, (n, avg) in sorted(st.items(), key=lambda kv: -kv[1][1]))
@@ -142,7 +159,7 @@ def update_policy(brain: Brain, book: str, signal: str) -> tuple[str, str] | Non
         "This is measured on the brain's own out-of-sample trades and is re-evaluated as more close; a trailing or profit-taking exit that stops winning is dropped again."
     )
     brain.learn("lesson", title, text, source=f"trade:{book}", extra_concepts=["paper trading", "walk-forward", "stop loss", "take profit"])
-    brain.db.commit()
+    brain.commit()
     return old, best_variant
 
 

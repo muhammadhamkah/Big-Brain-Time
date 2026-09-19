@@ -178,7 +178,34 @@ class Brain:
             self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
+        self._batch_depth = 0
         self._migrate()
+
+    # ------------------------------------------------------------ commits
+    def commit(self) -> None:
+        """Commit unless inside a batch(); then the batch commits once at the end."""
+        if self._batch_depth == 0 and self.db.in_transaction:
+            self.db.commit()
+
+    def batch(self):
+        """Context manager: every write inside becomes one transaction (all or nothing)."""
+        brain = self
+
+        class _Batch:
+            def __enter__(self_):
+                brain._batch_depth += 1
+                return brain
+
+            def __exit__(self_, exc_type, exc, tb):
+                brain._batch_depth -= 1
+                if brain._batch_depth == 0:
+                    if exc_type is None:
+                        brain.db.commit()
+                    else:
+                        brain.db.rollback()
+                return False
+
+        return _Batch()
 
     def _migrate(self) -> None:
         """Schema changes for databases created by earlier versions. Only writes when something must change."""
@@ -190,6 +217,9 @@ class Brain:
         ):
             if name not in columns:
                 self.db.execute(stmt)
+        bcols = {r["name"] for r in self.db.execute("PRAGMA table_info(beliefs)")}
+        if "sum_sq" not in bcols:
+            self.db.execute("ALTER TABLE beliefs ADD COLUMN sum_sq REAL NOT NULL DEFAULT 0")
         # A trade can only close once. Remove duplicates written by two traders on one book, then enforce it.
         dupes = self.db.execute(
             "SELECT COUNT(*) FROM trades WHERE id NOT IN (SELECT MIN(id) FROM trades GROUP BY book, symbol, signal, entry_time, exit_time)"
@@ -199,8 +229,33 @@ class Brain:
         indexes = {r["name"] for r in self.db.execute("PRAGMA index_list(trades)")}
         if "trades_unique" not in indexes:
             self.db.execute("CREATE UNIQUE INDEX trades_unique ON trades(book, symbol, signal, entry_time, exit_time)")
+        if "model_version" not in columns:
+            self.db.execute("ALTER TABLE trades ADD COLUMN model_version INTEGER NOT NULL DEFAULT 1")
+        self._upgrade_results_version()
         if self.db.in_transaction:
             self.db.commit()
+
+    RESULTS_VERSION = 2  # bump when execution or evaluation accounting changes; older evidence is retired, not reused
+
+    def _upgrade_results_version(self) -> None:
+        row = self.db.execute("SELECT value FROM state WHERE key = 'results_version'").fetchone()
+        current = json.loads(row[0]) if row else 1
+        if current >= self.RESULTS_VERSION:
+            return
+        had_stats = self.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0]
+        if had_stats and self.path != ":memory:":
+            try:  # keep the old evidence on disk before retiring it
+                from bigbrain.backup import snapshot
+
+                self.db.commit()
+                snapshot(self.path, Path(self.path).parent / "backups", keep=50)
+            except Exception:
+                pass
+        # exit statistics and policies from version 1 compared inconsistent fills; they are not evidence any more
+        self.db.execute("DELETE FROM exit_stats")
+        self.db.execute("DELETE FROM state WHERE key LIKE 'exit_policy:%'")
+        self.db.execute("INSERT INTO state (key, value) VALUES ('results_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(self.RESULTS_VERSION),))
+        self._journal("upgrade", f"results version {current} -> {self.RESULTS_VERSION}: exit statistics retired ({had_stats} rows)")
 
     # ------------------------------------------------------------------ learn
     def learn(
@@ -242,7 +297,7 @@ class Brain:
 
         synapses = self._wire(cell, tokens)
         self._journal("learn", f"{kind}: {title} (+{len(synapses)} links)")
-        self.db.commit()
+        self.commit()
         return cell, synapses
 
     def _wire(self, cell: Cell, tokens: dict[str, int]) -> list[Synapse]:
@@ -382,7 +437,7 @@ class Brain:
         if reinforce and results:
             self._reinforce([r.cell.id for r in results])
             self._journal("recall", query[:120])
-            self.db.commit()
+            self.commit()
         return results
 
     def _reinforce(self, cell_ids: list[str]) -> None:
@@ -509,7 +564,7 @@ class Brain:
             self.db.execute(f"DELETE FROM cell_tokens WHERE cell_id IN ({ph})", chunk)
             self.db.execute(f"DELETE FROM cells WHERE id IN ({ph})", chunk)
         self._journal("forget", f"{len(ids)} cells ({where})")
-        self.db.commit()
+        self.commit()
         return len(ids)
 
     # ------------------------------------------------------------ upkeep
@@ -542,7 +597,7 @@ class Brain:
             self.db.execute(f"DELETE FROM cells WHERE id IN ({ph})", chunk)
         self.db.execute("DELETE FROM journal WHERE ts < ?", (cutoff,))
         self._journal("prune", f"{len(ids)} {kind} cells older than {older_than_days} days")
-        self.db.commit()
+        self.commit()
         return len(ids)
 
     def checkpoint(self) -> None:
@@ -560,7 +615,7 @@ class Brain:
             "INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, json.dumps(value)),
         )
-        self.db.commit()
+        self.commit()
 
     def close(self) -> None:
         self.db.close()

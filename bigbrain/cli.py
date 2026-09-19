@@ -332,10 +332,24 @@ def cmd_trade(args: argparse.Namespace) -> int:
               f"VIP0 fees plus slippage, {sides}, every closed trade analysed. Ctrl-C to stop.")
     try:
         t.run(once=args.once)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
+        t.release_lock()
         print(f"\nstopped. {len(t.wallet.positions)} positions stay open in the book; run `bigbrain trade` again to manage them.")
         sys.stdout.flush()
         os._exit(0)  # skip waiting on fetch threads still in flight; state was saved after every symbol
+    return 0
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Remove duplicate trade records (already done on open) and rebuild beliefs from the trade log."""
+    from bigbrain.trader import Trader
+
+    brain = open_brain(args.db)
+    r = Trader(brain, book=args.book).rebuild_stats()
+    print(f"book '{args.book}': beliefs and exit statistics rebuilt from {r['trades']} trades.")
     return 0
 
 
@@ -584,6 +598,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset", action="store_true", help="close all positions and restart the wallet before trading (learning kept)")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_trade)
+
+    p = sub.add_parser("repair", help="rebuild a book's beliefs and exit statistics from its trade log")
+    p.add_argument("--book", default="main")
+    p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("reset", help="close all positions and restart a book's wallet; --forget also erases its history and beliefs")
     p.add_argument("--book", default="main")

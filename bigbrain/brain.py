@@ -178,6 +178,11 @@ class Brain:
                 self.db.execute(stmt)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # A trade can only close once. Remove any duplicates written by two traders on one book, then enforce it.
+        self.db.execute(
+            "DELETE FROM trades WHERE id NOT IN (SELECT MIN(id) FROM trades GROUP BY book, symbol, signal, entry_time, exit_time)"
+        )
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_unique ON trades(book, symbol, signal, entry_time, exit_time)")
         self.db.commit()
 
     # ------------------------------------------------------------------ learn

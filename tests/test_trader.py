@@ -277,6 +277,63 @@ class CatchUpTests(unittest.TestCase):
             self.assertTrue(any(e.get("catch_up") for e in events if e["action"] in ("sell", "cover")) or not closed_b)
 
 
+class IntegrityTests(unittest.TestCase):
+    def test_duplicate_trades_are_impossible_and_stats_rebuild(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(os.path.join(tmp, "b.db"))
+            symbols = ["AAAUSDT", "BBBUSDT"]
+            series = {s: stamped(synthetic(s, n=600, seed=70 + i, vol=0.02)) for i, s in enumerate(symbols)}
+            for bars in series.values():
+                for b in bars:
+                    b.quote_volume = b.volume * b.close
+            t = Trader(brain, book="i", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+            for end in range(250, 600):
+                t.tick(market=market_at(series, end), universe=universe(symbols))
+            n = brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0]
+            self.assertGreater(n, 0)
+            beliefs_before = sorted(tuple(r) for r in brain.db.execute("SELECT signal, regime, vol_bucket, wins, losses FROM beliefs WHERE book = 'i'"))
+            # a second recording of an existing trade is ignored
+            row = brain.db.execute("SELECT * FROM trades WHERE book = 'i' LIMIT 1").fetchone()
+            tr = pm.Trade(book="i", symbol=row["symbol"], signal=row["signal"], entry_time=row["entry_time"], entry_price=1, exit_time=row["exit_time"], exit_price=1,
+                          exit_reason="stop", qty=1, notional=1, gross_ret=0, net_ret=0, pnl=0, fees=0, slippage=0, bars_held=1, mfe=0, mae=0)
+            pm.record(brain, tr, [])
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0], n)
+            # corrupt the beliefs, then rebuild from the log
+            brain.db.execute("UPDATE beliefs SET wins = wins * 2, losses = losses * 2 WHERE book = 'i'")
+            t.rebuild_stats()
+            beliefs_after = sorted(tuple(r) for r in brain.db.execute("SELECT signal, regime, vol_bucket, wins, losses FROM beliefs WHERE book = 'i'"))
+            self.assertEqual(beliefs_before, beliefs_after)
+            # a pre-existing duplicate row is removed when the brain opens
+            brain.db.execute("DROP INDEX trades_unique")
+            brain.db.execute("INSERT INTO trades SELECT NULL, book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl, fees, slippage, bars_held, mfe, mae, context, findings, explore, side, funding, variants FROM trades WHERE id = ?", (row["id"],))
+            brain.db.commit()
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0], n + 1)
+            brain.close()
+            reopened = Brain(os.path.join(tmp, "b.db"))
+            self.assertEqual(reopened.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0], n)
+            reopened.close()
+
+    def test_lock_refuses_a_second_trader(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(os.path.join(tmp, "b.db"))
+            a = Trader(brain, book="lock", market="spot")
+            a.lock_path().parent.mkdir(parents=True, exist_ok=True)
+            a.lock_path().write_text(str(os.getppid()))  # another live process holds the book
+            with self.assertRaises(RuntimeError):
+                a.acquire_lock()
+            a.lock_path().unlink()
+            a.acquire_lock()  # free again, and re-entrant for the same process
+            a.acquire_lock()
+            a.release_lock()
+            self.assertFalse(a.lock_path().exists())
+            # a stale lock from a dead process is ignored
+            a.lock_path().write_text("999999")
+            a.acquire_lock()
+            a.release_lock()
+
+
 class ResetTests(unittest.TestCase):
     def test_reset_keeps_or_forgets_learning(self):
         brain = Brain()

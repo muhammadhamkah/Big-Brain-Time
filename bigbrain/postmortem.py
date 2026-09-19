@@ -143,7 +143,7 @@ def belief(brain: Brain, book: str, signal: str, regime: str, vol_bucket: str) -
 # ---------------------------------------------------------------- records
 def record(brain: Brain, t: Trade, findings: list[tuple[str, str]]) -> None:
     brain.db.execute(
-        "INSERT INTO trades (book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl,"
+        "INSERT OR IGNORE INTO trades (book, symbol, signal, entry_time, entry_price, exit_time, exit_price, exit_reason, qty, notional, gross_ret, net_ret, pnl,"
         " fees, slippage, bars_held, mfe, mae, context, findings, explore) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (t.book, t.symbol, t.signal, t.entry_time, t.entry_price, t.exit_time, t.exit_price, t.exit_reason, t.qty, t.notional, t.gross_ret, t.net_ret,
          t.pnl, t.fees, t.slippage, t.bars_held, t.mfe, t.mae, json.dumps(t.context), json.dumps([tag for tag, _ in findings]), int(t.explore)),

@@ -27,8 +27,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -36,6 +38,16 @@ from datetime import datetime, timezone
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 from bigbrain import exits
 from bigbrain import postmortem as pm
@@ -497,6 +509,51 @@ class Trader:
         if len(self.wallet.log) > LOG_LINES:
             self.wallet.log = self.wallet.log[-LOG_LINES:]
 
+    # ----------------------------------------------------------------- lock
+    def lock_path(self) -> Path:
+        base = Path(self.brain.path).parent if self.brain.path != ":memory:" else Path(os.environ.get("TMPDIR", "/tmp"))
+        return base / f"trade-{self.book}.lock"
+
+    def acquire_lock(self) -> None:
+        """Refuse to run two traders on one book: they would each close the same positions."""
+        path = self.lock_path()
+        if path.exists():
+            try:
+                pid = int(path.read_text().strip() or 0)
+            except ValueError:
+                pid = 0
+            if pid and pid != os.getpid() and _pid_alive(pid):
+                raise RuntimeError(f"another trader (pid {pid}) is already running book '{self.book}'. Stop it first, or use --book for a separate book.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(os.getpid()))
+
+    def release_lock(self) -> None:
+        try:
+            if self.lock_path().read_text().strip() == str(os.getpid()):
+                self.lock_path().unlink()
+        except OSError:
+            pass
+
+    # -------------------------------------------------------------- rebuild
+    def rebuild_stats(self) -> dict:
+        """Recompute beliefs and exit statistics from the trade log, the single source of truth."""
+        self.brain.db.execute("DELETE FROM beliefs WHERE book = ?", (self.book,))
+        self.brain.db.execute("DELETE FROM exit_stats WHERE book = ?", (self.book,))
+        n = 0
+        for r in self.brain.db.execute("SELECT * FROM trades WHERE book = ? ORDER BY id", (self.book,)).fetchall():
+            ctx = json.loads(r["context"])
+            t = pm.Trade(book=self.book, symbol=r["symbol"], signal=r["signal"], entry_time=r["entry_time"], entry_price=r["entry_price"], exit_time=r["exit_time"],
+                         exit_price=r["exit_price"], exit_reason=r["exit_reason"], qty=r["qty"], notional=r["notional"], gross_ret=r["gross_ret"], net_ret=r["net_ret"],
+                         pnl=r["pnl"], fees=r["fees"], slippage=r["slippage"], bars_held=r["bars_held"], mfe=r["mfe"], mae=r["mae"], context=ctx, explore=bool(r["explore"]),
+                         side=r["side"], funding=r["funding"])
+            pm.update_belief(self.brain, t)
+            variants = json.loads(r["variants"] or "{}")
+            if variants:
+                exits.record(self.brain, self.book, r["signal"], variants)
+            n += 1
+        self.brain.db.commit()
+        return {"trades": n}
+
     # ---------------------------------------------------------------- reset
     def reset(self, wallet: float | None = None, forget: bool = False) -> dict:
         """Close every position without a post-mortem and start the wallet again.
@@ -551,6 +608,10 @@ class Trader:
             log(line)
             self._log(line)
 
+        self.acquire_lock()
+        rebuilt = self.rebuild_stats()
+        if rebuilt["trades"]:
+            out(f"beliefs and exit statistics rebuilt from {rebuilt['trades']} recorded trades")
         while True:
             try:
                 started = time.time()
@@ -570,5 +631,6 @@ class Trader:
             except Exception as exc:
                 out(f"trade error: {exc}")
             if once:
+                self.release_lock()
                 return
             sleep(self.seconds_until_next_close())

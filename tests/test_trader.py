@@ -246,6 +246,37 @@ class PerpsTests(unittest.TestCase):
             self.assertAlmostEqual(p["margin"], p["notional"] / 3.0, places=6)
 
 
+class CatchUpTests(unittest.TestCase):
+    def test_missed_candles_are_replayed_for_open_positions(self):
+        brain_a, brain_b = Brain(), Brain()
+        symbols = ["AAAUSDT", "BBBUSDT"]
+        series = {s: stamped(synthetic(s, n=700, seed=50 + i, vol=0.02)) for i, s in enumerate(symbols)}
+        for bars in series.values():
+            for b in bars:
+                b.quote_volume = b.volume * b.close
+        # same book name in two brains: identical decisions. Run A sees every candle;
+        # run B has a 40-candle gap after bar 400 (laptop asleep) and must catch up.
+        a = Trader(brain_a, book="x", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+        b = Trader(brain_b, book="x", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+        for end in range(250, 401):
+            a.tick(market=market_at(series, end), universe=universe(symbols))
+            b.tick(market=market_at(series, end), universe=universe(symbols))
+        open_before = len(b.wallet.positions)
+        for end in range(401, 441):
+            a.tick(market=market_at(series, end), universe=universe(symbols))
+        events = b.tick(market=market_at(series, 441), universe=universe(symbols))["events"]  # the gap
+        a.tick(market=market_at(series, 441), universe=universe(symbols))
+        cutoff = series["AAAUSDT"][399].date
+        q = "SELECT symbol, signal, entry_time, exit_time, exit_reason FROM trades WHERE entry_time <= ? ORDER BY entry_time, symbol, signal"
+        closed_a = brain_a.db.execute(q, (cutoff,)).fetchall()
+        closed_b = brain_b.db.execute(q, (cutoff,)).fetchall()
+        self.assertTrue(closed_a)
+        # positions that were open before the gap must close at the same candle and for the same reason in both runs
+        self.assertEqual([tuple(r) for r in closed_a], [tuple(r) for r in closed_b])
+        if open_before:
+            self.assertTrue(any(e.get("catch_up") for e in events if e["action"] in ("sell", "cover")) or not closed_b)
+
+
 class ResetTests(unittest.TestCase):
     def test_reset_keeps_or_forgets_learning(self):
         brain = Brain()

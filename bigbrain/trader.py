@@ -267,11 +267,25 @@ class Trader:
     # ---------------------------------------------------------------- symbol
     def _step_symbol(self, symbol: str, bars: list[Bar], volume_24h: float) -> list[dict]:
         rs = readings(bars)
+        candle_qv = sum(b.quote_volume for b in bars[-20:]) / 20 or sum(b.volume * b.close for b in bars[-20:]) / 20
+        events: list[dict] = []
+        # Catch up: if candles closed while the trader was not running (sleep, restart, outage),
+        # manage the open positions through every missed candle in order, so stops that were
+        # touched in the gap fire at the right price and holding periods count real candles.
+        last_done = self.wallet.last_bar.get(symbol)
+        dates = [b.date for b in bars]
+        start = dates.index(last_done) + 1 if last_done in dates else len(bars) - 1
+        has_positions = any(p["symbol"] == symbol for p in self.wallet.positions.values())
+        for i in range(start, len(bars) - 1):
+            if not has_positions:
+                break
+            fired_i = detect(rs[i - 1], rs[i]) if i >= 1 else []
+            events += self._manage_exits(symbol, bars[i], rs[i], fired_i, volume_24h, candle_qv, catch_up=True)
+            has_positions = any(p["symbol"] == symbol for p in self.wallet.positions.values())
         cur, prev = rs[-1], rs[-2]
         fired = detect(prev, cur)
         ctx = context_for(rs, bars)
-        candle_qv = sum(b.quote_volume for b in bars[-20:]) / 20 or sum(b.volume * b.close for b in bars[-20:]) / 20
-        events = self._manage_exits(symbol, bars[-1], cur, fired, volume_24h, candle_qv)
+        events += self._manage_exits(symbol, bars[-1], cur, fired, volume_24h, candle_qv)
         for signal in fired:
             play = PLAYBOOK.get(signal)
             if play is None or (play["side"] == -1 and self.market != "perps"):
@@ -329,12 +343,14 @@ class Trader:
         self.wallet.positions[key] = asdict(pos)
         return {"symbol": symbol, "signal": signal, "action": "buy" if side == 1 else "short", "price": fill, "notional": notional, "explore": explore, "stop": pos.stop, "p_win": round(b["p_win"], 2)}
 
-    def _manage_exits(self, symbol: str, bar: Bar, cur: Reading, fired: list[str], volume_24h: float, candle_qv: float) -> list[dict]:
+    def _manage_exits(self, symbol: str, bar: Bar, cur: Reading, fired: list[str], volume_24h: float, candle_qv: float, catch_up: bool = False) -> list[dict]:
         events = []
         for key, raw in list(self.wallet.positions.items()):
             if raw["symbol"] != symbol:
                 continue
             pos = Position(**raw)
+            if pos.entry_time >= bar.date:
+                continue  # entered on this candle or later; nothing to manage yet
             pos.bars_held += 1
             if pos.side == 1:
                 pos.mfe = max(pos.mfe, bar.high / pos.entry_price - 1)
@@ -364,7 +380,10 @@ class Trader:
             if reason is None:
                 self.wallet.positions[key] = asdict(pos)
                 continue
-            events.append(self._close(pos, bar, price, reason, volume_24h, candle_qv))
+            ev = self._close(pos, bar, price, reason, volume_24h, candle_qv)
+            if catch_up:
+                ev["catch_up"] = True
+            events.append(ev)
             del self.wallet.positions[key]
         return events
 
@@ -543,7 +562,8 @@ class Trader:
                         out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['notional']:.0f} USDT  stop {e['stop']:.6g}  p(win) {e['p_win']}{'  (exploring)' if e['explore'] else ''}")
                     elif e["action"] in ("sell", "cover"):
                         fund = f" funding {e['funding']:+.2f}" if e.get("funding") else ""
-                        out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}  findings: {', '.join(e['findings'])}")
+                        late = " [caught up from a missed candle]" if e.get("catch_up") else ""
+                        out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}{late}  findings: {', '.join(e['findings'])}")
                     elif e["action"] == "skip" and "belief" in e["why"]:
                         out(f"    SKIP {e['symbol']:12} {e['signal']:18} {e['why']}")
                 self._save()

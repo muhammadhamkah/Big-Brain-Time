@@ -76,6 +76,8 @@ RISK_PER_TRADE = 0.01  # fraction of equity lost if the stop is hit
 EXPLORE_RISK = 0.005
 MAX_POSITION_FRACTION = 0.25
 MAX_OPEN_RISK = 0.10  # sum over open positions of (notional x stop distance) / equity
+MIN_STOP_PCT = 0.005  # a stop closer than this sits inside the spread and noise on quiet pairs
+MIN_STOP_COST_MULTIPLE = 6.0  # and never closer than this many round-trip costs
 LEVERAGE = {"spot": 1.0, "perps": 3.0}  # margin per position = notional / leverage; gross exposure <= equity x leverage
 MAINTENANCE_MARGIN = 0.005  # Binance tier-1 maintenance rate; equity below this x gross notional is a liquidation
 LOG_LINES = 80  # trade feed kept in state for the dashboard
@@ -350,7 +352,8 @@ class Trader:
         else:
             return None
         play = PLAYBOOK[signal]
-        stop_pct = play["stop_atr"] * ctx["atr_pct"]
+        round_trip = 2 * self.fees["taker"] + 2 * slippage_bps(equity_hint := self.wallet.equity() * MAX_POSITION_FRACTION, volume_24h, candle_qv) / 1e4
+        stop_pct = max(play["stop_atr"] * ctx["atr_pct"], MIN_STOP_PCT, MIN_STOP_COST_MULTIPLE * round_trip)
         if stop_pct <= 0:
             return None
         equity = self.wallet.equity()

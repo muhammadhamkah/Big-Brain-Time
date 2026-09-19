@@ -348,6 +348,24 @@ class IntegrityTests(unittest.TestCase):
             a.release_lock()
 
 
+class StopFloorTests(unittest.TestCase):
+    def test_stops_never_sit_inside_the_noise(self):
+        from bigbrain.trader import MIN_STOP_PCT
+        brain = Brain()
+        symbols = ["QUIETUSDT", "BBBUSDT"]
+        series = {s: stamped(synthetic(s, n=500, seed=90 + i, vol=0.0005 if s == "QUIETUSDT" else 0.02)) for i, s in enumerate(symbols)}
+        for bars in series.values():
+            for b in bars:
+                b.quote_volume = b.volume * b.close
+        t = Trader(brain, book="floor", interval="15m", wallet=1000.0, top=2, market="perps", fetch_funding=lambda: {})
+        for end in range(250, 500):
+            t.tick(market=market_at(series, end), universe=universe(symbols))
+        for p in t.wallet.positions.values():
+            self.assertGreaterEqual(p["context"]["risk_pct"], MIN_STOP_PCT - 1e-9, p["symbol"])
+        for r in brain.db.execute("SELECT context FROM trades WHERE book = 'floor'"):
+            self.assertGreaterEqual(json.loads(r["context"])["risk_pct"], MIN_STOP_PCT - 1e-9)
+
+
 class ConflictTests(unittest.TestCase):
     def test_never_long_and_short_the_same_pair(self):
         brain = Brain()

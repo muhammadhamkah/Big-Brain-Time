@@ -90,7 +90,8 @@ def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: 
     ``costs`` is a dict, so every variant is filled and charged exactly as the live trader fills:
         entry        entry fee as a fraction of notional (``entry`` already carries entry slippage)
         fee          taker rate charged on the exit value
-        slip         slippage fraction for a resting order fill (stop, target, trail); a float or a function of the level
+        slip         slippage fraction for a resting order fill (stop, target, trail); a float, or a function of
+                     (level, path bar index) so each fill pays for the liquidity of its own candle
         rule_slip    slippage fraction for the rule's own exit fill (its basis differs: quote, next open, resting)
         rule_funding cumulative funding fraction at the rule's exit (funding at a next-open fill included)
     A bare float is the legacy flat cost ratio, charged to every variant alike."""
@@ -112,7 +113,7 @@ def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: 
                     break
         if isinstance(costs, dict):
             s = costs["slip"] if own else costs.get("rule_slip", costs["slip"])
-            s = s(price) if callable(s) else s
+            s = s(price, exit_bar) if callable(s) else s
             fill = price * (1 - side * s)  # a long sells into the bid, a short buys back at the offer
             funding = fund_at(exit_bar) if own else costs.get("rule_funding", fund_at(n - 1))
             out[variant] = side * (fill / entry - 1) - costs.get("entry", 0.0) - (fill / entry) * costs.get("fee", 0.0) - funding

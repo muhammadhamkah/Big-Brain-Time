@@ -235,7 +235,9 @@ class Brain:
         if self.db.in_transaction:
             self.db.commit()
 
-    RESULTS_VERSION = 2  # bump when execution or evaluation accounting changes; older evidence is retired, not reused
+    RESULTS_VERSION = 3  # bump when execution or evaluation accounting changes; older evidence is retired, not reused
+    # 1: original; 2: chronological fills, gap-aware replay, block-based evidence; 3: rule tracked from entry,
+    # per-variant fills and fees with the liquidity of each exit candle, evidence counted from current trades only
 
     def _upgrade_results_version(self) -> None:
         row = self.db.execute("SELECT value FROM state WHERE key = 'results_version'").fetchone()
@@ -243,7 +245,8 @@ class Brain:
         if current >= self.RESULTS_VERSION:
             return
         had_stats = self.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0]
-        if had_stats and self.path != ":memory:":
+        had_trades = self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        if (had_stats or had_trades) and self.path != ":memory:":
             try:  # keep the old evidence on disk before retiring it
                 from bigbrain.backup import snapshot
 
@@ -256,7 +259,8 @@ class Brain:
         self.db.execute("DELETE FROM beliefs")  # rebuilt from current-version trades when a trader starts
         self.db.execute("DELETE FROM state WHERE key LIKE 'exit_policy:%'")
         self.db.execute("INSERT INTO state (key, value) VALUES ('results_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(self.RESULTS_VERSION),))
-        self._journal("upgrade", f"results version {current} -> {self.RESULTS_VERSION}: exit statistics retired ({had_stats} rows)")
+        self._journal("upgrade", f"results version {current} -> {self.RESULTS_VERSION}: exit statistics ({had_stats} rows) and beliefs retired; "
+                                 f"{had_trades} earlier trades stay on record but no longer count as evidence")
 
     # ------------------------------------------------------------------ learn
     def learn(

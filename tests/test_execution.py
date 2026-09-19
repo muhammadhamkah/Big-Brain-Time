@@ -301,7 +301,7 @@ class SecondReviewTests(unittest.TestCase):
         row = self.brain.db.execute("SELECT net_ret, funding, fees, notional, entry_price, qty, variants FROM trades WHERE book = 'rv'").fetchone()
         held = Position(**pos)
         held.funding, held.entry_fee = row["funding"], pos["entry_fee"]
-        costs = t._exit_costs(pos["entry_fee"], row["notional"], row["qty"], "resting", VOL, QV, row["funding"] / row["notional"])
+        costs = t._exit_costs(pos["entry_fee"], row["notional"], row["qty"], "resting", [(VOL, QV)] * 3, (VOL, QV), row["funding"] / row["notional"])
         path = [(100.2, 100.8, 100.0, 100.6), (100.6, 100.9, 100.1, 100.4), (100.4, 100.5, 97.0, 97.5)]
         fund_path = [0.0, row["funding"] / row["notional"], row["funding"] / row["notional"]]
         replay = exits.simulate(path, row["entry_price"], 1, 0.02, pos["stop"], costs, fund_path)
@@ -316,6 +316,98 @@ class SecondReviewTests(unittest.TestCase):
         self.assertAlmostEqual(r["tp_1R"], fill / 100.0 - 1 - 0.0005 - fill / 100.0 * 0.0005, places=12)
         fill = 101.0 * (1 - 0.0001)
         self.assertAlmostEqual(r["rule"], fill / 100.0 - 1 - 0.0005 - fill / 100.0 * 0.0005, places=12)
+
+
+class ThirdReviewTests(unittest.TestCase):
+    """Reproductions from the third review: upgrading a populated database, and liquidity that changes during a trade."""
+
+    def test_a_database_from_the_previous_release_upgrades_cleanly(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.db")
+            brain = Brain(path)
+            # --- what release 1c69eb6 left behind: version 2, trades with scores, exit statistics, beliefs, open positions and a shadow
+            brain.db.execute("UPDATE state SET value = '2' WHERE key = 'results_version'")
+            for i in range(25):
+                tr = trade("main", f"S{i}USDT", f"2026-09-{1 + i % 9:02d} {i:02d}:00", 0.01, exit_time=f"2026-09-{1 + i % 9:02d} 23:00")
+                pm.record(brain, tr, [], {v: 0.01 for v in exits.VARIANTS}); pm.update_belief(brain, tr)
+                exits.record(brain, "main", "rsi_oversold", {v: 0.01 for v in exits.VARIANTS})
+            shadow_trade = trade("main", "SHDUSDT", "2026-09-01 07:15", 0.0195, exit_time="2026-09-01 07:30")
+            pm.record(brain, shadow_trade, [], {})
+            brain.db.execute("UPDATE trades SET model_version = 2")
+            old_position = {  # layout of 1c69eb6: no rule_track, no liq_path, three-value path
+                "symbol": "OLDUSDT", "signal": "rsi_oversold", "entry_time": "2026-09-01 07:15", "entry_price": 100.05, "qty": 1.0, "notional": 100.05, "stop": 98.0,
+                "max_bars": 16, "exit_rule": "rsi_recovered", "context": {**CTX, "risk_pct": 0.02}, "explore": False, "bars_held": 2, "mfe": 0.01, "mae": -0.002,
+                "mark": 100.6, "entry_fee": 0.05, "entry_slip": 0.05, "side": 1, "funding": 0.01, "last_funding_hour": "2026-09-01 07", "margin": 33.35,
+                "path": [(100.8, 100.0, 100.6), (100.9, 100.1, 100.4)], "fund_path": [0.0, 0.0001], "exit_variant": "tp_1R", "exit_armed": False, "exit_best": 100.9,
+                "exit_target": 102.05,
+            }
+            old_shadow = {"symbol": "SHDUSDT", "signal": "rsi_oversold", "side": 1, "entry_price": 100.0, "entry_time": "2026-09-01 07:15", "risk_pct": 0.02, "stop": 98.0,
+                          "max_bars": 16, "exit_rule": "rsi_recovered", "bars_held": 1, "path": [(100.2, 103.0, 100.0, 102.8)], "fund_path": [0.0], "funding": 0.0,
+                          "last_funding_hour": "2026-09-01 07", "cost_ratio": 0.0012, "pending": False, "last_bar": "2026-09-01 07:30"}
+            orphan = {**old_shadow, "symbol": "GONEUSDT"}  # no trade record: cannot be sized
+            brain.set_state("trader:main", {"cash": 900.0, "start": 1000.0, "positions": {"OLDUSDT:rsi_oversold": old_position}, "last_bar": {}, "curve": [], "peak": 1000.0,
+                                            "max_drawdown": 0.0, "closed": 26, "log": [], "shadows": {"SHDUSDT:rsi_oversold:2026-09-01 07:15": old_shadow, "GONEUSDT:rsi_oversold:2026-09-01 07:15": orphan},
+                                            "market": "perps", "interval": "15m", "last_tick": ""})
+            brain.close()
+            # --- open it with this release
+            brain = Brain(path)
+            self.assertEqual(brain.get_state("results_version"), brain.RESULTS_VERSION)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs").fetchone()[0], 0)
+            self.assertTrue(os.listdir(os.path.join(tmp, "backups")))  # snapshot taken before retiring anything
+            t = Trader(brain, book="main", market="perps", fetch_funding=lambda: {})
+            pos = t.wallet.positions["OLDUSDT:rsi_oversold"]
+            self.assertEqual((pos["rule_track"]["bars_held"], pos["rule_track"]["stop"]), (2, 100.05 * 0.98))
+            self.assertAlmostEqual(pos["rule_track"]["funding"], 0.01 / 100.05)
+            sh = t.wallet.shadows["SHDUSDT:rsi_oversold:2026-09-01 07:15"]
+            self.assertEqual((sh["track"]["bars_held"], sh["qty"], sh["entry_fee_ratio"]), (1, 1.0, 0.0005))
+            self.assertNotIn("GONEUSDT:rsi_oversold:2026-09-01 07:15", t.wallet.shadows)
+            # the retired evidence no longer counts anywhere
+            self.assertEqual(pm.belief(brain, "main", "rsi_oversold", "uptrend", "mid")["samples"], 0)
+            t.rebuild_stats()
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs").fetchone()[0], 0)
+            # and the migrated shadow and position run without error, through a rule exit and the target
+            quiet, recovered = SimpleNamespace(rsi=40.0, sma20=None, close=100.0), SimpleNamespace(rsi=60.0, sma20=None, close=100.0)
+            t._process_bar("SHDUSDT", bar("2026-09-01 07:45", 102.8, 103.5, 102.5, 103.0), recovered, [], VOL, QV)
+            self.assertTrue(sh["track"]["pending"])
+            t._process_bar("SHDUSDT", bar("2026-09-01 08:00", 103.0, 103.5, 102.5, 103.2), quiet, [], VOL, QV)
+            self.assertNotIn("SHDUSDT:rsi_oversold:2026-09-01 07:15", t.wallet.shadows)
+            v = json.loads(brain.db.execute("SELECT variants FROM trades WHERE symbol = 'SHDUSDT'").fetchone()["variants"])
+            self.assertEqual(set(v), set(exits.VARIANTS))  # scored for the record ...
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)  # ... but a version-2 trade is not version-3 evidence
+            events = t._process_bar("OLDUSDT", bar("2026-09-01 07:45", 100.4, 102.5, 100.2, 102.0), quiet, [], VOL, QV)
+            self.assertEqual(events[0]["reason"], "target")
+            self.assertIn("OLDUSDT:rsi_oversold:2026-09-01 07:15", t.wallet.shadows)
+            self.assertEqual(brain.db.execute("SELECT model_version FROM trades WHERE symbol = 'OLDUSDT'").fetchone()[0], brain.RESULTS_VERSION)
+            # a second open (and a rolled-back reload) sees the migrated layout, not the old one again
+            t._save()
+            t2 = Trader(brain, book="main")
+            self.assertIn("track", t2.wallet.shadows["OLDUSDT:rsi_oversold:2026-09-01 07:15"])
+            brain.close()
+
+    def test_each_replayed_fill_pays_the_liquidity_of_its_own_candle(self):
+        brain = Brain()
+        t = Trader(brain, book="lq", market="perps", frozen=True, fetch_funding=lambda: {})
+        key = "AAAUSDT:rsi_oversold"
+        t.wallet.pending[key] = {"symbol": "AAAUSDT", "signal": "rsi_oversold", "side": 1, "notional": 5000.0, "stop_pct": 0.02, "explore": False, "variant": "tp_1R",
+                                 "max_bars": 16, "exit_rule": "rsi_recovered", "placed": "2026-09-01 06:45", "signal_close": 100.0, "p_win": 0.5, "samples": 0, "ctx": CTX}
+        t.wallet.cash = 10_000.0
+        thin, deep = (2_000_000.0, 20_000.0), (500_000_000.0, 5_000_000.0)  # a big order in a thin market, then the market deepens
+        quiet, recovered = SimpleNamespace(rsi=40.0, sma20=None, close=100.0), SimpleNamespace(rsi=60.0, sma20=None, close=100.0)
+        t._fill_pending("AAAUSDT", bar("2026-09-01 07:00", 100.0, 100.5, 99.8, 100.2), *thin, catch_up=False)
+        pos = t.wallet.positions[key]
+        events = t._process_bar("AAAUSDT", bar("2026-09-01 07:15", 100.2, 103.0, 100.0, 102.8), quiet, [], *thin)  # target fills in the thin candle
+        self.assertEqual(events[0]["reason"], "target")
+        booked = brain.db.execute("SELECT net_ret FROM trades WHERE book = 'lq'").fetchone()["net_ret"]
+        t._process_bar("AAAUSDT", bar("2026-09-01 07:30", 102.8, 103.5, 102.0, 103.0), recovered, [], *deep)  # liquidity is now 250x better
+        t._process_bar("AAAUSDT", bar("2026-09-01 07:45", 103.0, 103.5, 102.5, 103.2), quiet, [], *deep)
+        self.assertNotIn(f"AAAUSDT:rsi_oversold:{pos['entry_time']}", t.wallet.shadows)
+        v = json.loads(brain.db.execute("SELECT variants FROM trades WHERE book = 'lq'").fetchone()["variants"])
+        self.assertAlmostEqual(v["tp_1R"], booked, places=12)  # replayed with the thin candle's liquidity: exactly what was booked
+        cheap = 1.02 * (1 - slippage_bps(pos["qty"] * 1.02 * pos["entry_price"], *deep) / 1e4)
+        self.assertLess(v["tp_1R"], cheap - 1 - 2 * 0.0005 * 1.02 - 0.0005)  # and well below what the deep market would have pretended
 
 
 class EvidenceTests(unittest.TestCase):

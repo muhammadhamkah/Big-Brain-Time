@@ -197,6 +197,7 @@ class Position:
     margin: float = 0.0  # cash posted for this position (notional / leverage)
     path: list = field(default_factory=list)  # [(open, high, low, close)] per bar since entry, for exit learning
     fund_path: list = field(default_factory=list)  # cumulative funding as a fraction of notional, one value per path bar
+    liq_path: list = field(default_factory=list)  # (24h quote volume, candle quote volume) per path bar: the liquidity a fill on that candle pays for
     exit_variant: str = "rule"  # the exit policy this position runs under
     exit_armed: bool = False
     exit_best: float = 0.0
@@ -314,12 +315,41 @@ class Trader:
         self.frozen = stored.get("frozen", frozen) if stored else frozen  # a frozen book never adapts: fixed size, rule exits, no beliefs
         self.wallet = self._load(stored) if stored else Wallet(cash=wallet, start=wallet, peak=wallet)
 
-    @staticmethod
-    def _load(stored: dict) -> Wallet:
+    def _load(self, stored: dict) -> Wallet:
         stored = dict(stored)
         for extra in ("market", "interval", "last_tick", "frozen"):
             stored.pop(extra, None)
-        return Wallet(**stored)
+        wallet = Wallet(**stored)
+        self._migrate(wallet)
+        return wallet
+
+    def _migrate(self, wallet: Wallet) -> None:
+        """Bring positions and shadows saved by an earlier version of this module up to the current layout.
+
+        A position under a learned exit gets a rule track seeded from its own state (the rule has held
+        the same bars and paid the same funding). A shadow saved without a track gets one from its
+        fields and its size from the trade record; one that cannot be reconstructed is dropped, and
+        its trade keeps an empty variants column rather than a made-up score."""
+        for raw in wallet.positions.values():
+            if raw.get("exit_variant", "rule") != "rule" and not raw.get("rule_track"):
+                risk_pct = raw["context"].get("risk_pct") or 0.0
+                raw["rule_track"] = self._new_track(raw["entry_price"] * (1 - raw.get("side", 1) * risk_pct), raw.get("last_funding_hour", ""))
+                raw["rule_track"].update(bars_held=raw.get("bars_held", 0), funding=(raw.get("funding", 0.0) / raw["notional"]) if raw.get("notional") else 0.0)
+        for key, sh in list(wallet.shadows.items()):
+            if "track" in sh:
+                continue
+            row = self.brain.db.execute("SELECT qty, notional FROM trades WHERE book = ? AND symbol = ? AND signal = ? AND entry_time = ?",
+                                        (self.book, sh["symbol"], sh["signal"], sh["entry_time"])).fetchone()
+            if row is None or not row["notional"]:
+                del wallet.shadows[key]
+                self.brain._journal("migrate", f"book {self.book}: dropped shadow {key} saved by an older version (no trade record to size it)")
+                continue
+            sh["track"] = {"stop": sh["stop"], "bars_held": sh.get("bars_held", 0), "done": False, "pending": bool(sh.get("pending")), "exit_price": None,
+                           "basis": None, "horizon": None, "funding": sh.get("funding", 0.0), "last_funding_hour": sh.get("last_funding_hour", "")}
+            sh["qty"], sh["entry_fee_ratio"] = row["qty"], self.fees["taker"]  # the entry fee is always notional x taker
+            sh.setdefault("liq_path", [])
+            for old in ("stop", "bars_held", "funding", "last_funding_hour", "cost_ratio", "pending"):
+                sh.pop(old, None)
 
     def _reload(self) -> None:
         """Drop the in-memory wallet for the one in the database (after a rolled-back transaction)."""
@@ -587,7 +617,7 @@ class Trader:
             pos = Position(**raw)
             self._apply_funding(pos, bar)  # still held at this candle's open, so a funding time here is charged
             if pos.rule_track:
-                self._advance_track(pos.rule_track, pos, bar, None, [], len(pos.path))  # the rule's own order fills at this open too
+                self._advance_track(pos.rule_track, pos, bar, None, [], len(pos.path), volume_24h, candle_qv)  # the rule's own order fills at this open too
             ev = self._close(pos, bar, bar.open, pos.pending_exit, volume_24h, candle_qv, basis="next_open")
             if catch_up:
                 ev["catch_up"] = True
@@ -622,11 +652,12 @@ class Trader:
             pos.mark = bar.close
             self._apply_funding(pos, bar)
             if pos.rule_track:
-                self._advance_track(pos.rule_track, pos, bar, cur, fired, len(pos.path))
+                self._advance_track(pos.rule_track, pos, bar, cur, fired, len(pos.path), volume_24h, candle_qv)
             pos.path.append((bar.open, bar.high, bar.low, bar.close))
             pos.fund_path.append(pos.funding / pos.notional if pos.notional else 0.0)
+            pos.liq_path.append((volume_24h, candle_qv))
             if len(pos.path) > PATH_LIMIT:
-                pos.path, pos.fund_path = pos.path[-PATH_LIMIT:], pos.fund_path[-PATH_LIMIT:]
+                pos.path, pos.fund_path, pos.liq_path = pos.path[-PATH_LIMIT:], pos.fund_path[-PATH_LIMIT:], pos.liq_path[-PATH_LIMIT:]
             risk_pct = pos.context.get("risk_pct") or 0.0
             est = exits.ExitState(stop=pos.stop, best=pos.exit_best or pos.entry_price, armed=pos.exit_armed, target=pos.exit_target)
             hit, px = exits.step(pos.exit_variant, est, pos.entry_price, pos.side, risk_pct, bar.high, bar.low, bar.open)
@@ -733,13 +764,13 @@ class Trader:
         variants: dict = {}
         if pos.exit_variant == "rule":
             # the path ran to the rule's own exit: every variant can be scored on it now, each at its own fill and fee
-            costs = self._exit_costs(pos.entry_fee, pos.notional, pos.qty, basis, volume_24h, candle_qv, pos.funding / pos.notional if pos.notional else 0.0)
+            costs = self._exit_costs(pos.entry_fee, pos.notional, pos.qty, basis, pos.liq_path, (volume_24h, candle_qv), pos.funding / pos.notional if pos.notional else 0.0)
             variants = exits.simulate(pos.path, pos.entry_price, pos.side, risk_pct, price, costs, pos.fund_path)
             variants["rule"] = net_ret  # what actually happened (identical to the replay's own figure; see tests)
         elif pos.rule_track and pos.rule_track["done"]:
             # the rule would already have exited: score every variant on the rule's horizon now
-            variants = self._score_track(pos.rule_track, pos.entry_price, pos.side, risk_pct, pos.path, pos.fund_path, pos.entry_fee / pos.notional if pos.notional else 0.0,
-                                         pos.qty, volume_24h, candle_qv)
+            variants = self._score_track(pos.rule_track, pos.entry_price, pos.side, risk_pct, pos.path, pos.fund_path, pos.liq_path,
+                                         pos.entry_fee / pos.notional if pos.notional else 0.0, pos.qty, volume_24h, candle_qv)
         event = {"symbol": pos.symbol, "signal": pos.signal, "action": "sell" if pos.side == 1 else "cover", "reason": reason, "price": fill,
                  "net_ret": net_ret, "pnl": pnl, "funding": pos.funding, "basis": basis, "findings": [tag for tag, _ in findings], "postmortem": None}
         if not pm.record(self.brain, t, findings, variants):
@@ -769,7 +800,7 @@ class Trader:
         return {"stop": stop, "bars_held": 0, "done": False, "pending": False, "exit_price": None, "basis": None, "horizon": None,
                 "funding": 0.0, "last_funding_hour": last_funding_hour}
 
-    def _advance_track(self, track: dict, pos, bar: Bar, cur: Reading | None, fired: list[str], n_path: int) -> None:
+    def _advance_track(self, track: dict, pos, bar: Bar, cur: Reading | None, fired: list[str], n_path: int, volume_24h: float, candle_qv: float) -> None:
         """Run the signal's own rule one candle further, exactly as a position under that rule would be run.
 
         ``pos`` carries side, entry price, risk, exit rule and max bars (a Position or a shadow dict);
@@ -787,34 +818,40 @@ class Trader:
         if rate is not None:
             track["funding"] += side * rate * bar.close / entry  # the charge a real position of this size pays at this open
         if track["pending"]:
-            track.update(done=True, pending=False, exit_price=bar.open, basis="next_open", horizon=n_path)
+            track.update(done=True, pending=False, exit_price=bar.open, basis="next_open", horizon=n_path, liq=(volume_24h, candle_qv))
             return
         track["bars_held"] += 1
         st = exits.ExitState(stop=track["stop"], best=entry)
         hit, px = exits.step("rule", st, entry, side, risk_pct, bar.high, bar.low, bar.open)
         if hit == "stop":
-            track.update(done=True, exit_price=px, basis="resting", horizon=n_path + 1)
+            track.update(done=True, exit_price=px, basis="resting", horizon=n_path + 1, liq=(volume_24h, candle_qv))
         elif (cur is not None and self._exit_rule_hit(exit_rule, cur, fired)) or track["bars_held"] >= max_bars or n_path + 1 >= PATH_LIMIT:
             q = self._fresh_quote(symbol)
             if q is not None:
-                track.update(done=True, exit_price=q["bid"] if side == 1 else q["ask"], basis="quote", horizon=n_path + 1)
+                track.update(done=True, exit_price=q["bid"] if side == 1 else q["ask"], basis="quote", horizon=n_path + 1, liq=(volume_24h, candle_qv))
             else:
                 track["pending"] = True
 
-    def _slip_fn(self, basis: str, qty: float, volume_24h: float, candle_qv: float):
-        """Slippage as a function of the fill level, matching how the live trader fills on that basis."""
-        if basis == "quote":
-            return lambda price: impact_bps(qty * price, candle_qv) / 1e4  # the spread is already in the quote
-        return lambda price: slippage_bps(qty * price, volume_24h, candle_qv) / 1e4
+    @staticmethod
+    def _slip_fn(basis: str, qty: float, liq_path: list, fallback: tuple[float, float]):
+        """Slippage as a function of (fill level, path bar), matching how the live trader fills on that basis
+        with the liquidity of the candle the fill happens on; ``fallback`` serves bars recorded without liquidity."""
+        def slip(price: float, i: int) -> float:
+            volume_24h, candle_qv = liq_path[i] if 0 <= i < len(liq_path) else fallback
+            if basis == "quote":
+                return impact_bps(qty * price, candle_qv) / 1e4  # the spread is already in the quote
+            return slippage_bps(qty * price, volume_24h, candle_qv) / 1e4
 
-    def _exit_costs(self, entry_fee: float, notional: float, qty: float, rule_basis: str, volume_24h: float, candle_qv: float, rule_funding: float) -> dict:
-        return {"entry": entry_fee / notional if notional else 0.0, "fee": self.fees["taker"], "slip": self._slip_fn("resting", qty, volume_24h, candle_qv),
-                "rule_slip": self._slip_fn(rule_basis, qty, volume_24h, candle_qv), "rule_funding": rule_funding}
+        return slip
 
-    def _score_track(self, track: dict, entry: float, side: int, risk_pct: float, path: list, fund_path: list, entry_fee_ratio: float, qty: float,
+    def _exit_costs(self, entry_fee: float, notional: float, qty: float, rule_basis: str, liq_path: list, rule_liq: tuple[float, float], rule_funding: float) -> dict:
+        return {"entry": entry_fee / notional if notional else 0.0, "fee": self.fees["taker"], "slip": self._slip_fn("resting", qty, liq_path, rule_liq),
+                "rule_slip": self._slip_fn(rule_basis, qty, [], rule_liq), "rule_funding": rule_funding}
+
+    def _score_track(self, track: dict, entry: float, side: int, risk_pct: float, path: list, fund_path: list, liq_path: list, entry_fee_ratio: float, qty: float,
                      volume_24h: float, candle_qv: float) -> dict:
         h = track["horizon"]
-        costs = self._exit_costs(entry_fee_ratio, 1.0, qty, track["basis"], volume_24h, candle_qv, track["funding"])
+        costs = self._exit_costs(entry_fee_ratio, 1.0, qty, track["basis"], liq_path, tuple(track.get("liq") or (volume_24h, candle_qv)), track["funding"])
         return exits.simulate(path[:h], entry, side, risk_pct, track["exit_price"], costs, fund_path[:h])
 
     # --------------------------------------------------------------- shadows
@@ -827,7 +864,7 @@ class Trader:
             "symbol": pos.symbol, "signal": pos.signal, "side": pos.side, "entry_price": pos.entry_price, "entry_time": pos.entry_time,
             "risk_pct": pos.context.get("risk_pct") or 0.0, "max_bars": pos.max_bars, "exit_rule": pos.exit_rule, "qty": pos.qty,
             "entry_fee_ratio": pos.entry_fee / pos.notional if pos.notional else 0.0, "path": list(pos.path), "fund_path": list(pos.fund_path),
-            "track": track, "last_bar": last_bar,
+            "liq_path": list(pos.liq_path), "track": track, "last_bar": last_bar,
         }
 
     def _advance_shadows(self, symbol: str, bar: Bar, cur: Reading, fired: list[str], volume_24h: float, candle_qv: float) -> None:
@@ -837,21 +874,23 @@ class Trader:
             sh["last_bar"] = bar.date
             track = sh["track"]
             was_pending = track["pending"]
-            self._advance_track(track, sh, bar, cur, fired, len(sh["path"]))
+            self._advance_track(track, sh, bar, cur, fired, len(sh["path"]), volume_24h, candle_qv)
             if not was_pending:  # a queued exit filled at the open, before this candle; otherwise the rule sat through it
                 sh["path"].append((bar.open, bar.high, bar.low, bar.close))
                 sh["fund_path"].append(track["funding"])
+                sh.setdefault("liq_path", []).append((volume_24h, candle_qv))
             if track["done"]:
-                variants = self._score_track(track, sh["entry_price"], sh["side"], sh["risk_pct"], sh["path"], sh["fund_path"], sh["entry_fee_ratio"], sh["qty"], volume_24h, candle_qv)
+                variants = self._score_track(track, sh["entry_price"], sh["side"], sh["risk_pct"], sh["path"], sh["fund_path"], sh.get("liq_path", []),
+                                             sh["entry_fee_ratio"], sh["qty"], volume_24h, candle_qv)
                 self._record_variants(sh["symbol"], sh["signal"], sh["entry_time"], variants)
                 del self.wallet.shadows[key]
 
     def _record_variants(self, symbol: str, signal: str, entry_time: str, variants: dict) -> None:
-        self.brain.db.execute(
-            "UPDATE trades SET variants = ? WHERE book = ? AND symbol = ? AND signal = ? AND entry_time = ?",
-            (json.dumps(variants), self.book, symbol, signal, entry_time),
-        )
-        if not self.frozen:
+        ident = (self.book, symbol, signal, entry_time)
+        self.brain.db.execute("UPDATE trades SET variants = ? WHERE book = ? AND symbol = ? AND signal = ? AND entry_time = ?", (json.dumps(variants), *ident))
+        row = self.brain.db.execute("SELECT model_version FROM trades WHERE book = ? AND symbol = ? AND signal = ? AND entry_time = ?", ident).fetchone()
+        current = row is not None and row[0] == self.brain.RESULTS_VERSION  # a trade from an older results version is not evidence about this one
+        if current and not self.frozen:
             exits.record(self.brain, self.book, signal, variants)
             self._maybe_change_policy(signal)
         self.brain.commit()

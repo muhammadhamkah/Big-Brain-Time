@@ -311,6 +311,11 @@ class Trader:
         key = f"{symbol}:{signal}"
         if key in self.wallet.positions:
             return None
+        side = PLAYBOOK[signal]["side"]
+        opposite = [p for p in self.wallet.positions.values() if p["symbol"] == symbol and p.get("side", 1) != side]
+        if opposite:
+            held = ", ".join(p["signal"] for p in opposite)
+            return {"symbol": symbol, "signal": signal, "action": "skip", "why": f"conflict: already {'short' if side == 1 else 'long'} {symbol} via {held}; hedging one pair only pays double costs"}
         b = pm.belief(self.brain, self.book, signal, ctx["regime"], ctx["vol_bucket"])
         seed = f"{self.book}{symbol}{signal}{bar.date}"
         if b["samples"] >= pm.MIN_SAMPLES:
@@ -336,7 +341,6 @@ class Trader:
         notional = min(equity * risk / stop_pct, equity * MAX_POSITION_FRACTION, risk_room / stop_pct, exposure_room, self.wallet.cash * self.leverage * 0.98)
         if notional < MIN_NOTIONAL:
             return {"symbol": symbol, "signal": signal, "action": "skip", "why": "no room: cash, exposure or risk budget"}
-        side = play["side"]
         slip = slippage_bps(notional, volume_24h, candle_qv) / 1e4
         fill = bar.close * (1 + side * slip)  # buying lifts the offer, selling hits the bid
         fee = notional * self.fees["taker"]
@@ -625,7 +629,7 @@ class Trader:
                         fund = f" funding {e['funding']:+.2f}" if e.get("funding") else ""
                         late = " [caught up from a missed candle]" if e.get("catch_up") else ""
                         out(f"    {e['action'].upper():5} {e['symbol']:12} {e['signal']:18} @ {e['price']:.6g}  {e['net_ret']:+.2%} ({e['pnl']:+.2f} USDT{fund}) by {e['reason']}{late}  findings: {', '.join(e['findings'])}")
-                    elif e["action"] == "skip" and "belief" in e["why"]:
+                    elif e["action"] == "skip" and ("belief" in e["why"] or "conflict" in e["why"]):
                         out(f"    SKIP {e['symbol']:12} {e['signal']:18} {e['why']}")
                 self._save()
             except Exception as exc:

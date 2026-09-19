@@ -334,6 +334,27 @@ class IntegrityTests(unittest.TestCase):
             a.release_lock()
 
 
+class ConflictTests(unittest.TestCase):
+    def test_never_long_and_short_the_same_pair(self):
+        brain = Brain()
+        symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+        series = {s: stamped(synthetic(s, n=900, seed=80 + i, vol=0.025)) for i, s in enumerate(symbols)}
+        for bars in series.values():
+            for b in bars:
+                b.quote_volume = b.volume * b.close
+        t = Trader(brain, book="c", interval="15m", wallet=1000.0, top=3, market="perps", fetch_funding=lambda: {})
+        conflicts = 0
+        for end in range(250, 900):
+            r = t.tick(market=market_at(series, end), universe=universe(symbols))
+            conflicts += sum(1 for e in r["events"] if e["action"] == "skip" and "conflict" in e["why"])
+            sides = {}
+            for p in t.wallet.positions.values():
+                sides.setdefault(p["symbol"], set()).add(p["side"])
+            for sym, ss in sides.items():
+                self.assertEqual(len(ss), 1, f"{sym} is both long and short")
+        self.assertGreater(conflicts, 0, "the synthetic run should have produced at least one refused hedge")
+
+
 class ResetTests(unittest.TestCase):
     def test_reset_keeps_or_forgets_learning(self):
         brain = Brain()

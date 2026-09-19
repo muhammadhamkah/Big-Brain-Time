@@ -314,6 +314,20 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual(reopened.db.execute("SELECT COUNT(*) FROM trades WHERE book = 'i'").fetchone()[0], n)
             reopened.close()
 
+    def test_other_trader_processes_are_detected(self):
+        from unittest import mock
+        from bigbrain import trader as tr
+        import os
+        fake = f"{os.getpid()} python -m bigbrain.cli trade\n4242 /Users/x/.venv/bin/python -m bigbrain.cli trade --book main\n4243 /Users/x/.venv/bin/bigbrain dashboard\n4244 grep bigbrain trade\n"
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake)):
+            others = Trader.other_traders()
+        self.assertEqual([pid for pid, _ in others], [4242])
+        brain = Brain()
+        t = Trader(brain, book="p", market="spot")
+        with mock.patch.object(Trader, "other_traders", return_value=[(4242, "python -m bigbrain.cli trade")]):
+            with self.assertRaises(RuntimeError):
+                t.acquire_lock()
+
     def test_lock_refuses_a_second_trader(self):
         import os, tempfile
         with tempfile.TemporaryDirectory() as tmp:

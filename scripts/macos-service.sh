@@ -5,6 +5,7 @@
 #   scripts/macos-service.sh install [--book main] [--top 100] [--interval 15m]
 #   scripts/macos-service.sh install-backup [--push]     # snapshot every 6 hours (and push to GitHub with --push)
 #   scripts/macos-service.sh status
+#   scripts/macos-service.sh restart      # after git pull, so the service runs the new code
 #   scripts/macos-service.sh log          # follow the log
 #   scripts/macos-service.sh uninstall
 set -euo pipefail
@@ -80,11 +81,18 @@ PLIST
     ;;
   status)
     if launchctl list | grep -q "$LABEL"; then
-      echo "$LABEL is loaded:"; launchctl list | grep "$LABEL"
+      echo "$LABEL is loaded (a trader is running in the background; do not also run 'bigbrain trade' in a terminal):"
+      launchctl list | grep "$LABEL"
       [ -f "$LOG" ] && { echo; tail -n 5 "$LOG"; }
     else
       echo "$LABEL is not installed"
     fi
+    echo
+    echo "trader processes:"; ps -axo pid=,command= | grep -E "bigbrain(\.cli)? trade" | grep -v grep || echo "  none"
+    ;;
+  restart)
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST" && echo "restarted $LABEL on the current code"
     ;;
   log)
     tail -f "$LOG"

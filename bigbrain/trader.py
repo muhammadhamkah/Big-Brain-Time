@@ -40,6 +40,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+import re as _re
+
+_TRADER_CMD = _re.compile(r"(^|[\s/])bigbrain(\.cli)?\s+trade(\s|$)")
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -533,8 +538,36 @@ class Trader:
         base = Path(self.brain.path).parent if self.brain.path != ":memory:" else Path(os.environ.get("TMPDIR", "/tmp"))
         return base / f"trade-{self.book}.lock"
 
+    @staticmethod
+    def other_traders() -> list[tuple[int, str]]:
+        """Other live processes that look like a trader, whatever started them (terminal, launchd, old code)."""
+        import subprocess
+
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return []
+        found = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_str, _, cmd = line.partition(" ")
+            if not pid_str.isdigit() or int(pid_str) == os.getpid():
+                continue
+            if _TRADER_CMD.search(cmd):
+                found.append((int(pid_str), cmd.strip()))
+        return found
+
     def acquire_lock(self) -> None:
         """Refuse to run two traders on one book: they would each close the same positions."""
+        others = self.other_traders()
+        if others:
+            listing = "; ".join(f"pid {pid}: {cmd[:80]}" for pid, cmd in others)
+            raise RuntimeError(
+                f"another trader process is running ({listing}). Two traders on one brain corrupt the book. "
+                "If it is the background service, run `scripts/macos-service.sh uninstall` (or reinstall it to update it); otherwise `kill <pid>`."
+            )
         path = self.lock_path()
         if path.exists():
             try:
@@ -628,9 +661,12 @@ class Trader:
             self._log(line)
 
         self.acquire_lock()
-        rebuilt = self.rebuild_stats()
-        if rebuilt["trades"]:
-            out(f"beliefs and exit statistics rebuilt from {rebuilt['trades']} recorded trades")
+        try:
+            rebuilt = self.rebuild_stats()
+            if rebuilt["trades"]:
+                out(f"beliefs and exit statistics rebuilt from {rebuilt['trades']} recorded trades")
+        except Exception as exc:  # a locked database must not stop trading; stats are rebuilt on the next start
+            out(f"could not rebuild statistics now ({exc}); continuing with the stored beliefs")
         while True:
             try:
                 started = time.time()

@@ -132,7 +132,9 @@ scripts/macos-service.sh log              # follow .brain/trade.log
 scripts/macos-service.sh uninstall
 ```
 
-A MacBook still sleeps when the lid closes unless it is plugged in with an external display; a Mac mini, an always-on laptop, or a small cloud server is the reliable home for a six-month run. The book is a table in `.brain/brain.db`; back that file up and the whole history comes with it. `bigbrain dashboard` works in any terminal while the service runs.
+A MacBook still sleeps when the lid closes unless it is plugged in with an external display; a Mac mini, an always-on laptop, or a small cloud server is the reliable home for a six-month run. `bigbrain dashboard` works in any terminal while the service runs.
+
+**Backups.** The brain is one file, `.brain/brain.db`, never committed to the main branch. `bigbrain backup` takes a consistent snapshot while the trader runs (SQLite's online backup), gzips it into `.brain/backups/`, and keeps the last 14. `bigbrain backup --push` also publishes the snapshot to a `brain-backup` branch on GitHub that always holds exactly one commit, so the repository stays small. `scripts/macos-service.sh install-backup --push` does that every six hours. `bigbrain restore` brings back the latest local snapshot, a named file, or `--from-github`. Stop the trader before restoring.
 
 ### Claude-powered cortex
 

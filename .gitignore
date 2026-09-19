@@ -8,3 +8,6 @@ dist/
 *.sqlite
 .brain/
 .env
+*.db.gz
+*.db-wal
+*.db-shm

@@ -3,6 +3,7 @@
 # restarts if it stops, keeps the Mac awake while running, and logs to .brain/trade.log.
 #
 #   scripts/macos-service.sh install [--book main] [--top 100] [--interval 15m]
+#   scripts/macos-service.sh install-backup [--push]     # snapshot every 6 hours (and push to GitHub with --push)
 #   scripts/macos-service.sh status
 #   scripts/macos-service.sh log          # follow the log
 #   scripts/macos-service.sh uninstall
@@ -47,10 +48,35 @@ PLIST
     echo "  dashboard: bigbrain dashboard   (in any terminal)"
     echo "  note: caffeinate keeps the Mac from sleeping while the trader runs; closing the lid still sleeps a MacBook unless it is plugged in with an external display, or you disable lid sleep."
     ;;
+  install-backup)
+    BLABEL="com.bigbrain.backup"; BPLIST="$HOME/Library/LaunchAgents/$BLABEL.plist"
+    ARGS=""
+    for a in "$@"; do ARGS="$ARGS<string>$a</string>"; done
+    cat > "$BPLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$BLABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$PYTHON</string><string>-m</string><string>bigbrain.cli</string><string>backup</string>$ARGS
+  </array>
+  <key>WorkingDirectory</key><string>$PROJECT</string>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>$PROJECT/.brain/backup.log</string>
+  <key>StandardErrorPath</key><string>$PROJECT/.brain/backup.log</string>
+</dict></plist>
+PLIST
+    launchctl unload "$BPLIST" 2>/dev/null || true
+    launchctl load "$BPLIST"
+    echo "installed $BLABEL: snapshot every 6 hours into .brain/backups (log: .brain/backup.log)"
+    ;;
   uninstall)
     launchctl unload "$PLIST" 2>/dev/null || true
     rm -f "$PLIST"
-    echo "removed $LABEL (the book and the brain are untouched)"
+    launchctl unload "$HOME/Library/LaunchAgents/com.bigbrain.backup.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.bigbrain.backup.plist"
+    echo "removed $LABEL and the backup agent (the book and the brain are untouched)"
     ;;
   status)
     if launchctl list | grep -q "$LABEL"; then

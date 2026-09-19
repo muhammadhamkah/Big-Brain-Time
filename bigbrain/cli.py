@@ -343,6 +343,44 @@ def cmd_trade(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    from bigbrain import backup
+
+    db = Path(args.db)
+    if not db.exists():
+        print(f"no database at {db}", file=sys.stderr)
+        return 1
+    out_dir = Path(args.dir) if args.dir else db.parent / "backups"
+    repo = Path(__file__).resolve().parent.parent
+    backup.run_periodic(db, out_dir, repo, every_hours=args.every, keep=args.keep, do_push=args.push, once=not args.every)
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    from bigbrain import backup
+
+    db = Path(args.db)
+    out_dir = db.parent / "backups"
+    repo = Path(__file__).resolve().parent.parent
+    if args.from_github:
+        try:
+            snap = backup.fetch(repo, out_dir)
+        except Exception as exc:
+            print(f"could not fetch the backup branch: {exc}", file=sys.stderr)
+            return 1
+    elif args.file:
+        snap = Path(args.file)
+    else:
+        snap = backup.latest(out_dir)
+        if snap is None:
+            print(f"no snapshots in {out_dir}", file=sys.stderr)
+            return 1
+    print(f"restoring {snap} -> {db}  (stop the trader first; the current file is kept as {db.name}.before-restore)")
+    backup.restore(snap, db)
+    print("done")
+    return 0
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
     """Remove duplicate trade records (already done on open) and rebuild beliefs from the trade log."""
     from bigbrain.trader import Trader
@@ -598,6 +636,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset", action="store_true", help="close all positions and restart the wallet before trading (learning kept)")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_trade)
+
+    p = sub.add_parser("backup", help="consistent snapshot of the brain; --push publishes it to the brain-backup branch on GitHub")
+    p.add_argument("--dir", help="where snapshots go (default .brain/backups)")
+    p.add_argument("--keep", type=int, default=14, help="local snapshots to keep")
+    p.add_argument("--push", action="store_true", help="also push the snapshot to GitHub (branch brain-backup, one commit, replaced each time)")
+    p.add_argument("--every", type=float, default=0, metavar="HOURS", help="keep running and back up every N hours")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("restore", help="replace the brain with a snapshot (latest local, a file, or --from-github)")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--from-github", action="store_true")
+    p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser("repair", help="rebuild a book's beliefs and exit statistics from its trade log")
     p.add_argument("--book", default="main")

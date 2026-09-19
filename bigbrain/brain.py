@@ -169,21 +169,37 @@ class Brain:
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
-        self.db = sqlite3.connect(self.path)
+        # Several processes share one file (trader, dashboard, ask): wait up to 30s for a lock, and use
+        # write-ahead logging so readers never block the writer and the writer never blocks readers.
+        self.db = sqlite3.connect(self.path, timeout=30)
         self.db.row_factory = sqlite3.Row
+        if self.path != ":memory:":
+            self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
-        for stmt in ("ALTER TABLE trades ADD COLUMN side INTEGER NOT NULL DEFAULT 1", "ALTER TABLE trades ADD COLUMN funding REAL NOT NULL DEFAULT 0",
-                     "ALTER TABLE trades ADD COLUMN variants TEXT NOT NULL DEFAULT '{}'"):
-            try:
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Schema changes for databases created by earlier versions. Only writes when something must change."""
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(trades)")}
+        for name, stmt in (
+            ("side", "ALTER TABLE trades ADD COLUMN side INTEGER NOT NULL DEFAULT 1"),
+            ("funding", "ALTER TABLE trades ADD COLUMN funding REAL NOT NULL DEFAULT 0"),
+            ("variants", "ALTER TABLE trades ADD COLUMN variants TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if name not in columns:
                 self.db.execute(stmt)
-            except sqlite3.OperationalError:
-                pass  # column already exists
-        # A trade can only close once. Remove any duplicates written by two traders on one book, then enforce it.
-        self.db.execute(
-            "DELETE FROM trades WHERE id NOT IN (SELECT MIN(id) FROM trades GROUP BY book, symbol, signal, entry_time, exit_time)"
-        )
-        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_unique ON trades(book, symbol, signal, entry_time, exit_time)")
-        self.db.commit()
+        # A trade can only close once. Remove duplicates written by two traders on one book, then enforce it.
+        dupes = self.db.execute(
+            "SELECT COUNT(*) FROM trades WHERE id NOT IN (SELECT MIN(id) FROM trades GROUP BY book, symbol, signal, entry_time, exit_time)"
+        ).fetchone()[0]
+        if dupes:
+            self.db.execute("DELETE FROM trades WHERE id NOT IN (SELECT MIN(id) FROM trades GROUP BY book, symbol, signal, entry_time, exit_time)")
+        indexes = {r["name"] for r in self.db.execute("PRAGMA index_list(trades)")}
+        if "trades_unique" not in indexes:
+            self.db.execute("CREATE UNIQUE INDEX trades_unique ON trades(book, symbol, signal, entry_time, exit_time)")
+        if self.db.in_transaction:
+            self.db.commit()
 
     # ------------------------------------------------------------------ learn
     def learn(

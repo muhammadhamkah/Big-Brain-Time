@@ -106,6 +106,21 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.brain.forget()
 
+    def test_two_processes_can_share_the_file(self):
+        """A reader must not be blocked by a writer mid-transaction (WAL), and reopening must not rewrite the schema."""
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.db")
+            writer = Brain(path)
+            self.assertEqual(writer.db.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+            writer.db.execute("INSERT INTO state (key, value) VALUES ('k', '1')")  # open write transaction, not committed
+            reader = Brain(path)  # opening runs the migration checks; must not block or fail
+            self.assertIsNone(reader.get_state("k"))  # sees the committed view
+            self.assertFalse(reader.db.in_transaction)
+            writer.db.commit()
+            self.assertEqual(reader.get_state("k"), 1)
+            reader.close(); writer.close()
+
     def test_persistence(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:

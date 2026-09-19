@@ -177,15 +177,20 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
 
 
 def run(brain: Brain, book: str = "main", refresh: float = 10.0, once: bool = False, out=print, sleep=time.sleep) -> None:
+    import sqlite3
+
     while True:
-        state = brain.get_state(f"trader:{book}") or {}
-        prices: dict[str, float] = {}
-        if state.get("positions"):
-            try:
-                prices = live_prices(state.get("market", "perps"))
-            except Exception:
-                prices = {}
-        out(CLEAR + render(brain, book, prices))
+        try:
+            state = brain.get_state(f"trader:{book}") or {}
+            prices: dict[str, float] = {}
+            if state.get("positions"):
+                try:
+                    prices = live_prices(state.get("market", "perps"))
+                except Exception:
+                    prices = {}
+            out(CLEAR + render(brain, book, prices))
+        except sqlite3.OperationalError as exc:
+            out(f"{CLEAR}{YELLOW}database busy ({exc}); retrying in {refresh:.0f}s{RESET}")
         if once:
             return
         sleep(refresh)

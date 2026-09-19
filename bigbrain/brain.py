@@ -253,6 +253,7 @@ class Brain:
                 pass
         # exit statistics and policies from version 1 compared inconsistent fills; they are not evidence any more
         self.db.execute("DELETE FROM exit_stats")
+        self.db.execute("DELETE FROM beliefs")  # rebuilt from current-version trades when a trader starts
         self.db.execute("DELETE FROM state WHERE key LIKE 'exit_policy:%'")
         self.db.execute("INSERT INTO state (key, value) VALUES ('results_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(self.RESULTS_VERSION),))
         self._journal("upgrade", f"results version {current} -> {self.RESULTS_VERSION}: exit statistics retired ({had_stats} rows)")

@@ -80,28 +80,44 @@ def step(variant: str, st: ExitState, entry: float, side: int, risk_pct: float, 
     return None, None
 
 
-def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: float, cost_ratio: float, funding_path: list | None = None) -> dict[str, float]:
+def simulate(path: list, entry: float, side: int, risk_pct: float, actual_exit: float, costs, funding_path: list | None = None) -> dict[str, float]:
     """Net return each variant would have produced on this trade's path.
 
-    ``path`` is [(open, high, low, close), ...] for every bar after entry (older records may
-    carry (high, low, close)); ``actual_exit`` is the price the signal's own rule exited at
-    (used when a variant never triggers); ``cost_ratio`` is fees plus slippage as a fraction
-    of notional, charged to every variant alike."""
+    ``path`` is [(open, high, low, close), ...] for every bar the rule was in the market (older
+    records may carry (high, low, close)); ``actual_exit`` is the price the signal's own rule exited
+    at, before slippage: a variant that never triggers leaves with the rule, at that price.
+
+    ``costs`` is a dict, so every variant is filled and charged exactly as the live trader fills:
+        entry        entry fee as a fraction of notional (``entry`` already carries entry slippage)
+        fee          taker rate charged on the exit value
+        slip         slippage fraction for a resting order fill (stop, target, trail); a float or a function of the level
+        rule_slip    slippage fraction for the rule's own exit fill (its basis differs: quote, next open, resting)
+        rule_funding cumulative funding fraction at the rule's exit (funding at a next-open fill included)
+    A bare float is the legacy flat cost ratio, charged to every variant alike."""
     out: dict[str, float] = {}
     n = len(path)
+
+    def fund_at(i: int) -> float:
+        return funding_path[i] if funding_path and 0 <= i < len(funding_path) else 0.0
+
     for variant in VARIANTS:
-        price, exit_bar = actual_exit, n - 1
+        price, exit_bar, own = actual_exit, n - 1, False
         if variant != "rule":
             st = init_state(variant, entry, side, risk_pct)
             for i, bar in enumerate(path):
                 open_, high, low = (bar[0], bar[1], bar[2]) if len(bar) == 4 else (None, bar[0], bar[1])
                 reason, px = step(variant, st, entry, side, risk_pct, high, low, open_)
                 if reason:
-                    price, exit_bar = px, i
+                    price, exit_bar, own = px, i, True
                     break
-        # funding accrued up to this variant's own exit bar (cumulative fraction of notional; longs pay positive rates)
-        funding = funding_path[min(exit_bar, len(funding_path) - 1)] if funding_path else 0.0
-        out[variant] = side * (price / entry - 1) - cost_ratio - funding
+        if isinstance(costs, dict):
+            s = costs["slip"] if own else costs.get("rule_slip", costs["slip"])
+            s = s(price) if callable(s) else s
+            fill = price * (1 - side * s)  # a long sells into the bid, a short buys back at the offer
+            funding = fund_at(exit_bar) if own else costs.get("rule_funding", fund_at(n - 1))
+            out[variant] = side * (fill / entry - 1) - costs.get("entry", 0.0) - (fill / entry) * costs.get("fee", 0.0) - funding
+        else:
+            out[variant] = side * (price / entry - 1) - costs - fund_at(min(exit_bar, n - 1))
     return out
 
 

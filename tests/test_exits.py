@@ -10,7 +10,7 @@ def path_up_then_down(entry=100.0):
 
 class SimulateTests(unittest.TestCase):
     def test_variants_on_a_giveback_path(self):
-        r = exits.simulate(path_up_then_down(), 100.0, 1, 0.01, actual_exit=97.0, cost_ratio=0.002)
+        r = exits.simulate(path_up_then_down(), 100.0, 1, 0.01, actual_exit=97.0, costs=0.002)
         self.assertAlmostEqual(r["rule"], -0.03 - 0.002)
         self.assertAlmostEqual(r["tp_1R"], 0.01 - 0.002)  # hit 101 on bar 1
         self.assertAlmostEqual(r["tp_2R"], 0.02 - 0.002)  # hit 102 on bar 2
@@ -19,7 +19,7 @@ class SimulateTests(unittest.TestCase):
 
     def test_short_side_mirrors(self):
         path = [(100.5, 99, 99.5), (99.5, 98, 98.5), (98.5, 97, 97.5), (100.5, 98, 100)]
-        r = exits.simulate(path, 100.0, -1, 0.01, actual_exit=100.0, cost_ratio=0.0)
+        r = exits.simulate(path, 100.0, -1, 0.01, actual_exit=100.0, costs=0.0)
         self.assertAlmostEqual(r["tp_1R"], 0.01)
         self.assertAlmostEqual(r["tp_2R"], 0.02)
         self.assertGreater(r["trail_1R"], 0.0)
@@ -27,7 +27,7 @@ class SimulateTests(unittest.TestCase):
 
     def test_stop_before_target_in_same_bar(self):
         path = [(102, 98, 100)]
-        r = exits.simulate(path, 100.0, 1, 0.01, actual_exit=100.0, cost_ratio=0.0)
+        r = exits.simulate(path, 100.0, 1, 0.01, actual_exit=100.0, costs=0.0)
         self.assertAlmostEqual(r["tp_1R"], -0.01)
 
 

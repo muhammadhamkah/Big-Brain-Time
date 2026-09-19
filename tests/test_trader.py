@@ -49,6 +49,7 @@ class BeliefTests(unittest.TestCase):
         self.assertEqual(b["samples"], 0)
         for i in range(10):
             t = pm.Trade("main", "X", "rsi_oversold", f"t{i}", 1, f"t{i+1}", 1, "time", 1, 100, -0.01, -0.012, -1.2, 0.2, 0.0, 3, 0.002, -0.015, {"regime": "downtrend", "vol_bucket": "high"})
+            pm.record(brain, t, [])  # the trade log is the evidence; the beliefs table is a tally of it
             pm.update_belief(brain, t)
         b = pm.belief(brain, "main", "rsi_oversold", "downtrend", "high")
         self.assertGreaterEqual(b["samples"], pm.MIN_SAMPLES)

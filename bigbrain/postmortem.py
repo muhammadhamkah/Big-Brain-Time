@@ -120,25 +120,25 @@ def update_belief(brain: Brain, t: Trade) -> None:
 MIN_BLOCKS = 4  # independent-ish time blocks (UTC days) needed before a verdict; simultaneous crypto trades are one observation, not many
 
 
-def _block_stats(brain: Brain, book: str, signal: str, regime: str | None, vol_bucket: str | None) -> tuple[int, float, float, int]:
-    """(trades, mean, block standard error, blocks) from the trade log, grouping trades by UTC day of exit.
+def _eligible(brain: Brain, book: str, signal: str) -> list[dict]:
+    """Every trade that counts as evidence: this book and signal, recorded under the current results version."""
+    rows = brain.db.execute("SELECT net_ret, exit_time, context FROM trades WHERE book = ? AND signal = ? AND model_version = ?",
+                            (book, signal, brain.RESULTS_VERSION)).fetchall()
+    return [{"net_ret": r["net_ret"], "exit_time": r["exit_time"], "context": json.loads(r["context"])} for r in rows]
+
+
+def _block_stats(trades: list[dict]) -> tuple[int, float, float, int]:
+    """(trades, mean, block standard error, blocks), grouping trades by UTC day of exit.
 
     Trades closed on the same day move together (one market, many pairs), so the uncertainty is
-    measured across days, not across trades. Only trades recorded under the current results version count."""
-    q = "SELECT net_ret, exit_time, context FROM trades WHERE book = ? AND signal = ? AND model_version = ?"
-    rows = brain.db.execute(q, (book, signal, brain.RESULTS_VERSION)).fetchall()
-    rets, blocks = [], {}
-    for r in rows:
-        if regime is not None:
-            ctx = json.loads(r["context"])
-            if ctx.get("regime") != regime or ctx.get("vol_bucket") != vol_bucket:
-                continue
-        rets.append(r["net_ret"])
-        blocks.setdefault(r["exit_time"][:10], []).append(r["net_ret"])
-    n = len(rets)
+    measured across days, not across trades."""
+    n = len(trades)
     if n == 0:
         return 0, 0.0, float("inf"), 0
-    mean = sum(rets) / n
+    blocks: dict[str, list[float]] = {}
+    for t in trades:
+        blocks.setdefault(t["exit_time"][:10], []).append(t["net_ret"])
+    mean = sum(t["net_ret"] for t in trades) / n
     means = [sum(v) / len(v) for v in blocks.values()]
     k = len(means)
     if k < MIN_BLOCKS:
@@ -151,33 +151,22 @@ def _block_stats(brain: Brain, book: str, signal: str, regime: str | None, vol_b
 def belief(brain: Brain, book: str, signal: str, regime: str, vol_bucket: str) -> dict:
     """What the brain believes about a signal in a context: win probability, expectancy, and how much evidence it has.
 
-    Win probability blends the belief tallies with a prior; expectancy and its uncertainty come
-    from the trade log, with uncertainty measured across time blocks (see ``_block_stats``).
-    Falls back from the exact context to the signal across all contexts, then to the prior."""
-    exact = brain.db.execute(
-        "SELECT wins, losses, sum_ret, sum_win, sum_loss, sum_sq FROM beliefs WHERE book = ? AND signal = ? AND regime = ? AND vol_bucket = ?",
-        (book, signal, regime, vol_bucket),
-    ).fetchone()
-    broad = brain.db.execute(
-        "SELECT SUM(wins) AS wins, SUM(losses) AS losses, SUM(sum_ret) AS sum_ret, SUM(sum_win) AS sum_win, SUM(sum_loss) AS sum_loss, SUM(sum_sq) AS sum_sq"
-        " FROM beliefs WHERE book = ? AND signal = ?",
-        (book, signal),
-    ).fetchone()
-    ew, el, er, esq = (exact["wins"], exact["losses"], exact["sum_ret"], exact["sum_sq"]) if exact else (0, 0, 0.0, 0.0)
-    bw, bl, br, bsq = (broad["wins"] or 0, broad["losses"] or 0, broad["sum_ret"] or 0.0, broad["sum_sq"] or 0.0)
+    Everything is computed from the same eligible evidence: the trade log, current results version
+    only. Win probability blends the tallies with a prior; expectancy and its uncertainty are
+    measured across time blocks (see ``_block_stats``). Falls back from the exact context to the
+    signal across all contexts, then to the prior."""
+    broad = _eligible(brain, book, signal)
+    exact = [t for t in broad if t["context"].get("regime") == regime and t["context"].get("vol_bucket") == vol_bucket]
+    ew, el = sum(1 for t in exact if t["net_ret"] > 0), sum(1 for t in exact if t["net_ret"] <= 0)
+    bw, bl = sum(1 for t in broad if t["net_ret"] > 0), sum(1 for t in broad if t["net_ret"] <= 0)
     n_exact, n_broad = ew + el, bw + bl
     # Blend: the exact context dominates once it has samples; the broad record fills in before that.
     w_exact = min(1.0, n_exact / MIN_SAMPLES)
     wins = PRIOR_WINS + w_exact * ew + (1 - w_exact) * (bw * min(1.0, n_broad / MIN_SAMPLES))
     losses = PRIOR_LOSSES + w_exact * el + (1 - w_exact) * (bl * min(1.0, n_broad / MIN_SAMPLES))
     p_win = wins / (wins + losses)
+    n, expectancy, stderr, blocks = _block_stats(exact if n_exact >= MIN_SAMPLES else broad)
     n_eff = n_exact if n_exact >= MIN_SAMPLES else max(n_exact, min(n_broad, MIN_SAMPLES - 1))
-    if n_exact >= MIN_SAMPLES:
-        n, expectancy, stderr, blocks = _block_stats(brain, book, signal, regime, vol_bucket)
-    else:
-        n, expectancy, stderr, blocks = _block_stats(brain, book, signal, None, None)
-    if n == 0:
-        expectancy = (er / n_exact) if n_exact else (br / n_broad if n_broad else 0.0)
     return {"p_win": p_win, "expectancy": expectancy, "stderr": stderr, "samples": n_eff, "blocks": blocks, "exact_samples": n_exact, "broad_samples": n_broad}
 
 

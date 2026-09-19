@@ -204,6 +204,7 @@ class Position:
     entered_at_open: bool = False  # filled at its entry candle's open, so that candle is managed too
     fill_basis: str = ""  # quote | next_open
     pending_exit: str = ""  # an exit decided at a close, waiting for the next candle's open
+    rule_track: dict | None = None  # under a learned exit: how the signal's own rule is doing on this same path
 
     @property
     def key(self) -> str:
@@ -309,6 +310,7 @@ class Trader:
         self.funding: dict[str, dict] = {}
         self.quotes: dict[str, dict] = {}  # timestamped bid/ask at decision time, refreshed every live tick
         self.live = False  # True while the current tick runs on freshly fetched data (fills at quotes, never at a passed price)
+        self._catch_up = False  # True while replaying missed candles: no quote may be used for a decision that belongs to the past
         self.frozen = stored.get("frozen", frozen) if stored else frozen  # a frozen book never adapts: fixed size, rule exits, no beliefs
         self.wallet = self._load(stored) if stored else Wallet(cash=wallet, start=wallet, peak=wallet)
 
@@ -460,16 +462,23 @@ class Trader:
         return events
 
     def _process_bar(self, symbol: str, bar: Bar, cur: Reading, fired: list[str], volume_24h: float, candle_qv: float, catch_up: bool = False) -> list[dict]:
-        """One closed candle for one symbol, in market order: queued orders fill at the open, then the candle plays out."""
-        events = self._fill_pending(symbol, bar, volume_24h, candle_qv, catch_up)
-        events += self._manage_exits(symbol, bar, cur, fired, volume_24h, candle_qv, catch_up)
-        self._advance_shadows(symbol, bar, cur, fired)
+        """One closed candle for one symbol, in market order: queued orders fill at the open, then the candle plays out.
+
+        While catching up on missed candles nothing may fill at today's quote: those decisions belong
+        to the past, so every market order queues and fills at the following candle's open."""
+        self._catch_up = catch_up
+        try:
+            events = self._fill_pending(symbol, bar, volume_24h, candle_qv, catch_up)
+            events += self._manage_exits(symbol, bar, cur, fired, volume_24h, candle_qv, catch_up)
+            self._advance_shadows(symbol, bar, cur, fired, volume_24h, candle_qv)
+        finally:
+            self._catch_up = False
         return events
 
     # ---------------------------------------------------------------- quotes
     def _fresh_quote(self, symbol: str) -> dict | None:
         """The live bid/ask if it exists and is recent enough to trade at; otherwise None."""
-        if not self.live:
+        if not self.live or self._catch_up:
             return None
         q = self.quotes.get(symbol)
         if not q or q.get("bid", 0) <= 0 or q.get("ask", 0) <= 0 or q["ask"] < q["bid"]:
@@ -553,13 +562,16 @@ class Trader:
         qty = notional / fill
         stop_pct, variant = order["stop_pct"], order["variant"]
         est = exits.init_state(variant, fill, side, stop_pct)
+        # A learned exit is an overlay on the signal's own rule. The rule itself is tracked from the first
+        # candle, so the 'rule' baseline every variant is scored against is what the rule would really have done.
+        track = None if variant == "rule" else self._new_track(fill * (1 - side * stop_pct), last_funding_hour)
         pos = Position(
             symbol=symbol, signal=signal, entry_time=entry_time, entry_price=fill, qty=qty, notional=notional,
             stop=fill * (1 - side * stop_pct), max_bars=order["max_bars"], exit_rule=order["exit_rule"],
             context={**order["ctx"], "risk_pct": stop_pct, "p_win_believed": order["p_win"], "samples": order["samples"], "market": self.market,
                      "exit_variant": variant, "signal_close": order["signal_close"], "decided": order["placed"], "fill_basis": basis},
             explore=order["explore"], mark=price, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=last_funding_hour, margin=margin,
-            exit_variant=variant, exit_best=est.best, exit_target=est.target, entered_at_open=entered_at_open, fill_basis=basis,
+            exit_variant=variant, exit_best=est.best, exit_target=est.target, entered_at_open=entered_at_open, fill_basis=basis, rule_track=track,
         )
         self.wallet.cash -= margin + fee
         self.wallet.positions[pos.key] = asdict(pos)
@@ -574,6 +586,8 @@ class Trader:
                 continue
             pos = Position(**raw)
             self._apply_funding(pos, bar)  # still held at this candle's open, so a funding time here is charged
+            if pos.rule_track:
+                self._advance_track(pos.rule_track, pos, bar, None, [], len(pos.path))  # the rule's own order fills at this open too
             ev = self._close(pos, bar, bar.open, pos.pending_exit, volume_24h, candle_qv, basis="next_open")
             if catch_up:
                 ev["catch_up"] = True
@@ -607,6 +621,8 @@ class Trader:
                 pos.mae = min(pos.mae, 1 - bar.high / pos.entry_price)
             pos.mark = bar.close
             self._apply_funding(pos, bar)
+            if pos.rule_track:
+                self._advance_track(pos.rule_track, pos, bar, cur, fired, len(pos.path))
             pos.path.append((bar.open, bar.high, bar.low, bar.close))
             pos.fund_path.append(pos.funding / pos.notional if pos.notional else 0.0)
             if len(pos.path) > PATH_LIMIT:
@@ -713,23 +729,28 @@ class Trader:
             context={**pos.context, "exit_basis": basis}, explore=pos.explore, side=pos.side, funding=pos.funding,
         )
         findings = pm.lenses(t)
-        cost_ratio = (t.fees + t.slippage) / pos.notional if pos.notional else 0.0
+        risk_pct = pos.context.get("risk_pct") or 0.0
         variants: dict = {}
         if pos.exit_variant == "rule":
-            # the path ran to the rule's own exit: every variant can be scored on it now, funding included
-            variants = exits.simulate(pos.path, pos.entry_price, pos.side, pos.context.get("risk_pct") or 0.0, price, cost_ratio, pos.fund_path)
-            variants["rule"] = net_ret  # what actually happened
+            # the path ran to the rule's own exit: every variant can be scored on it now, each at its own fill and fee
+            costs = self._exit_costs(pos.entry_fee, pos.notional, pos.qty, basis, volume_24h, candle_qv, pos.funding / pos.notional if pos.notional else 0.0)
+            variants = exits.simulate(pos.path, pos.entry_price, pos.side, risk_pct, price, costs, pos.fund_path)
+            variants["rule"] = net_ret  # what actually happened (identical to the replay's own figure; see tests)
+        elif pos.rule_track and pos.rule_track["done"]:
+            # the rule would already have exited: score every variant on the rule's horizon now
+            variants = self._score_track(pos.rule_track, pos.entry_price, pos.side, risk_pct, pos.path, pos.fund_path, pos.entry_fee / pos.notional if pos.notional else 0.0,
+                                         pos.qty, volume_24h, candle_qv)
         event = {"symbol": pos.symbol, "signal": pos.signal, "action": "sell" if pos.side == 1 else "cover", "reason": reason, "price": fill,
                  "net_ret": net_ret, "pnl": pnl, "funding": pos.funding, "basis": basis, "findings": [tag for tag, _ in findings], "postmortem": None}
         if not pm.record(self.brain, t, findings, variants):
             return {**event, "action": "duplicate", "findings": []}
         pm.update_belief(self.brain, t)
-        if pos.exit_variant == "rule":
+        if variants:
             if not self.frozen:
                 exits.record(self.brain, self.book, pos.signal, variants)
                 self._maybe_change_policy(pos.signal)
         else:
-            self._open_shadow(pos, cost_ratio, bar.date)  # keep watching until the original rule would have exited
+            self._open_shadow(pos, bar.date)  # keep watching until the original rule would have exited
         event["postmortem"] = pm.learn_postmortem(self.brain, t, findings)
         n_signal = self.brain.db.execute("SELECT COUNT(*) FROM trades WHERE book = ? AND signal = ?", (self.book, pos.signal)).fetchone()[0]
         if n_signal % 10 == 0:
@@ -742,54 +763,88 @@ class Trader:
         if changed:
             self._log(f"    EXIT POLICY {signal}: {changed[0]} -> {changed[1]} (learned from {exits.stats(self.brain, self.book, signal)['rule'][0]} trades)")
 
+    # ------------------------------------------------------------ rule track
+    @staticmethod
+    def _new_track(stop: float, last_funding_hour: str) -> dict:
+        return {"stop": stop, "bars_held": 0, "done": False, "pending": False, "exit_price": None, "basis": None, "horizon": None,
+                "funding": 0.0, "last_funding_hour": last_funding_hour}
+
+    def _advance_track(self, track: dict, pos, bar: Bar, cur: Reading | None, fired: list[str], n_path: int) -> None:
+        """Run the signal's own rule one candle further, exactly as a position under that rule would be run.
+
+        ``pos`` carries side, entry price, risk, exit rule and max bars (a Position or a shadow dict);
+        ``n_path`` is the number of path bars before this candle. A queued rule exit fills at this
+        candle's open (horizon: the bars before it); a stop or a live-quote exit fills within this
+        candle (horizon: the bars up to and including it)."""
+        if track["done"]:
+            return
+        side, entry = (pos.side, pos.entry_price) if isinstance(pos, Position) else (pos["side"], pos["entry_price"])
+        risk_pct = (pos.context.get("risk_pct") or 0.0) if isinstance(pos, Position) else pos["risk_pct"]
+        exit_rule, max_bars, symbol = (pos.exit_rule, pos.max_bars, pos.symbol) if isinstance(pos, Position) else (pos["exit_rule"], pos["max_bars"], pos["symbol"])
+        rate, hour_key = self._funding_at(symbol, bar, track["last_funding_hour"])
+        if hour_key:
+            track["last_funding_hour"] = hour_key
+        if rate is not None:
+            track["funding"] += side * rate * bar.close / entry  # the charge a real position of this size pays at this open
+        if track["pending"]:
+            track.update(done=True, pending=False, exit_price=bar.open, basis="next_open", horizon=n_path)
+            return
+        track["bars_held"] += 1
+        st = exits.ExitState(stop=track["stop"], best=entry)
+        hit, px = exits.step("rule", st, entry, side, risk_pct, bar.high, bar.low, bar.open)
+        if hit == "stop":
+            track.update(done=True, exit_price=px, basis="resting", horizon=n_path + 1)
+        elif (cur is not None and self._exit_rule_hit(exit_rule, cur, fired)) or track["bars_held"] >= max_bars or n_path + 1 >= PATH_LIMIT:
+            q = self._fresh_quote(symbol)
+            if q is not None:
+                track.update(done=True, exit_price=q["bid"] if side == 1 else q["ask"], basis="quote", horizon=n_path + 1)
+            else:
+                track["pending"] = True
+
+    def _slip_fn(self, basis: str, qty: float, volume_24h: float, candle_qv: float):
+        """Slippage as a function of the fill level, matching how the live trader fills on that basis."""
+        if basis == "quote":
+            return lambda price: impact_bps(qty * price, candle_qv) / 1e4  # the spread is already in the quote
+        return lambda price: slippage_bps(qty * price, volume_24h, candle_qv) / 1e4
+
+    def _exit_costs(self, entry_fee: float, notional: float, qty: float, rule_basis: str, volume_24h: float, candle_qv: float, rule_funding: float) -> dict:
+        return {"entry": entry_fee / notional if notional else 0.0, "fee": self.fees["taker"], "slip": self._slip_fn("resting", qty, volume_24h, candle_qv),
+                "rule_slip": self._slip_fn(rule_basis, qty, volume_24h, candle_qv), "rule_funding": rule_funding}
+
+    def _score_track(self, track: dict, entry: float, side: int, risk_pct: float, path: list, fund_path: list, entry_fee_ratio: float, qty: float,
+                     volume_24h: float, candle_qv: float) -> dict:
+        h = track["horizon"]
+        costs = self._exit_costs(entry_fee_ratio, 1.0, qty, track["basis"], volume_24h, candle_qv, track["funding"])
+        return exits.simulate(path[:h], entry, side, risk_pct, track["exit_price"], costs, fund_path[:h])
+
     # --------------------------------------------------------------- shadows
-    def _open_shadow(self, pos: Position, cost_ratio: float, last_bar: str) -> None:
-        """A position closed by a learned exit keeps a shadow running under the original rule, so the
-        'rule' baseline stays the original rule and every variant is scored on one complete path,
-        with the funding that path would have paid."""
-        risk_pct = pos.context.get("risk_pct") or 0.0
+    def _open_shadow(self, pos: Position, last_bar: str) -> None:
+        """A position closed by a learned exit before its rule would have exited leaves a shadow that keeps
+        running the rule, so the 'rule' baseline stays the rule and every variant is scored on one complete
+        path with the funding that path would have paid."""
+        track = pos.rule_track or self._new_track(pos.entry_price * (1 - pos.side * (pos.context.get("risk_pct") or 0.0)), pos.last_funding_hour)
         self.wallet.shadows[f"{pos.symbol}:{pos.signal}:{pos.entry_time}"] = {
             "symbol": pos.symbol, "signal": pos.signal, "side": pos.side, "entry_price": pos.entry_price, "entry_time": pos.entry_time,
-            "risk_pct": risk_pct, "stop": pos.entry_price * (1 - pos.side * risk_pct), "max_bars": pos.max_bars, "exit_rule": pos.exit_rule,
-            "bars_held": pos.bars_held, "path": list(pos.path), "fund_path": list(pos.fund_path), "funding": (pos.funding / pos.notional) if pos.notional else 0.0,
-            "last_funding_hour": pos.last_funding_hour, "cost_ratio": cost_ratio, "pending": False, "last_bar": last_bar,
+            "risk_pct": pos.context.get("risk_pct") or 0.0, "max_bars": pos.max_bars, "exit_rule": pos.exit_rule, "qty": pos.qty,
+            "entry_fee_ratio": pos.entry_fee / pos.notional if pos.notional else 0.0, "path": list(pos.path), "fund_path": list(pos.fund_path),
+            "track": track, "last_bar": last_bar,
         }
 
-    def _advance_shadows(self, symbol: str, bar: Bar, cur: Reading, fired: list[str]) -> None:
+    def _advance_shadows(self, symbol: str, bar: Bar, cur: Reading, fired: list[str], volume_24h: float, candle_qv: float) -> None:
         for key, sh in list(self.wallet.shadows.items()):
             if sh["symbol"] != symbol or bar.date <= sh.get("last_bar", sh["entry_time"]):
                 continue  # the position itself already saw this candle
             sh["last_bar"] = bar.date
-            if sh.get("pending"):
-                # the rule's market order, queued at the last close, fills at this candle's open (funding at that open still applies)
-                rate, hour_key = self._funding_at(symbol, bar, sh.get("last_funding_hour", ""))
-                funding = sh["funding"] + (sh["side"] * rate * bar.close / sh["entry_price"] if rate is not None else 0.0)
-                self._finish_shadow(key, sh, bar.open, funding)
-                continue
-            sh["bars_held"] += 1
-            rate, hour_key = self._funding_at(symbol, bar, sh.get("last_funding_hour", ""))
-            if hour_key:
-                sh["last_funding_hour"] = hour_key
-            if rate is not None:
-                sh["funding"] += sh["side"] * rate * bar.close / sh["entry_price"]  # the same charge a real position of this size pays
-            sh["path"].append((bar.open, bar.high, bar.low, bar.close))
-            sh["fund_path"].append(sh["funding"])
-            st = exits.ExitState(stop=sh["stop"], best=sh["entry_price"])
-            hit, px = exits.step("rule", st, sh["entry_price"], sh["side"], sh["risk_pct"], bar.high, bar.low, bar.open)
-            if hit == "stop":
-                self._finish_shadow(key, sh, px, sh["funding"])
-            elif self._exit_rule_hit(sh["exit_rule"], cur, fired) or sh["bars_held"] >= sh["max_bars"] or len(sh["path"]) > PATH_LIMIT:
-                q = self._fresh_quote(symbol)
-                if q is not None:
-                    self._finish_shadow(key, sh, q["bid"] if sh["side"] == 1 else q["ask"], sh["funding"])
-                else:
-                    sh["pending"] = True
-
-    def _finish_shadow(self, key: str, sh: dict, price: float, funding: float) -> None:
-        variants = exits.simulate(sh["path"], sh["entry_price"], sh["side"], sh["risk_pct"], price, sh["cost_ratio"], sh["fund_path"])
-        variants["rule"] = sh["side"] * (price / sh["entry_price"] - 1) - sh["cost_ratio"] - funding
-        self._record_variants(sh["symbol"], sh["signal"], sh["entry_time"], variants)
-        del self.wallet.shadows[key]
+            track = sh["track"]
+            was_pending = track["pending"]
+            self._advance_track(track, sh, bar, cur, fired, len(sh["path"]))
+            if not was_pending:  # a queued exit filled at the open, before this candle; otherwise the rule sat through it
+                sh["path"].append((bar.open, bar.high, bar.low, bar.close))
+                sh["fund_path"].append(track["funding"])
+            if track["done"]:
+                variants = self._score_track(track, sh["entry_price"], sh["side"], sh["risk_pct"], sh["path"], sh["fund_path"], sh["entry_fee_ratio"], sh["qty"], volume_24h, candle_qv)
+                self._record_variants(sh["symbol"], sh["signal"], sh["entry_time"], variants)
+                del self.wallet.shadows[key]
 
     def _record_variants(self, symbol: str, signal: str, entry_time: str, variants: dict) -> None:
         self.brain.db.execute(
@@ -901,12 +956,12 @@ class Trader:
     def rebuild_stats(self) -> dict:
         """Recompute beliefs and exit statistics from the trade log, the single source of truth.
 
-        Exit statistics only count trades recorded under the current results version: older ones were
-        measured under a different execution model and are evidence about that model, not this one."""
+        Only trades recorded under the current results version count: older ones were measured under a
+        different execution model and are evidence about that model, not this one."""
         self.brain.db.execute("DELETE FROM beliefs WHERE book = ?", (self.book,))
         self.brain.db.execute("DELETE FROM exit_stats WHERE book = ?", (self.book,))
         n = 0
-        for r in self.brain.db.execute("SELECT * FROM trades WHERE book = ? ORDER BY id", (self.book,)).fetchall():
+        for r in self.brain.db.execute("SELECT * FROM trades WHERE book = ? AND model_version = ? ORDER BY id", (self.book, self.brain.RESULTS_VERSION)).fetchall():
             ctx = json.loads(r["context"])
             t = pm.Trade(book=self.book, symbol=r["symbol"], signal=r["signal"], entry_time=r["entry_time"], entry_price=r["entry_price"], exit_time=r["exit_time"],
                          exit_price=r["exit_price"], exit_reason=r["exit_reason"], qty=r["qty"], notional=r["notional"], gross_ret=r["gross_ret"], net_ret=r["net_ret"],
@@ -914,7 +969,7 @@ class Trader:
                          side=r["side"], funding=r["funding"])
             pm.update_belief(self.brain, t)
             variants = json.loads(r["variants"] or "{}")
-            if variants and not self.frozen and r["model_version"] == self.brain.RESULTS_VERSION:
+            if variants and not self.frozen:
                 exits.record(self.brain, self.book, r["signal"], variants)
             n += 1
         self.brain.commit()

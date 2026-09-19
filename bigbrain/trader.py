@@ -555,7 +555,7 @@ class Trader:
             pid_str, _, cmd = line.partition(" ")
             if not pid_str.isdigit() or int(pid_str) == os.getpid():
                 continue
-            if _TRADER_CMD.search(cmd):
+            if _TRADER_CMD.search(cmd) and not cmd.lstrip().startswith("grep") and " grep " not in cmd:
                 found.append((int(pid_str), cmd.strip()))
         return found
 

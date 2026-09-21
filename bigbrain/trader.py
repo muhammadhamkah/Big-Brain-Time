@@ -206,6 +206,7 @@ class Position:
     fill_basis: str = ""  # quote | next_open
     pending_exit: str = ""  # an exit decided at a close, waiting for the next candle's open
     rule_track: dict | None = None  # under a learned exit: how the signal's own rule is doing on this same path
+    model_version: int = 0  # results version the position was opened under (0: saved before versions were stamped)
 
     @property
     def key(self) -> str:
@@ -330,11 +331,16 @@ class Trader:
         the same bars and paid the same funding). A shadow saved without a track gets one from its
         fields and its size from the trade record; one that cannot be reconstructed is dropped, and
         its trade keeps an empty variants column rather than a made-up score."""
+        legacy = self.brain.get_state("results_version_previous", self.brain.RESULTS_VERSION - 1)
         for raw in wallet.positions.values():
+            if not raw.get("model_version"):
+                raw["model_version"] = legacy  # opened under the earlier model: it may finish, but it is not evidence about this one
             if raw.get("exit_variant", "rule") != "rule" and not raw.get("rule_track"):
                 risk_pct = raw["context"].get("risk_pct") or 0.0
                 raw["rule_track"] = self._new_track(raw["entry_price"] * (1 - raw.get("side", 1) * risk_pct), raw.get("last_funding_hour", ""))
                 raw["rule_track"].update(bars_held=raw.get("bars_held", 0), funding=(raw.get("funding", 0.0) / raw["notional"]) if raw.get("notional") else 0.0)
+        for order in wallet.pending.values():
+            order.setdefault("model_version", legacy)
         for key, sh in list(wallet.shadows.items()):
             if "track" in sh:
                 continue
@@ -462,9 +468,21 @@ class Trader:
     def _has_work(self, symbol: str) -> bool:
         return symbol in self.wallet.symbols()
 
+    def _liquidity(self, bars: list[Bar], i: int, fallback_24h: float = 0.0) -> tuple[float, float]:
+        """(24h quote volume, average candle quote volume) as known when candle ``i`` closed: the trailing day of
+        candles and the trailing twenty. The same numbers whether the candle is processed live or caught up later."""
+        def qv(b: Bar) -> float:
+            return b.quote_volume or b.volume * b.close
+
+        per_day = max(1, 86400 // INTERVAL_SECONDS[self.interval])
+        day = bars[max(0, i + 1 - per_day):i + 1]
+        volume_24h = sum(qv(b) for b in day) * (per_day / len(day)) if day else 0.0
+        recent = bars[max(0, i - 19):i + 1]
+        candle_qv = sum(qv(b) for b in recent) / len(recent) if recent else 0.0
+        return (volume_24h or fallback_24h), candle_qv
+
     def _step_symbol(self, symbol: str, bars: list[Bar], volume_24h: float) -> list[dict]:
         rs = readings(bars)
-        candle_qv = sum(b.quote_volume for b in bars[-20:]) / 20 or sum(b.volume * b.close for b in bars[-20:]) / 20
         events: list[dict] = []
         # Catch up: if candles closed while the trader was not running (sleep, restart, outage), queued
         # orders fill and open positions are managed through every missed candle in order, so stops that
@@ -477,9 +495,10 @@ class Trader:
             if not self._has_work(symbol):
                 break
             fired_i = detect(rs[i - 1], rs[i]) if i >= 1 else []
-            events += self._process_bar(symbol, bars[i], rs[i], fired_i, volume_24h, candle_qv, catch_up=True)
+            events += self._process_bar(symbol, bars[i], rs[i], fired_i, *self._liquidity(bars, i, volume_24h), catch_up=True)
         cur, prev = rs[-1], rs[-2]
         fired = detect(prev, cur)
+        volume_24h, candle_qv = self._liquidity(bars, len(bars) - 1, volume_24h)
         events += self._process_bar(symbol, bars[-1], cur, fired, volume_24h, candle_qv)
         ctx = context_for(rs, bars)
         for signal in fired:
@@ -566,7 +585,7 @@ class Trader:
         order = {
             "symbol": symbol, "signal": signal, "side": side, "notional": notional, "stop_pct": stop_pct, "explore": explore, "variant": variant,
             "max_bars": play["max_bars"], "exit_rule": play["exit"], "placed": bar.date, "signal_close": bar.close, "p_win": round(b["p_win"], 3), "samples": b["samples"],
-            "ctx": ctx,
+            "ctx": ctx, "model_version": self.brain.RESULTS_VERSION,
         }
         q = self._fresh_quote(symbol)
         if q is not None:
@@ -602,6 +621,7 @@ class Trader:
                      "exit_variant": variant, "signal_close": order["signal_close"], "decided": order["placed"], "fill_basis": basis},
             explore=order["explore"], mark=price, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=last_funding_hour, margin=margin,
             exit_variant=variant, exit_best=est.best, exit_target=est.target, entered_at_open=entered_at_open, fill_basis=basis, rule_track=track,
+            model_version=order.get("model_version") or self.brain.RESULTS_VERSION,
         )
         self.wallet.cash -= margin + fee
         self.wallet.positions[pos.key] = asdict(pos)
@@ -758,7 +778,9 @@ class Trader:
             gross_ret=gross_ret, net_ret=net_ret, pnl=pnl, fees=pos.entry_fee + fee,
             slippage=pos.entry_slip + gross_notional * slip, bars_held=pos.bars_held, mfe=pos.mfe, mae=pos.mae,
             context={**pos.context, "exit_basis": basis}, explore=pos.explore, side=pos.side, funding=pos.funding,
+            model_version=pos.model_version or self.brain.RESULTS_VERSION,
         )
+        current = t.model_version == self.brain.RESULTS_VERSION  # a position opened under an earlier model may finish, but is not evidence about this one
         findings = pm.lenses(t)
         risk_pct = pos.context.get("risk_pct") or 0.0
         variants: dict = {}
@@ -775,9 +797,10 @@ class Trader:
                  "net_ret": net_ret, "pnl": pnl, "funding": pos.funding, "basis": basis, "findings": [tag for tag, _ in findings], "postmortem": None}
         if not pm.record(self.brain, t, findings, variants):
             return {**event, "action": "duplicate", "findings": []}
-        pm.update_belief(self.brain, t)
+        if current:
+            pm.update_belief(self.brain, t)
         if variants:
-            if not self.frozen:
+            if current and not self.frozen:
                 exits.record(self.brain, self.book, pos.signal, variants)
                 self._maybe_change_policy(pos.signal)
         else:
@@ -1081,6 +1104,8 @@ class Trader:
             self._log(line)
 
         books = (self, *companions)
+        if getattr(self.brain, "upgrade_error", None):
+            raise RuntimeError(f"{self.brain.upgrade_error}. Free disk space or fix the backups folder, then start again; nothing was retired.")
         for t in books:
             t.acquire_lock()
         for t in books:

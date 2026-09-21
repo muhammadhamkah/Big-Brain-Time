@@ -271,7 +271,7 @@ class CatchUpTests(unittest.TestCase):
         events = b.tick(market=market_at(series, 441), universe=universe(symbols))["events"]  # the gap
         a.tick(market=market_at(series, 441), universe=universe(symbols))
         cutoff = series["AAAUSDT"][399].date
-        q = "SELECT symbol, signal, entry_time, exit_time, exit_reason FROM trades WHERE entry_time <= ? ORDER BY entry_time, symbol, signal"
+        q = "SELECT symbol, signal, entry_time, exit_time, exit_reason, exit_price, net_ret, variants FROM trades WHERE entry_time <= ? ORDER BY entry_time, symbol, signal"
         closed_a = brain_a.db.execute(q, (cutoff,)).fetchall()
         closed_b = brain_b.db.execute(q, (cutoff,)).fetchall()
         self.assertTrue(closed_a)

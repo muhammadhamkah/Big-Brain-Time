@@ -50,6 +50,7 @@ class Trade:
     explore: bool = False
     side: int = 1  # +1 long, -1 short
     funding: float = 0.0  # funding paid (positive) or received (negative), in USDT
+    model_version: int | None = None  # results version the position was opened under; None means the current one
 
 
 # ------------------------------------------------------------------- lenses
@@ -195,7 +196,7 @@ def record(brain: Brain, t: Trade, findings: list[tuple[str, str]], variants: di
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (t.book, t.symbol, t.signal, t.entry_time, t.entry_price, t.exit_time, t.exit_price, t.exit_reason, t.qty, t.notional, t.gross_ret, t.net_ret,
          t.pnl, t.fees, t.slippage, t.bars_held, t.mfe, t.mae, json.dumps(t.context), json.dumps([tag for tag, _ in findings]), int(t.explore),
-         t.side, t.funding, json.dumps(variants or {}), brain.RESULTS_VERSION),
+         t.side, t.funding, json.dumps(variants or {}), brain.RESULTS_VERSION if t.model_version is None else t.model_version),
     )
     return cur.rowcount == 1
 

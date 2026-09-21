@@ -377,14 +377,66 @@ class ThirdReviewTests(unittest.TestCase):
             v = json.loads(brain.db.execute("SELECT variants FROM trades WHERE symbol = 'SHDUSDT'").fetchone()["variants"])
             self.assertEqual(set(v), set(exits.VARIANTS))  # scored for the record ...
             self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)  # ... but a version-2 trade is not version-3 evidence
+            self.assertEqual(pos["model_version"], 2)  # opened under the previous model
             events = t._process_bar("OLDUSDT", bar("2026-09-01 07:45", 100.4, 102.5, 100.2, 102.0), quiet, [], VOL, QV)
             self.assertEqual(events[0]["reason"], "target")
             self.assertIn("OLDUSDT:rsi_oversold:2026-09-01 07:15", t.wallet.shadows)
-            self.assertEqual(brain.db.execute("SELECT model_version FROM trades WHERE symbol = 'OLDUSDT'").fetchone()[0], brain.RESULTS_VERSION)
+            # it finishes, is recorded under the version it was opened under, and is not evidence about this one
+            self.assertEqual(brain.db.execute("SELECT model_version FROM trades WHERE symbol = 'OLDUSDT'").fetchone()[0], 2)
+            self.assertEqual(pm.belief(brain, "main", "rsi_oversold", "uptrend", "mid")["samples"], 0)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs").fetchone()[0], 0)
+            t._process_bar("OLDUSDT", bar("2026-09-01 08:00", 102.0, 102.5, 101.5, 102.2), recovered, [], VOL, QV)
+            t._process_bar("OLDUSDT", bar("2026-09-01 08:15", 102.2, 102.5, 101.5, 102.0), quiet, [], VOL, QV)
+            self.assertNotIn("OLDUSDT:rsi_oversold:2026-09-01 07:15", t.wallet.shadows)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            # a queued order saved by the old release is legacy too; a new order is stamped with the current version
+            t.wallet.pending["QUEUSDT:rsi_oversold"] = {"symbol": "QUEUSDT", "signal": "rsi_oversold", "side": 1, "notional": 100.0, "stop_pct": 0.02, "explore": False, "variant": "rule",
+                                                       "max_bars": 16, "exit_rule": "rsi_recovered", "placed": "2026-09-01 07:00", "signal_close": 100.0, "p_win": 0.5, "samples": 0, "ctx": CTX}
+            t._save()
+            t = Trader(brain, book="main")
+            self.assertEqual(t.wallet.pending["QUEUSDT:rsi_oversold"]["model_version"], 2)
+            t._fill_pending("QUEUSDT", bar("2026-09-01 08:30", 100.0, 100.5, 99.8, 100.2), VOL, QV, catch_up=False)
+            self.assertEqual(t.wallet.positions["QUEUSDT:rsi_oversold"]["model_version"], 2)
+            ev = t._consider_entry("NEWUSDT", "rsi_oversold", bar("2026-09-01 08:30", 100.0, 100.5, 99.8, 100.2), CTX, VOL, QV)
+            if ev and ev["action"] == "queued":
+                self.assertEqual(t.wallet.pending["NEWUSDT:rsi_oversold"]["model_version"], brain.RESULTS_VERSION)
             # a second open (and a rolled-back reload) sees the migrated layout, not the old one again
             t._save()
             t2 = Trader(brain, book="main")
-            self.assertIn("track", t2.wallet.shadows["OLDUSDT:rsi_oversold:2026-09-01 07:15"])
+            self.assertEqual(t2.wallet.positions["QUEUSDT:rsi_oversold"]["model_version"], 2)
+            brain.close()
+
+    def test_the_upgrade_is_not_applied_when_the_snapshot_fails(self):
+        import os, tempfile
+        from bigbrain import backup
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.db")
+            brain = Brain(path)
+            brain.db.execute("UPDATE state SET value = '2' WHERE key = 'results_version'")
+            for i in range(5):
+                tr = trade("main", f"S{i}USDT", f"2026-09-0{1 + i} 00:00", 0.01, exit_time=f"2026-09-0{1 + i} 23:00")
+                pm.record(brain, tr, [], {}); pm.update_belief(brain, tr)
+                exits.record(brain, "main", "rsi_oversold", {v: 0.01 for v in exits.VARIANTS})
+            brain.db.execute("UPDATE trades SET model_version = 2")
+            brain.set_state(exits.policy_key("main"), {"rsi_oversold": "tp_1R"})
+            brain.close()
+            with mock.patch.object(backup, "snapshot", side_effect=OSError("No space left on device")):
+                brain = Brain(path)
+                self.assertIn("No space left", brain.upgrade_error)
+                self.assertEqual(brain.get_state("results_version"), 2)  # nothing advanced ...
+                self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 5)  # ... nothing retired
+                self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs").fetchone()[0], 1)
+                self.assertEqual(exits.current_policy(brain, "main"), {"rsi_oversold": "tp_1R"})
+                self.assertFalse(os.path.exists(os.path.join(tmp, "backups")) and os.listdir(os.path.join(tmp, "backups")))
+                with self.assertRaises(RuntimeError):
+                    Trader(brain, book="main", market="perps").run(log=lambda line: None, once=True)
+                brain.close()
+            brain = Brain(path)  # the next open, with the disk fixed, applies it
+            self.assertIsNone(brain.upgrade_error)
+            self.assertEqual(brain.get_state("results_version"), brain.RESULTS_VERSION)
+            self.assertEqual(brain.get_state("results_version_previous"), 2)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            self.assertTrue(os.listdir(os.path.join(tmp, "backups")))
             brain.close()
 
     def test_each_replayed_fill_pays_the_liquidity_of_its_own_candle(self):
@@ -408,6 +460,32 @@ class ThirdReviewTests(unittest.TestCase):
         self.assertAlmostEqual(v["tp_1R"], booked, places=12)  # replayed with the thin candle's liquidity: exactly what was booked
         cheap = 1.02 * (1 - slippage_bps(pos["qty"] * 1.02 * pos["entry_price"], *deep) / 1e4)
         self.assertLess(v["tp_1R"], cheap - 1 - 2 * 0.0005 * 1.02 - 0.0005)  # and well below what the deep market would have pretended
+
+    def test_caught_up_candles_use_the_liquidity_known_at_the_time(self):
+        brain_a, brain_b = Brain(), Brain()
+        symbols = ["AAAUSDT", "BBBUSDT"]
+        series = {s: stamped(synthetic(s, n=700, seed=110 + i, vol=0.02)) for i, s in enumerate(symbols)}
+        for bars in series.values():
+            for j, b in enumerate(bars):
+                b.quote_volume = b.volume * b.close * (1 + 200 * (j > 420))  # the market becomes two hundred times deeper after candle 420
+        a = Trader(brain_a, book="x", interval="15m", wallet=1000.0, top=2, market="perps", frozen=True, fetch_funding=lambda: {})
+        b = Trader(brain_b, book="x", interval="15m", wallet=1000.0, top=2, market="perps", frozen=True, fetch_funding=lambda: {})
+        for end in range(250, 401):
+            a.tick(market=market_at(series, end), universe=universe(symbols))
+            b.tick(market=market_at(series, end), universe=universe(symbols))
+        for end in range(401, 461):
+            a.tick(market=market_at(series, end), universe=universe(symbols))
+        b.tick(market=market_at(series, 461), universe=universe(symbols))  # sixty candles at once
+        a.tick(market=market_at(series, 461), universe=universe(symbols))
+        cutoff = series["AAAUSDT"][400].date  # entries taken inside the gap exist only in the continuous run, by design
+        q = "SELECT symbol, signal, entry_time, exit_time, exit_price, net_ret, slippage, variants FROM trades WHERE entry_time <= ? ORDER BY entry_time, symbol, signal"
+        rows_a = [tuple(r) for r in brain_a.db.execute(q, (cutoff,))]
+        rows_b = [tuple(r) for r in brain_b.db.execute(q, (cutoff,))]
+        self.assertTrue(any(r[3] > cutoff for r in rows_a), "some trade should close inside the gap")
+        self.assertEqual(rows_a, rows_b)  # same fills, same slippage, same scores: a caught-up candle pays its own liquidity
+        for key, raw in b.wallet.positions.items():
+            if raw["entry_time"] <= cutoff:
+                self.assertEqual(a.wallet.positions[key]["liq_path"], raw["liq_path"])
 
 
 class EvidenceTests(unittest.TestCase):

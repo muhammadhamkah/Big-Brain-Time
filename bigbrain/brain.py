@@ -240,6 +240,12 @@ class Brain:
     # per-variant fills and fees with the liquidity of each exit candle, evidence counted from current trades only
 
     def _upgrade_results_version(self) -> None:
+        """Retire evidence measured under an earlier results version, after a verified snapshot.
+
+        If the snapshot cannot be written the upgrade is not applied: nothing is deleted, the stored
+        version stays where it was, and ``upgrade_error`` says why so the trader can refuse to run
+        until it is fixed (disk space, permissions). It is retried on every open."""
+        self.upgrade_error: str | None = None
         row = self.db.execute("SELECT value FROM state WHERE key = 'results_version'").fetchone()
         current = json.loads(row[0]) if row else 1
         if current >= self.RESULTS_VERSION:
@@ -251,14 +257,20 @@ class Brain:
                 from bigbrain.backup import snapshot
 
                 self.db.commit()
-                snapshot(self.path, Path(self.path).parent / "backups", keep=50)
-            except Exception:
-                pass
-        # exit statistics and policies from version 1 compared inconsistent fills; they are not evidence any more
+                target = snapshot(self.path, Path(self.path).parent / "backups", keep=50)
+                if not Path(target).is_file() or Path(target).stat().st_size == 0:
+                    raise OSError(f"snapshot {target} was not written")
+            except Exception as exc:
+                self.upgrade_error = f"results version {current} -> {self.RESULTS_VERSION} not applied: the snapshot that must precede it failed ({exc})"
+                self._journal("upgrade-failed", self.upgrade_error)
+                self.db.commit()
+                return
+        # exit statistics, beliefs and policies from earlier versions compared inconsistent fills; they are not evidence any more
         self.db.execute("DELETE FROM exit_stats")
         self.db.execute("DELETE FROM beliefs")  # rebuilt from current-version trades when a trader starts
         self.db.execute("DELETE FROM state WHERE key LIKE 'exit_policy:%'")
         self.db.execute("INSERT INTO state (key, value) VALUES ('results_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(self.RESULTS_VERSION),))
+        self.db.execute("INSERT INTO state (key, value) VALUES ('results_version_previous', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(current),))
         self._journal("upgrade", f"results version {current} -> {self.RESULTS_VERSION}: exit statistics ({had_stats} rows) and beliefs retired; "
                                  f"{had_trades} earlier trades stay on record but no longer count as evidence")
 

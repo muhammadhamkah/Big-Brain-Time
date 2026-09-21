@@ -524,7 +524,13 @@ def cmd_lab(args: argparse.Namespace) -> int:
     brain = open_brain(args.db)
     cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
     try:
-        symbols = lab.resolve_symbols(args.symbols or args.symbol, market)
+        spec_symbols = args.symbols or args.symbol
+        if args.rank_at_start and spec_symbols.startswith("top:") and "-" not in spec_symbols:
+            wanted = int(spec_symbols[4:])
+            spec_symbols = f"top:{min(3 * wanted, 150)}"  # a wider pool, ranked by volume at the start of the history below
+        else:
+            wanted = None
+        symbols = lab.resolve_symbols(spec_symbols, market)
     except Exception as exc:
         print(f"could not resolve the universe: {exc}", file=sys.stderr)
         return 1
@@ -537,6 +543,10 @@ def cmd_lab(args: argparse.Namespace) -> int:
     if not markets:
         print("no candles fetched", file=sys.stderr)
         return 1
+    if wanted:
+        markets = lab.rank_at_start(markets, wanted)
+        extras = {k: {s: v[s] for s in markets if s in v} for k, v in extras.items()} if extras else extras
+        print(f"universe ranked by volume over the first 30 days of the history, not today: {len(markets)} symbols kept ({', '.join(sorted(markets)[:8])}, ...)")
     data = markets[symbols[0]] if len(markets) == 1 else markets
     n = len(lab.grid_points(grid))
     print(f"{sum(len(b) for b in markets.values())} candles across {len(markets)} symbols; testing {n} parameter setting{'s' if n != 1 else ''} "
@@ -773,6 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum (default psar)")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--symbols", default="", help="a universe: 'BTCUSDT,ETHUSDT,...' or 'top:30' (by 24h volume); trades are pooled and judged on the same dates")
+    p.add_argument("--rank-at-start", action="store_true", help="with --symbols top:N, choose the N by volume at the START of the history (what was knowable then), not today's winners")
     p.add_argument("--interval", default="15m")
     p.add_argument("--days", type=int, default=90)
     p.add_argument("--market", default=None, choices=("spot", "perps"), help="default spot, or perps for rules that need funding")

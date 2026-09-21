@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from bigbrain.brain import Brain
 from bigbrain.ingest import indicators as ind
@@ -249,7 +250,7 @@ def funding_carry_rule(bars: list[Bar], params: dict, extras: dict | None = None
     return out
 
 
-@rule("xs_momentum", {"lookback": 30, "skip": 1, "hold": 7, "top": 0.2},
+@rule("xs_momentum", {"lookback": 30, "skip": 1, "hold": 7, "top": 0.2, "stop_pct": 0.25},
       "cross-sectional momentum: every `hold` candles rank the universe by trailing return, long the top fraction, short the bottom, market neutral",
       portfolio=True, hint="daily candles over a universe, e.g. --symbols top:30")
 def xs_momentum_rule(markets: Markets, params: dict, extras: dict | None = None) -> dict[str, dict[str, dict]]:
@@ -271,7 +272,8 @@ def xs_momentum_rule(markets: Markets, params: dict, extras: dict | None = None)
             w = 1.0 / (2 * k) if k else 0.0
             for s in markets:
                 side = 1 if s in longs else -1 if s in shorts else 0
-                current[s] = {"target": side, "stop": None, "reverse": False, "weight": w} if side else _flat()
+                stop = closes[s][d] * (1 - side * params.get("stop_pct", 0.25)) if side else None
+                current[s] = {"target": side, "stop": stop, "reverse": False, "weight": w} if side else _flat()
         for s in markets:
             if d in closes[s]:
                 out[s][d] = dict(current[s])
@@ -328,7 +330,7 @@ def simulate(bars: list[Bar], decisions: list[dict], costs: Costs, interval: str
         ret = gross - costs.fee - costs.fee * fill / pos["entry"] - pos["funding"]
         if pos["entry_i"] >= start:
             trades.append(Trade(pos["side"], pos["entry_i"], pos["entry"], i, fill, ret, reason, pos["weight"], bars[i].date, symbol, pos["funding"]))
-            equity *= 1 + size * pos["weight"] * ret
+            equity = max(0.0, equity * (1 + size * pos["weight"] * ret))  # a loss beyond the account is a liquidation, not a debt
         pos = None
 
     def open_at(price: float, i: int, side: int, weight: float) -> None:
@@ -356,7 +358,7 @@ def simulate(bars: list[Bar], decisions: list[dict], costs: Costs, interval: str
                     open_at(level, i, -side, weight)
         mark = equity
         if pos and pos["entry_i"] >= start:
-            mark = equity * (1 + size * pos["weight"] * pos["side"] * (bar.close / pos["entry"] - 1))
+            mark = max(0.0, equity * (1 + size * pos["weight"] * pos["side"] * (bar.close / pos["entry"] - 1)))
         curve.append(mark)
     if pos and pos["entry_i"] >= start:
         close_at(bars[-1].close, len(bars) - 1, "end")
@@ -385,7 +387,7 @@ def summarize_pool(trades: list[Trade], symbols: int) -> Result:
         return r
     equity, curve, daily = 1.0, [1.0], {}
     for t in sorted(trades, key=lambda t: (t.date, t.entry_i)):
-        equity *= 1 + t.weight * t.ret
+        equity = max(0.0, equity * (1 + t.weight * t.ret))  # liquidation floors the account at zero
         curve.append(equity)
         daily[t.date[:10]] = daily.get(t.date[:10], 0.0) + t.weight * t.ret
     r.net_return = equity - 1
@@ -612,7 +614,7 @@ def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", c
     base = f"{FUTURES_HOST}/fapi/v1/klines" if market == "perps" else f"{BINANCE_HOSTS[0]}/api/v3/klines"
     bars: list[Bar] = []
     while cursor < now_ms:
-        url = f"{base}?symbol={symbol.upper()}&interval={interval}&startTime={cursor}&limit={limit}"
+        url = f"{base}?symbol={quote(symbol.upper())}&interval={interval}&startTime={cursor}&limit={limit}"
         chunk = parse_binance_klines(_get_json(url))
         if not chunk:
             break
@@ -647,7 +649,7 @@ def fetch_funding_history(symbol: str, interval: str, days: int, cache_dir: str 
     cursor = now_ms - days * 86400 * 1000
     out: dict[str, float] = {}
     while cursor < now_ms:
-        url = f"{FUTURES_HOST}/fapi/v1/fundingRate?symbol={symbol.upper()}&startTime={cursor}&limit=1000"
+        url = f"{FUTURES_HOST}/fapi/v1/fundingRate?symbol={quote(symbol.upper())}&startTime={cursor}&limit=1000"
         rows = _get_json(url)
         if not rows:
             break
@@ -675,6 +677,40 @@ def resolve_symbols(spec: str, market: str) -> list[str]:
         ranked = top_usdt_perps(last) if market == "perps" else top_usdt_pairs(last)
         return [u["symbol"] for u in ranked[first - 1:last]]
     return [s.strip().upper() for s in spec.split(",") if s.strip()]
+
+
+def rank_at_start(markets: Markets, n: int, days: int = 30, min_history: float = 0.8) -> Markets:
+    """Keep the ``n`` symbols with the most quote volume over the first ``days`` of the history, among those that
+    existed for at least ``min_history`` of it.
+
+    A universe chosen by today's volume is a list of coins that already went up: a long-only rule tested on it
+    looks better than it is, and so does the buy-and-hold benchmark. Ranking at the start uses only what was
+    known then. Coins that were delisted since are still missing, so the bias is reduced, not gone."""
+    if not markets:
+        return markets
+    first = min(bars[0].date for bars in markets.values())
+    last = max(bars[-1].date for bars in markets.values())
+    span = max(1, len({b.date for bars in markets.values() for b in bars}))
+    per_day = max(1, int(86400 / INTERVAL_SECONDS.get(_interval_of(markets), 86400)))
+    early_cut = days * per_day
+    scored = []
+    for s, bars in markets.items():
+        if bars[0].date > first or len(bars) < min_history * span:
+            continue  # listed later, or not around for enough of the period
+        early = bars[:early_cut]
+        scored.append((sum(b.quote_volume or b.volume * b.close for b in early), s))
+    keep = {s for _, s in sorted(scored, reverse=True)[:n]}
+    return {s: bars for s, bars in markets.items() if s in keep}
+
+
+def _interval_of(markets: Markets) -> str:
+    for bars in markets.values():
+        if len(bars) > 1:
+            gap = (_ms(bars[1].date) - _ms(bars[0].date)) // 1000
+            for name, seconds in INTERVAL_SECONDS.items():
+                if seconds == gap:
+                    return name
+    return "1d"
 
 
 def fetch_universe(symbols: list[str], interval: str, days: int, market: str, cache_dir=None, workers: int = 4, funding: bool = False, log=None) -> tuple[Markets, dict]:

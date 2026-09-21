@@ -304,5 +304,44 @@ class BenchmarkAndDataTests(unittest.TestCase):
                 lab._get_json("https://x/klines")
 
 
+class HonestyTests(unittest.TestCase):
+    def test_a_loss_beyond_the_account_is_a_liquidation_not_a_debt(self):
+        costs = lab.Costs(fee=0.0, spread_bps=0.0)
+        bars = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 400, 401, 399, 400), bar(3, 400, 401, 399, 400)]
+        r = lab.simulate(bars, [{"target": -1}, {"target": -1}, {"target": 0}, {"target": 0}], costs, "1d")  # a short that quadrupled against us
+        self.assertAlmostEqual(r.log[0].ret, -3.0)
+        self.assertAlmostEqual(r.net_return, -1.0)  # wiped out, not -300%
+        self.assertGreaterEqual(min([1.0] + [1 + x for x in [r.net_return]]), 0.0)
+        pooled = lab.summarize_pool([lab.Trade(-1, 0, 100, 2, 400, -3.0, "signal", 0.5, "D0002")], 1)
+        self.assertAlmostEqual(pooled.net_return, -1.0)
+
+    def test_momentum_legs_carry_stops(self):
+        markets = {f"S{j}USDT": [bar(i, 100 + j + i * 0.1 * j, 101 + j + i * 0.1 * j, 99 + j + i * 0.1 * j, 100 + j + i * 0.1 * j) for i in range(60)] for j in range(6)}
+        for bars in markets.values():
+            for i, b in enumerate(bars):
+                b.date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d} 00:00"
+        by_date = lab.xs_momentum_rule(markets, {**lab.RULES["xs_momentum"]["defaults"], "lookback": 10, "hold": 5}, {})
+        last = markets["S5USDT"][-1].date
+        legs = [by_date[s][last] for s in markets if by_date[s][last]["target"]]
+        self.assertTrue(legs)
+        for d in legs:
+            self.assertIsNotNone(d["stop"])
+            self.assertEqual(d["stop"] > 0, True)
+
+    def test_universe_is_ranked_by_volume_at_the_start(self):
+        def series(vol_early, vol_late, n=100, first=0):
+            out = []
+            for i in range(first, n):
+                b = bar(i, 100, 101, 99, 100)
+                b.date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d} 00:00"
+                b.quote_volume = vol_early if i < 30 else vol_late
+                out.append(b)
+            return out
+
+        markets = {"OLDBIG": series(1e9, 1e6), "NOWBIG": series(1e6, 1e9), "MID": series(5e8, 5e8), "LATE": series(1e9, 1e9, first=40)}
+        kept = lab.rank_at_start(markets, 2)
+        self.assertEqual(set(kept), {"OLDBIG", "MID"})  # today's winner and the late listing are out: neither was knowable at the start
+
+
 if __name__ == "__main__":
     unittest.main()

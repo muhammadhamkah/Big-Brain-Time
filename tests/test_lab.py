@@ -274,6 +274,30 @@ class HypothesisTests(unittest.TestCase):
         self.assertIn("4 pairs", lab.format_report(report, "4 pairs", "1d"))
 
 
+class ScalpTests(unittest.TestCase):
+    def test_take_profit_fills_at_its_level_after_the_stop_is_checked(self):
+        costs = lab.Costs(fee=0.0, spread_bps=0.0)
+        bars = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 100, 100.6, 99.8, 100.2), bar(3, 100, 101, 99, 100)]
+        r = lab.simulate(bars, [{"target": 1}, {"target": 1, "take": 100.5}, {"target": 1}, {"target": 1}], costs, "1m")
+        self.assertEqual((r.log[0].reason, r.log[0].exit), ("target", 100.5))
+        both = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 100, 100.6, 98.0, 99.0), bar(3, 99, 100, 98, 99)]
+        r = lab.simulate(both, [{"target": 1}, {"target": 1, "take": 100.5, "stop": 99.0}, {"target": 1}, {"target": 1}], costs, "1m")
+        self.assertEqual(r.log[0].reason, "stop")  # stop and target in one candle: the stop is assumed first
+        gap = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 102, 103, 101.5, 102), bar(3, 102, 103, 101, 102)]
+        r = lab.simulate(gap, [{"target": 1}, {"target": 1, "take": 100.5}, {"target": 1}, {"target": 1}], costs, "1m")
+        self.assertEqual(r.log[0].exit, 102.0)  # a gap beyond the target fills at the open
+
+    def test_scalping_a_random_walk_wins_often_and_loses_money(self):
+        bars = synthetic("RW", n=6000, seed=17, drift=0.0, vol=0.002)
+        r = lab.evaluate("scalp", bars, {"target_pct": 0.003, "stop_pct": 0.03}, lab.Costs(fee=0.001, spread_bps=1.0), "1m")
+        self.assertGreater(r.trades, 50)
+        self.assertGreater(r.wins / r.trades, 0.75)  # the seductive part
+        self.assertLess(r.profit_factor, 1.0)  # the arithmetic
+        decisions = lab.scalp_rule(bars, {**lab.RULES["scalp"]["defaults"], "dip": 2})
+        self.assertEqual(len(decisions), len(bars))
+        self.assertTrue(any(d.get("take") for d in decisions))
+
+
 class BenchmarkAndDataTests(unittest.TestCase):
     def test_buy_and_hold_benchmark_and_ranges(self):
         markets = {"AUSDT": [bar(i, 100 + i, 101 + i, 99 + i, 100 + i) for i in range(10)], "BUSDT": [bar(i, 100 - i, 101 - i, 99 - i, 100 - i) for i in range(10)]}

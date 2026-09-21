@@ -250,6 +250,28 @@ def funding_carry_rule(bars: list[Bar], params: dict, extras: dict | None = None
     return out
 
 
+@rule("scalp", {"target_pct": 0.003, "stop_pct": 0.03, "max_bars": 0, "dip": 0},
+      "the 'exit at a tiny profit' idea: buy whenever flat (or after `dip` falling candles), take profit at target_pct, stop at stop_pct (0 = none), give up after max_bars (0 = never)",
+      hint="spot, short candles; watch the win rate against the profit factor")
+def scalp_rule(bars: list[Bar], params: dict, extras: dict | None = None) -> list[dict]:
+    target, stop, max_bars, dip = params["target_pct"], params["stop_pct"], int(params["max_bars"]), int(params["dip"])
+    out, holding, entry_px, held = [], False, 0.0, 0
+    for i, b in enumerate(bars):
+        if holding:
+            held += 1
+            if b.high >= entry_px * (1 + target) or (stop > 0 and b.low <= entry_px * (1 - stop)) or (max_bars and held >= max_bars):
+                holding = False
+        if not holding and i > 0:
+            falling = all(bars[j].close < bars[j - 1].close for j in range(max(1, i - dip + 1), i + 1)) if dip else True
+            if falling:
+                holding, entry_px, held = True, b.close, 0  # the fill is the next open; the target and stop are set from the decision price
+        if holding:
+            out.append({"target": 1, "stop": entry_px * (1 - stop) if stop > 0 else None, "reverse": False, "take": entry_px * (1 + target)})
+        else:
+            out.append(_flat())
+    return out
+
+
 @rule("xs_momentum", {"lookback": 30, "skip": 1, "hold": 7, "top": 0.2, "stop_pct": 0.25},
       "cross-sectional momentum: every `hold` candles rank the universe by trailing return, long the top fraction, short the bottom, market neutral",
       portfolio=True, hint="daily candles over a universe, e.g. --symbols top:30")
@@ -356,6 +378,12 @@ def simulate(bars: list[Bar], decisions: list[dict], costs: Costs, interval: str
                 close_at(level, i, "stop")
                 if d.get("reverse"):
                     open_at(level, i, -side, weight)
+        take = d.get("take")
+        if pos and take is not None:  # a resting take-profit: the stop was checked first, the conservative order when both are touched
+            hit = bar.high >= take if pos["side"] == 1 else bar.low <= take
+            if hit:
+                gapped = bar.open > take if pos["side"] == 1 else bar.open < take
+                close_at(bar.open if gapped else take, i, "target")
         mark = equity
         if pos and pos["entry_i"] >= start:
             mark = max(0.0, equity * (1 + size * pos["weight"] * pos["side"] * (bar.close / pos["entry"] - 1)))

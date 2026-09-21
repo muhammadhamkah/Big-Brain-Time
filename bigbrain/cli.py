@@ -505,7 +505,9 @@ def cmd_lab(args: argparse.Namespace) -> int:
     from bigbrain import lab
 
     if args.rule not in lab.RULES:
-        print(f"unknown rule '{args.rule}'; rules: " + ", ".join(f"{k} ({v['doc']})" for k, v in lab.RULES.items()), file=sys.stderr)
+        print(f"unknown rule '{args.rule}'; rules:", file=sys.stderr)
+        for k, v in lab.RULES.items():
+            print(f"  {k:14} {v['doc']}" + (f" [{v['hint']}]" if v["hint"] else ""), file=sys.stderr)
         return 2
     spec = lab.RULES[args.rule]
     try:
@@ -513,23 +515,38 @@ def cmd_lab(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    market = args.market or ("perps" if "funding" in spec["needs"] else "spot")
+    if "funding" in spec["needs"] and market != "perps":
+        print(f"the {args.rule} rule needs funding rates, which only perps have; add --market perps", file=sys.stderr)
+        return 2
+    fee = args.fee if args.fee is not None else (0.0005 if market == "perps" else 0.001)
     costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
     brain = open_brain(args.db)
     cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
-    print(f"fetching {args.days} days of {args.symbol} {args.interval} candles from Binance {args.market} ...", flush=True)
     try:
-        bars = lab.fetch_history(args.symbol, args.interval, args.days, args.market, cache_dir=cache)
+        symbols = lab.resolve_symbols(args.symbols or args.symbol, market)
     except Exception as exc:
-        print(f"could not fetch candles: {exc}", file=sys.stderr)
+        print(f"could not resolve the universe: {exc}", file=sys.stderr)
         return 1
+    if spec["portfolio"] and len(symbols) < 4:
+        print(f"the {args.rule} rule ranks a universe; give it at least four symbols, e.g. --symbols top:30", file=sys.stderr)
+        return 2
+    print(f"fetching {args.days} days of {args.interval} candles for {len(symbols)} symbol{'s' if len(symbols) != 1 else ''} from Binance {market}"
+          + (" with funding history" if "funding" in spec["needs"] else "") + " ...", flush=True)
+    markets, extras = lab.fetch_universe(symbols, args.interval, args.days, market, cache_dir=cache, workers=args.workers, funding="funding" in spec["needs"], log=print)
+    if not markets:
+        print("no candles fetched", file=sys.stderr)
+        return 1
+    data = markets[symbols[0]] if len(markets) == 1 else markets
     n = len(lab.grid_points(grid))
-    print(f"{len(bars)} candles; testing {n} parameter setting{'s' if n != 1 else ''} with {args.workers} workers, then a {args.folds}-window walk-forward ...", flush=True)
-    report = lab.run(args.rule, bars, grid, costs, args.interval, folds=args.folds, workers=args.workers)
-    print(lab.format_report(report, args.symbol, args.interval, top=args.top))
+    print(f"{sum(len(b) for b in markets.values())} candles across {len(markets)} symbols; testing {n} parameter setting{'s' if n != 1 else ''} "
+          f"with {args.workers} workers, then a {args.folds}-window walk-forward ...", flush=True)
+    report = lab.run(args.rule, data, grid, costs, args.interval, folds=args.folds, workers=args.workers, extras=extras)
+    label = symbols[0] if len(markets) == 1 else f"{len(markets)} pairs"
+    print(lab.format_report(report, label, args.interval, top=args.top))
     if not args.no_learn:
-        title = lab.learn_result(brain, report, args.symbol, args.interval, args.days)
-        print(f"\nthe brain remembers this as '{title}'; ask it with: bigbrain ask \"does {args.rule} work on {args.symbol} {args.interval}\"")
+        title = lab.learn_result(brain, report, label, args.interval, args.days)
+        print(f"\nthe brain remembers this as '{title}'")
     return 0
 
 
@@ -753,11 +770,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_beliefs)
 
     p = sub.add_parser("lab", help="test a trading rule honestly: parameter grid with plateau score, real costs, walk-forward, verdict")
-    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion (default psar)")
+    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum (default psar)")
     p.add_argument("--symbol", default="BTCUSDT")
+    p.add_argument("--symbols", default="", help="a universe: 'BTCUSDT,ETHUSDT,...' or 'top:30' (by 24h volume); trades are pooled and judged on the same dates")
     p.add_argument("--interval", default="15m")
     p.add_argument("--days", type=int, default=90)
-    p.add_argument("--market", default="spot", choices=("spot", "perps"))
+    p.add_argument("--market", default=None, choices=("spot", "perps"), help="default spot, or perps for rules that need funding")
     p.add_argument("--grid", default="", help='parameter grid, e.g. "start=0.01,0.02,0.04;increment=0.01,0.02,0.04;maximum=0.1,0.2,0.4"; missing parameters keep defaults')
     p.add_argument("--fee", type=float, default=None, help="fee per side as a fraction (default: 0.1%% spot, 0.05%% perps; use 0 for a spread-only FX broker)")
     p.add_argument("--spread-bps", type=float, default=1.0, help="full bid-ask spread in basis points, half paid per fill (default 1; EURUSD at 0.4 pip is about 0.35)")

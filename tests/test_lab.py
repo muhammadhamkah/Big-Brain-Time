@@ -78,7 +78,9 @@ class RuleTests(unittest.TestCase):
     def test_other_rules_produce_one_decision_per_candle(self):
         bars = synthetic("X", n=300, seed=3)
         for name, spec in lab.RULES.items():
-            d = spec["fn"](bars, spec["defaults"])
+            if spec["portfolio"]:
+                continue
+            d = spec["fn"](bars, spec["defaults"], {"interval": "15m"})
             self.assertEqual(len(d), len(bars), name)
             self.assertTrue(all(x["target"] in (-1, 0, 1) for x in d), name)
 
@@ -115,7 +117,7 @@ class WalkForwardTests(unittest.TestCase):
         # An honest walk-forward must pick knob=2 for the final window (it cannot see that window) and lose there.
         n = 600
 
-        def knob_rule(bars, params):
+        def knob_rule(bars, params, extras=None):
             k = int(params["knob"])
             out = []
             for i in range(len(bars)):
@@ -124,7 +126,7 @@ class WalkForwardTests(unittest.TestCase):
                 out.append({"target": (1 if right else -1) if i % 2 == 0 else 0, "stop": None, "reverse": False})  # a fresh trade every other candle
             return out
 
-        lab.RULES["knob_test"] = {"fn": knob_rule, "defaults": {"knob": 1}, "doc": "test"}
+        lab.RULES["knob_test"] = {"fn": knob_rule, "defaults": {"knob": 1}, "doc": "test", "portfolio": False, "needs": (), "hint": ""}
         try:
             bars = [bar(i, 100 + i * 0.1, 100.2 + i * 0.1, 99.9 + i * 0.1, 100.1 + i * 0.1) for i in range(n)]  # steadily rising
             grid = {"knob": [1, 2]}
@@ -166,6 +168,107 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("out-of-sample profit factor", cells[0].content)
         lab.learn_result(brain, report, "RWUSDT", "1m", 2)  # rewritten, not duplicated
         self.assertEqual(len([c for c in brain.cells(kind="lesson") if c.title == title]), 1)
+
+
+class HypothesisTests(unittest.TestCase):
+    """The rules built for the brain's own research programme."""
+
+    def test_playbook_rule_manages_a_signal_like_the_trader(self):
+        from tests.test_trader import stamped
+        bars = stamped(synthetic("X", n=900, seed=21, vol=0.02))
+        for b in bars:
+            b.quote_volume = b.volume * b.close
+        decisions = lab.playbook_rule(bars, {**lab.RULES["playbook"]["defaults"], "signal": "rsi_oversold"})
+        self.assertEqual(len(decisions), len(bars))
+        held = [d for d in decisions if d["target"]]
+        self.assertTrue(held, "the synthetic series should trigger RSI oversold at least once")
+        self.assertTrue(all(d["target"] == 1 and d["stop"] is not None for d in held))  # long only, always with a stop
+        shorts = lab.playbook_rule(bars, {**lab.RULES["playbook"]["defaults"], "signal": "macd_bearish", "max_bars": 48})
+        self.assertTrue(any(d["target"] == -1 for d in shorts))
+        # a position never outlives max_bars
+        run = 0
+        for d in decisions:
+            run = run + 1 if d["target"] else 0
+            self.assertLessEqual(run, 16 + 1)
+        r = lab.evaluate("playbook", bars, {"signal": "rsi_oversold"}, lab.Costs(), "15m")
+        self.assertGreater(r.trades, 0)
+        self.assertEqual(lab.parse_grid("signal=*", lab.RULES["playbook"]["defaults"])["signal"], list(lab.PLAYBOOK_SIGNALS))
+
+    def test_trend_with_volatility_targeting_sizes_by_volatility(self):
+        calm = [bar(i, 100 + i * 0.05, 100.3 + i * 0.05, 99.9 + i * 0.05, 100.1 + i * 0.05) for i in range(200)]
+        d = lab.trend_vt_rule(calm, lab.RULES["trend_vt"]["defaults"], {"interval": "1d"})
+        self.assertEqual(d[-1]["target"], 1)
+        self.assertLessEqual(d[-1]["weight"], 1.0)
+        wild = synthetic("W", n=200, seed=9, vol=0.08)
+        dw = lab.trend_vt_rule(wild, lab.RULES["trend_vt"]["defaults"], {"interval": "1d"})
+        weights = [x["weight"] for x in dw if x["target"]]
+        self.assertTrue(weights and max(weights) < 0.5)  # 8% daily volatility is far above a 40% annual target: the position shrinks
+        # weights scale the account, not the trade's own return
+        bars = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 110, 111, 109, 110), bar(3, 110, 111, 109, 110)]
+        r = lab.simulate(bars, [{"target": 1, "weight": 0.25}, {"target": 0}, {"target": 0}, {"target": 0}], lab.Costs(fee=0, spread_bps=0), "1d")
+        self.assertAlmostEqual(r.log[0].ret, 0.10)
+        self.assertAlmostEqual(r.net_return, 0.025)
+
+    def test_funding_is_paid_and_the_carry_rule_collects_it(self):
+        costs = lab.Costs(fee=0.0, spread_bps=0.0)
+        bars = [bar(i, 100, 100.5, 99.5, 100) for i in range(6)]
+        funding = {"D0002": 0.001, "D0004": 0.001}  # 10bp paid at two candles' opens
+        r = lab.simulate(bars, [{"target": 1}] * 6, costs, "4h", funding=funding)  # a long held throughout pays both
+        self.assertAlmostEqual(r.log[0].ret, -0.002)
+        self.assertAlmostEqual(r.log[0].funding, 0.002)
+        r = lab.simulate(bars, [{"target": -1}] * 6, costs, "4h", funding=funding)  # a short receives them
+        self.assertAlmostEqual(r.log[0].ret, +0.002)
+        # the carry rule shorts when annualized funding runs hot, and stands down when it normalizes
+        hot = {f"D{i:04d}": 0.0005 for i in range(0, 12)}  # 5bp per 8h = 55% a year
+        cold = {f"D{i:04d}": 0.00002 for i in range(12, 24)}
+        bars = [bar(i, 100, 100.5, 99.5, 100) for i in range(24)]
+        d = lab.funding_carry_rule(bars, lab.RULES["funding_carry"]["defaults"], {"funding": {**hot, **cold}})
+        self.assertEqual(d[5]["target"], -1)
+        self.assertEqual(d[-1]["target"], 0)
+        self.assertIsNotNone(d[5]["stop"])
+        self.assertGreater(d[5]["stop"], 100)  # a short's stop sits above
+
+    def test_cross_sectional_momentum_is_market_neutral_and_pooled(self):
+        markets = {}
+        for j in range(10):  # ten symbols with different drifts: the ranking must find the strongest and weakest
+            drift = (j - 4.5) * 0.004
+            markets[f"S{j}USDT"] = [bar(i, 100 * (1 + drift) ** i, 100 * (1 + drift) ** i * 1.001, 100 * (1 + drift) ** i * 0.999, 100 * (1 + drift) ** (i + 1)) for i in range(120)]
+        for bars in markets.values():
+            for i, b in enumerate(bars):
+                b.date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d} 00:00"
+        params = {"lookback": 30, "skip": 1, "hold": 7, "top": 0.2}
+        by_date = lab.xs_momentum_rule(markets, params, {})
+        last = markets["S9USDT"][-1].date
+        longs = [s for s in markets if by_date[s][last]["target"] == 1]
+        shorts = [s for s in markets if by_date[s][last]["target"] == -1]
+        self.assertEqual((sorted(longs), sorted(shorts)), (["S8USDT", "S9USDT"], ["S0USDT", "S1USDT"]))
+        self.assertAlmostEqual(sum(by_date[s][last].get("weight", 0) for s in longs + shorts), 1.0)
+        r = lab.evaluate("xs_momentum", markets, params, lab.Costs(fee=0.0005, spread_bps=2.0), "1d")
+        self.assertEqual(r.symbols, 10)
+        self.assertGreaterEqual(r.trades, 4)  # constant drifts never change the ranking, so the four legs are held to the end
+        self.assertGreater(r.net_return, 0)  # persistent drifts are what momentum is built for
+        self.assertTrue(all(t.symbol for t in r.log))
+
+    def test_a_universe_is_walked_forward_by_date(self):
+        markets = {}
+        for j in range(4):
+            bars = synthetic(f"S{j}", n=400, seed=30 + j, vol=0.02)
+            for i, b in enumerate(bars):
+                b.date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d} {j:02d}:00"  # symbols close at different minutes; windows are still cut by date
+            markets[f"S{j}USDT"] = bars
+        grid = lab.parse_grid("fast=5,10;slow=30,60", lab.RULES["sma_cross"]["defaults"])
+        wf = lab.walk_forward("sma_cross", markets, grid, lab.Costs(), "1d", folds=4, workers=2)
+        self.assertEqual(len(wf["steps"]), 3)
+        for step in wf["steps"]:
+            for t in step["out_of_sample"] and wf["oos_trades"]:
+                self.assertGreaterEqual(t.date, wf["steps"][0]["train_to"])  # never a trade from before the first boundary
+        boundaries = [s["train_to"] for s in wf["steps"]]
+        self.assertEqual(boundaries, sorted(boundaries))
+        pooled = lab.summarize_pool(wf["oos_trades"], 4)
+        self.assertEqual(pooled.trades, wf["out_of_sample"]["trades"])
+        report = lab.run("sma_cross", markets, grid, lab.Costs(), "1d", folds=4, workers=2)
+        self.assertEqual(len(report["symbols"]), 4)
+        self.assertIn("4 pairs", lab.format_report(report, "4 pairs", "1d"))
 
 
 if __name__ == "__main__":

@@ -138,7 +138,17 @@ bigbrain lab --rule psar --symbol EURUSDT --interval 1m --days 30 --fee 0 --spre
 * **Walk-forward.** The candles are cut into windows; for each window the parameters are chosen on everything before it and judged on it alone. The stitched out-of-sample record, with its profit factor and how many standard errors its mean trade sits from zero, is the only number that says anything about next week.
 * **A verdict the brain keeps.** "no edge", "noise", or "worth a look" becomes a lesson cell, so `bigbrain ask "does parabolic SAR work on 1m EURUSD"` answers from evidence.
 
-Rules are small functions of past candles and parameters (`bigbrain/lab.py`): parabolic SAR stop-and-reverse, moving-average crossover, RSI mean reversion. Adding one is adding a function. The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it.
+Rules are small functions of past candles and parameters (`bigbrain/lab.py`). Adding one is adding a function. The lab runs on one market or a whole universe (`--symbols top:30` pools the trades and cuts the walk-forward by date, so every symbol is judged on the same days), and on perps it pays or receives funding at the real historical rate. The rules it ships with:
+
+| rule | what it tests | run it on |
+|---|---|---|
+| `playbook` | the live trader's own eight signals, managed exactly as the trader manages them (`--grid "signal=*"`) | 15m, 4h and 1d, a universe |
+| `trend_vt` | daily trend with volatility targeting: the boring edge | 1d, the majors |
+| `funding_carry` | shorting when the crowd pays to be long, and the reverse, collecting funding | 4h perps, a universe |
+| `xs_momentum` | cross-sectional momentum: long the strongest of the universe, short the weakest, market neutral | 1d, a universe |
+| `psar`, `sma_cross`, `rsi_reversion` | the textbook indicators, for calibration | anything |
+
+The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it. What it can do is reject nineteen ideas in twenty cheaply, so the live book only ever trades the twentieth.
 
 ### Running for months
 

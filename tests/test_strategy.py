@@ -138,5 +138,23 @@ class MarkTests(unittest.TestCase):
         self.assertGreater(t.wallet.equity(), 1000.0 - 1.0)  # only fees and impact are gone
 
 
+class DashboardTests(unittest.TestCase):
+    def test_dashboard_shows_the_book_against_its_control(self):
+        from bigbrain import dashboard
+        brain = Brain()
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        series = daily(symbols, seed=400)
+        t = StrategyTrader(brain, book="db", rule="trend_vt", symbols=symbols, interval="1d", wallet=1000.0, market="perps",
+                           grid={"sma": [30], "vol_window": [20], "target_vol": [0.15], "short": [1]}, fetch_funding=lambda: {})
+        for end in range(260, 300):
+            t.tick(market=market_at(series, end), universe=universe(symbols))
+        base = brain.get_state("strategy:db")["hold_base"]
+        text = dashboard.render(brain, "db", prices={s: base[s] * 1.10 for s in symbols}, width=160, height=50)
+        self.assertIn("STRATEGY", text)
+        self.assertIn("trend_vt with sma=30", text)
+        self.assertIn("+10.00%", text)  # the control at live prices
+        self.assertIn("gap", text)
+
+
 if __name__ == "__main__":
     unittest.main()

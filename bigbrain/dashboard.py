@@ -110,6 +110,24 @@ def render(brain: Brain, book: str, prices: dict[str, float] | None = None, widt
         lines.append(f"{DIM}equity{RESET} {sparkline(curve + [equity], min(width - 12, 100))}")
     lines.append("")
 
+    # strategy book: the rule, its parameters, and the book against its buy-and-hold control at live prices
+    cfg = brain.get_state(f"strategy:{book}")
+    if cfg:
+        from bigbrain.lab import describe_params
+        from bigbrain.trader import _shift
+
+        base = cfg.get("hold_base") or {}
+        marks = {s: prices.get(s) or (cfg.get("closes") or {}).get(s) for s in base}
+        pairs = [(marks[s], base[s]) for s in base if marks.get(s) and base[s]]
+        control = sum(m / b for m, b in pairs) / len(pairs) - 1 if pairs else 0.0
+        book_ret = equity / start - 1
+        gap = book_ret - control
+        nxt = _shift(cfg.get("last_refit", ""), cfg.get("refit_days", 30) * 86400)[:10] if cfg.get("last_refit") else "at next tick"
+        lines.append(f"{BOLD}STRATEGY{RESET}  {cfg['rule']} with {describe_params(cfg.get('params') or {}) or 'default parameters'}   {DIM}re-chosen {cfg.get('last_refit', '-')[:10] or '-'}, next {nxt}{RESET}")
+        lines.append(f"  book {colour(book_ret, f'{book_ret:+.2%}')}   control (holding the same {len(pairs)} coins since {cfg.get('hold_start', '-')[:16]}) {colour(control, f'{control:+.2%}')}   "
+                     f"gap {colour(gap, f'{gap:+.2%}')}  {DIM}the gap over months is the only number that matters{RESET}")
+        lines.append("")
+
     # open positions
     lines.append(f"{BOLD}OPEN POSITIONS{RESET}  {DIM}side symbol signal entry -> live mark, unrealized at live, bars held, stop{RESET}")
     positions.sort(key=lambda p: -abs(p.get("side", 1) * p["qty"] * ((p["mark"] or p["entry_price"]) - p["entry_price"])))

@@ -125,6 +125,21 @@ Run it in a terminal you leave open, or with `--once` from cron every 15 minutes
 
 `bigbrain portfolio` shows the book; `bigbrain beliefs` shows the table that drives its decisions, with days of evidence and standard errors, plus the exit policies and their change log; `bigbrain ask "why did you lose on SOLUSDT"` recalls the post-mortems. Separate books (`--book`) keep separate wallets and beliefs. No real orders are ever sent.
 
+### The lab: testing a rule before anyone pays for it
+
+`bigbrain lab` runs a trading rule over months of candles with the live trader's honesty (decisions after the close, fills at the next open, stops and stop-and-reverse orders filled at their level or the open on a gap, fee plus half the spread plus slippage on every fill) and then does what a backtest screenshot never does:
+
+```bash
+bigbrain lab --rule psar --symbol EURUSDT --interval 1m --days 30 --fee 0 --spread-bps 0.35 \
+             --grid "start=0.01,0.02,0.04;increment=0.01,0.02,0.04;maximum=0.1,0.2,0.4"
+```
+
+* **Grid with a plateau score.** Every parameter setting is scored by its own profit factor or its neighbours' average, whichever is lower. A real edge is a region where nearby settings all work; a lone spike is a fit to one stretch of noise.
+* **Walk-forward.** The candles are cut into windows; for each window the parameters are chosen on everything before it and judged on it alone. The stitched out-of-sample record, with its profit factor and how many standard errors its mean trade sits from zero, is the only number that says anything about next week.
+* **A verdict the brain keeps.** "no edge", "noise", or "worth a look" becomes a lesson cell, so `bigbrain ask "does parabolic SAR work on 1m EURUSD"` answers from evidence.
+
+Rules are small functions of past candles and parameters (`bigbrain/lab.py`): parabolic SAR stop-and-reverse, moving-average crossover, RSI mean reversion. Adding one is adding a function. The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it.
+
 ### Running for months
 
 The trader only manages positions while it runs, so a long run needs a process that survives closed terminals and restarts. On a Mac:
@@ -184,6 +199,7 @@ bigbrain/
   dashboard.py        live terminal dashboard: equity, positions at live prices, beliefs, trades, feed
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
+  lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

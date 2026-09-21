@@ -501,6 +501,38 @@ def cmd_beliefs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lab(args: argparse.Namespace) -> int:
+    from bigbrain import lab
+
+    if args.rule not in lab.RULES:
+        print(f"unknown rule '{args.rule}'; rules: " + ", ".join(f"{k} ({v['doc']})" for k, v in lab.RULES.items()), file=sys.stderr)
+        return 2
+    spec = lab.RULES[args.rule]
+    try:
+        grid = lab.parse_grid(args.grid or "", spec["defaults"])
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    brain = open_brain(args.db)
+    cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
+    print(f"fetching {args.days} days of {args.symbol} {args.interval} candles from Binance {args.market} ...", flush=True)
+    try:
+        bars = lab.fetch_history(args.symbol, args.interval, args.days, args.market, cache_dir=cache)
+    except Exception as exc:
+        print(f"could not fetch candles: {exc}", file=sys.stderr)
+        return 1
+    n = len(lab.grid_points(grid))
+    print(f"{len(bars)} candles; testing {n} parameter setting{'s' if n != 1 else ''} with {args.workers} workers, then a {args.folds}-window walk-forward ...", flush=True)
+    report = lab.run(args.rule, bars, grid, costs, args.interval, folds=args.folds, workers=args.workers)
+    print(lab.format_report(report, args.symbol, args.interval, top=args.top))
+    if not args.no_learn:
+        title = lab.learn_result(brain, report, args.symbol, args.interval, args.days)
+        print(f"\nthe brain remembers this as '{title}'; ask it with: bigbrain ask \"does {args.rule} work on {args.symbol} {args.interval}\"")
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -719,6 +751,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("beliefs", help="what the brain believes about each signal in each context, from its own trades")
     p.add_argument("--book", default="main")
     p.set_defaults(func=cmd_beliefs)
+
+    p = sub.add_parser("lab", help="test a trading rule honestly: parameter grid with plateau score, real costs, walk-forward, verdict")
+    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion (default psar)")
+    p.add_argument("--symbol", default="BTCUSDT")
+    p.add_argument("--interval", default="15m")
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--market", default="spot", choices=("spot", "perps"))
+    p.add_argument("--grid", default="", help='parameter grid, e.g. "start=0.01,0.02,0.04;increment=0.01,0.02,0.04;maximum=0.1,0.2,0.4"; missing parameters keep defaults')
+    p.add_argument("--fee", type=float, default=None, help="fee per side as a fraction (default: 0.1%% spot, 0.05%% perps; use 0 for a spread-only FX broker)")
+    p.add_argument("--spread-bps", type=float, default=1.0, help="full bid-ask spread in basis points, half paid per fill (default 1; EURUSD at 0.4 pip is about 0.35)")
+    p.add_argument("--slippage-bps", type=float, default=0.0, help="extra slippage per fill in basis points")
+    p.add_argument("--folds", type=int, default=6, help="walk-forward windows (default 6)")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--top", type=int, default=10, help="grid rows to print")
+    p.add_argument("--no-learn", action="store_true", help="do not write the verdict into the brain")
+    p.set_defaults(func=cmd_lab)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

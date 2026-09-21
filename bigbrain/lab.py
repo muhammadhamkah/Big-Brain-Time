@@ -541,7 +541,11 @@ def walk_forward(rule_name: str, data, grid: dict[str, list], costs: Costs, inte
                       "in_sample": best.as_dict(), "out_of_sample": test.as_dict()})
         oos_trades += test.log
     stitched = summarize_pool(oos_trades, len(markets))
-    years = max((_ms(dates[-1]) - _ms(dates[window])) / (365.25 * 86400 * 1000), 1e-9)
+    try:
+        span_s = (_ms(dates[-1]) - _ms(dates[window])) / 1000
+    except ValueError:  # synthetic candles without real timestamps: count them
+        span_s = (len(dates) - window) * INTERVAL_SECONDS[interval]
+    years = max(span_s / (365.25 * 86400), 1e-9)
     oos = {**stitched.as_dict(), "years": years, "tstat_ts": stitched.sharpe * math.sqrt(years)}  # time-series t: Sharpe x sqrt(years)
     return {"folds": folds, "steps": steps, "out_of_sample": oos, "oos_trades": oos_trades,
             "benchmark": buy_and_hold(markets, dates[window])}  # holding the universe over the same out-of-sample span

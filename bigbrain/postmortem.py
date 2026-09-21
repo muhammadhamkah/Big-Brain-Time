@@ -207,8 +207,8 @@ def narrative(t: Trade, findings: list[tuple[str, str]]) -> str:
     head = (
         f"{t.symbol} {'long' if t.side == 1 else 'short'} on {t.signal.replace('_', ' ')} entered {t.entry_time} UTC at {t.entry_price:.6g} and closed {t.exit_time} at {t.exit_price:.6g} "
         f"by {t.exit_reason} after {t.bars_held} bars: a {verdict} of {t.net_ret:+.2%} net ({t.gross_ret:+.2%} gross, {t.pnl:+.2f} USDT on {t.notional:.0f} notional). "
-        f"Context at entry: {ctx.get('regime', 'unknown')} regime, {ctx.get('vol_bucket', 'mid')} volatility ({ctx.get('vol20', 0):.0%} annualized), "
-        f"RSI {ctx.get('rsi', 0):.0f}, stop {ctx.get('risk_pct', 0):.2%} away. While open the trade reached {t.mfe:+.2%} at best and {t.mae:+.2%} at worst."
+        f"Context at entry: {ctx.get('regime', 'unknown')} regime, {ctx.get('vol_bucket', 'mid')} volatility ({(ctx.get('vol20') or 0):.0%} annualized), "
+        f"RSI {(ctx.get('rsi') or 0):.0f}, stop {(ctx.get('risk_pct') or 0):.2%} away. While open the trade reached {t.mfe:+.2%} at best and {t.mae:+.2%} at worst."
         + (f" Funding {'paid' if t.funding > 0 else 'received'}: {abs(t.funding):.2f} USDT." if t.funding else "")
     )
     why = " ".join(f"Finding ({tag.replace('_', ' ')}): {text}" for tag, text in findings)

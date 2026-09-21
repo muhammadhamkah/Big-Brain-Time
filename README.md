@@ -150,6 +150,17 @@ Rules are small functions of past candles and parameters (`bigbrain/lab.py`). Ad
 
 The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it. What it can do is reject nineteen ideas in twenty cheaply, so the live book only ever trades the twentieth.
 
+### Trading what survived: a strategy book
+
+`bigbrain strategy` trades a lab rule live in its own book, with everything the playbook trader has (fills at live quotes or the next open, real funding, fees and slippage, atomic bookkeeping, the dashboard) and none of its learning: the rule decides, the book executes. Parameters are re-chosen every 30 days on all the history the book can see, with the same selection the lab's walk-forward used, so what runs is what was tested. A buy-and-hold control of the same coins from the same start runs beside it and `bigbrain portfolio --book trend` shows both.
+
+```bash
+bigbrain strategy --rule trend_vt --symbols BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,LINKUSDT,SOLUSDT --target-vol 0.15 --wallet 1000
+scripts/macos-service.sh install strategy --rule trend_vt --target-vol 0.15     # the same, as the background service
+```
+
+This is the one rule that survived the lab: daily trend following on the majors, sized to a volatility target. Expect a few decisions a month per coin, long flat stretches, and returns that arrive in bursts. Two days shows the machinery; months show the performance.
+
 ### Running for months
 
 The trader only manages positions while it runs, so a long run needs a process that survives closed terminals and restarts. On a Mac:
@@ -210,6 +221,7 @@ bigbrain/
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
   lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
+  strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support
   sources.py          the brain's diet: builds fetch jobs from defaults + packs, runs them in parallel

@@ -100,7 +100,7 @@ PLAYBOOK = {
     "macd_bearish": {"side": -1, "stop_atr": 2.0, "max_bars": 48, "exit": "macd_bullish"},
 }
 
-_TRADER_CMD = re.compile(r"(^|[\s/])bigbrain(\.cli)?\s+trade(\s|$)")
+_TRADER_CMD = re.compile(r"(^|[\s/])bigbrain(\.cli)?\s+(trade|strategy)(\s|$)")
 
 
 def _now() -> str:
@@ -392,6 +392,7 @@ class Trader:
             except Exception:
                 quotes = {}
         self.quotes, self.live = (quotes or {}), live
+        self._before_symbols(market)
         events: list[dict] = []
         for symbol in symbols:
             bars = market.get(symbol)
@@ -413,6 +414,9 @@ class Trader:
         self._upkeep()
         return {"events": events, "equity": self.wallet.equity(), "cash": self.wallet.cash, "open": len(self.wallet.positions),
                 "pending": len(self.wallet.pending), "symbols": len(symbols)}
+
+    def _before_symbols(self, market: dict[str, list[Bar]]) -> None:
+        """Hook: called once per tick after inputs are set, before any symbol is processed."""
 
     PRUNE_AFTER_DAYS = 60
 
@@ -617,7 +621,7 @@ class Trader:
         pos = Position(
             symbol=symbol, signal=signal, entry_time=entry_time, entry_price=fill, qty=qty, notional=notional,
             stop=fill * (1 - side * stop_pct), max_bars=order["max_bars"], exit_rule=order["exit_rule"],
-            context={**order["ctx"], "risk_pct": stop_pct, "p_win_believed": order["p_win"], "samples": order["samples"], "market": self.market,
+            context={**order["ctx"], "risk_pct": order.get("risk_pct", stop_pct), "p_win_believed": order["p_win"], "samples": order["samples"], "market": self.market,
                      "exit_variant": variant, "signal_close": order["signal_close"], "decided": order["placed"], "fill_basis": basis},
             explore=order["explore"], mark=price, entry_fee=fee, entry_slip=notional * slip, side=side, last_funding_hour=last_funding_hour, margin=margin,
             exit_variant=variant, exit_best=est.best, exit_target=est.target, entered_at_open=entered_at_open, fill_basis=basis, rule_track=track,
@@ -732,7 +736,8 @@ class Trader:
         except (ValueError, IndexError):
             return None, ""
         if hour in FUNDING_HOURS and minute == 0:
-            return self.funding.get(symbol, {}).get("rate", 0.0), hour_key
+            per_candle = 3 if self.interval == "1d" else 1  # a daily candle spans all three payments
+            return self.funding.get(symbol, {}).get("rate", 0.0) * per_candle, hour_key
         return None, hour_key
 
     @staticmethod
@@ -753,7 +758,7 @@ class Trader:
             return "death_cross" in fired
         if rule == "macd_bearish":
             return "macd_bearish" in fired
-        return False
+        return False  # "never": a strategy book decides its own exits
 
     def _close(self, pos: Position, bar: Bar, price: float, reason: str, volume_24h: float, candle_qv: float, basis: str = "resting") -> dict:
         """Close a position at ``price`` (a quote, a resting order's level, or a candle open) and learn from it.

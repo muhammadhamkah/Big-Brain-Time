@@ -437,6 +437,14 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         return 0
     t = Trader(brain, book=args.book)
     r = t.report()
+    cfg = brain.get_state(f"strategy:{args.book}")
+    if cfg:
+        from bigbrain.strategy import StrategyTrader
+
+        t = StrategyTrader(brain, book=args.book, rule=cfg["rule"], symbols=cfg["symbols"], grid=cfg.get("grid"), refit_days=cfg.get("refit_days", 30))
+        r = t.report()
+        bench = r["benchmark"]
+        print(f"strategy {r['rule']} with {lab_params(r['params'])} (re-chosen {r['last_refit'] or 'never'}); control: holding the same {bench['symbols']} coins since {bench['since'] or '-'}: {bench['return']:+.2%}")
     mode = ", frozen baseline" if r["frozen"] else ""
     print(f"book {args.book} ({r['market']}{mode}): equity {r['equity']:.2f} USDT ({r['return']:+.2%} on {r['start']:.0f}), cash {r['cash']:.2f}, max drawdown {r['max_drawdown']:.1%}, closed trades {r['closed']}"
           + (f", {r['pending']} orders queued for the next open" if r["pending"] else "") + (f", {r['shadows']} shadows scoring exits" if r["shadows"] else ""))
@@ -457,6 +465,12 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         ):
             print(f"  {row['symbol']:12} {row['signal']:18} {row['entry_time']} -> {row['exit_time']} {row['exit_reason']:6} {row['net_ret']:+.2%} ({row['pnl']:+.2f})  {', '.join(json.loads(row['findings']))}")
     return 0
+
+
+def lab_params(p: dict | None) -> str:
+    from bigbrain.lab import describe_params
+
+    return describe_params(p) if p else "default parameters"
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -498,6 +512,44 @@ def cmd_beliefs(args: argparse.Namespace) -> int:
         print("\npolicy changes (every adoption and reversal, with the evidence at the time):")
         for e in log[-12:]:
             print(f"  {e['at']}  {e['signal']:18} {e['from']} -> {e['to']}  rule {e['rule_avg']:+.2%} vs {e['best_avg']:+.2%} over {e['trades']} trades")
+    return 0
+
+
+def cmd_strategy(args: argparse.Namespace) -> int:
+    from bigbrain import lab
+    from bigbrain.strategy import StrategyTrader
+
+    brain = open_brain(args.db)
+    if args.rule not in lab.RULES:
+        print(f"unknown rule '{args.rule}'; rules: {', '.join(lab.RULES)}", file=sys.stderr)
+        return 2
+    try:
+        grid = lab.parse_grid(args.grid or "", lab.RULES[args.rule]["defaults"])
+        symbols = lab.resolve_symbols(args.symbols, args.market)
+        t = StrategyTrader(brain, book=args.book, rule=args.rule, symbols=symbols, interval=args.interval, wallet=args.wallet, market=args.market,
+                           grid=grid, target_vol=args.target_vol, refit_days=args.refit_days)
+    except (ValueError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.reset:
+        r = t.reset(wallet=args.wallet)
+        t.hold_base, t.hold_start, t.params, t.last_refit = {}, "", None, ""
+        t._save_config()
+        print(f"Reset book '{args.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT; the control restarts with it.")
+    if not args.once:
+        print(f"Strategy book '{args.book}': {args.rule} on {len(symbols)} symbols ({', '.join(symbols[:6])}{', ...' if len(symbols) > 6 else ''}), {args.interval} candles, "
+              f"Binance {args.market}, wallet {t.wallet.start:.0f} USDT. Parameters re-chosen every {args.refit_days} days from {len(lab.grid_points(grid))} settings; "
+              f"a buy-and-hold control of the same coins runs beside it. No beliefs, no exit learning: the rule decides. Ctrl-C to stop.")
+    try:
+        t.run(once=args.once)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        t.release_lock()
+        print(f"\nstopped. {len(t.wallet.positions)} positions stay open in the book; run the same command again to manage them.")
+        sys.stdout.flush()
+        os._exit(0)
     return 0
 
 
@@ -778,6 +830,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("beliefs", help="what the brain believes about each signal in each context, from its own trades")
     p.add_argument("--book", default="main")
     p.set_defaults(func=cmd_beliefs)
+
+    p = sub.add_parser("strategy", help="trade a lab rule live in its own book: the rule decides, the trader executes, a buy-and-hold control runs beside it")
+    p.add_argument("--rule", default="trend_vt")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,LINKUSDT,SOLUSDT", help="a list, or top:N")
+    p.add_argument("--book", default="trend")
+    p.add_argument("--interval", default="1d")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"))
+    p.add_argument("--wallet", type=float, default=1000.0)
+    p.add_argument("--grid", default="sma=30,50,100,200;short=0,1", help="settings the monthly refit chooses from (the lab's selection rule)")
+    p.add_argument("--target-vol", type=float, default=0.15, help="annualized volatility target per coin (default 0.15)")
+    p.add_argument("--refit-days", type=int, default=30)
+    p.add_argument("--reset", action="store_true", help="close every position, restart the wallet and the control")
+    p.add_argument("--once", action="store_true")
+    p.set_defaults(func=cmd_strategy)
 
     p = sub.add_parser("lab", help="test a trading rule honestly: parameter grid with plateau score, real costs, walk-forward, verdict")
     p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum (default psar)")

@@ -22,6 +22,8 @@ case "$cmd" in
   install)
     [ -x "$PYTHON" ] || { echo "no virtualenv at $PROJECT/.venv; run: python3 -m venv .venv && source .venv/bin/activate && pip install -e ."; exit 1; }
     mkdir -p "$PROJECT/.brain" "$HOME/Library/LaunchAgents"
+    SUBCMD="trade"
+    case "${1:-}" in trade|strategy) SUBCMD="$1"; shift ;; esac
     ARGS=""
     for a in "$@"; do ARGS="$ARGS<string>$a</string>"; done
     cat > "$PLIST" <<PLIST
@@ -31,7 +33,7 @@ case "$cmd" in
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/caffeinate</string><string>-s</string>
-    <string>$PYTHON</string><string>-m</string><string>bigbrain.cli</string><string>trade</string>$ARGS
+    <string>$PYTHON</string><string>-m</string><string>bigbrain.cli</string><string>$SUBCMD</string>$ARGS
   </array>
   <key>WorkingDirectory</key><string>$PROJECT</string>
   <key>EnvironmentVariables</key><dict><key>PYTHONUNBUFFERED</key><string>1</string></dict>
@@ -88,7 +90,7 @@ PLIST
       echo "$LABEL is not installed"
     fi
     echo
-    echo "trader processes:"; ps -axo pid=,command= | grep -E "bigbrain(\.cli)? trade" | grep -v grep || echo "  none"
+    echo "trader processes:"; ps -axo pid=,command= | grep -E "bigbrain(\.cli)? (trade|strategy)" | grep -v grep || echo "  none"
     ;;
   restart)
     launchctl unload "$PLIST" 2>/dev/null || true

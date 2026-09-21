@@ -536,6 +536,10 @@ def cmd_strategy(args: argparse.Namespace) -> int:
         t.hold_base, t.hold_start, t.params, t.last_refit = {}, "", None, ""
         t._save_config()
         print(f"Reset book '{args.book}': closed {r['positions_closed']} positions, wallet back to {r['wallet']:.0f} USDT; the control restarts with it.")
+    if args.rebase_control:
+        t.hold_base, t.hold_start = {}, ""  # the next tick starts the control again at the prices the book can trade at now
+        t._save_config()
+        print("the buy-and-hold control restarts at the next tick, at current quotes; positions are untouched.")
     if not args.once:
         print(f"Strategy book '{args.book}': {args.rule} on {len(symbols)} symbols ({', '.join(symbols[:6])}{', ...' if len(symbols) > 6 else ''}), {args.interval} candles, "
               f"Binance {args.market}, wallet {t.wallet.start:.0f} USDT. Parameters re-chosen every {args.refit_days} days from {len(lab.grid_points(grid))} settings; "
@@ -842,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-vol", type=float, default=0.15, help="annualized volatility target per coin (default 0.15)")
     p.add_argument("--refit-days", type=int, default=30)
     p.add_argument("--reset", action="store_true", help="close every position, restart the wallet and the control")
+    p.add_argument("--rebase-control", action="store_true", help="restart only the buy-and-hold control at current quotes (positions untouched)")
     p.add_argument("--once", action="store_true")
     p.set_defaults(func=cmd_strategy)
 

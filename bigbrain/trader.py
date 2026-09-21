@@ -925,9 +925,14 @@ class Trader:
 
     # ---------------------------------------------------------------- marks
     def _mark_equity(self, market: dict[str, list[Bar]]) -> None:
+        """Mark open positions: at the live quote when one is fresh (a daily book would otherwise carry a
+        mark up to a day old), else at the last closed candle."""
         for raw in self.wallet.positions.values():
             bars = market.get(raw["symbol"])
-            if bars and len(bars) >= 2:
+            q = self._fresh_quote(raw["symbol"])
+            if q is not None:
+                raw["mark"] = (q["bid"] + q["ask"]) / 2
+            elif bars and len(bars) >= 2:
                 raw["mark"] = bars[-2].close
         eq = self.wallet.equity()
         if self.wallet.positions and eq < MAINTENANCE_MARGIN * self.wallet.gross_notional():

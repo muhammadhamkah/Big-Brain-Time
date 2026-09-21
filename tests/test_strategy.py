@@ -118,5 +118,25 @@ class StrategyBookTests(unittest.TestCase):
         self.assertEqual(t.wallet.pending, {})
 
 
+class MarkTests(unittest.TestCase):
+    def test_live_marks_and_the_control_use_the_quote_not_yesterdays_close(self):
+        import time
+        brain = Brain()
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        series = daily(symbols, seed=300)
+        t = StrategyTrader(brain, book="mk", rule="trend_vt", symbols=symbols, interval="1d", wallet=1000.0, market="perps",
+                           grid={"sma": [30], "vol_window": [20], "target_vol": [0.15], "short": [1]}, fetch_funding=lambda: {})
+        market = market_at(series, 300)
+        quotes = {s: {"bid": market[s][-2].close * 1.049, "ask": market[s][-2].close * 1.051, "at": time.time()} for s in symbols}  # a 5% rally since the close
+        t.tick(market=market, universe=universe(symbols), quotes=quotes, live=True)
+        self.assertTrue(t.wallet.positions)
+        for p in t.wallet.positions.values():
+            mid = (quotes[p["symbol"]]["bid"] + quotes[p["symbol"]]["ask"]) / 2
+            self.assertAlmostEqual(p["mark"], mid)  # not yesterday's close
+            self.assertLess(abs(p["side"] * (p["mark"] / p["entry_price"] - 1)), 0.002)  # entered at the quote, marked at the quote: no phantom loss
+        self.assertAlmostEqual(t.report()["benchmark"]["return"], 0.0)  # the control starts where the book could trade
+        self.assertGreater(t.wallet.equity(), 1000.0 - 1.0)  # only fees and impact are gone
+
+
 if __name__ == "__main__":
     unittest.main()

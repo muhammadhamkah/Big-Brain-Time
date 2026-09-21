@@ -63,10 +63,11 @@ class StrategyTrader(Trader):
         if not closed:
             return
         today = max(bars[-1].date for bars in closed.values())
-        for s, bars in closed.items():
-            self.closes[s] = bars[-1].close
-        if not self.hold_base:  # the control starts when the book starts
-            self.hold_base, self.hold_start = {s: bars[-1].close for s, bars in closed.items()}, today
+        for s, bars in closed.items():  # the control is marked like the book: at the live quote when fresh, else the last close
+            q = self._fresh_quote(s)
+            self.closes[s] = (q["bid"] + q["ask"]) / 2 if q is not None else bars[-1].close
+        if not self.hold_base:  # the control starts when the book starts, at the same prices the book can trade at
+            self.hold_base, self.hold_start = dict(self.closes), today
         self._maybe_refit(closed, today)
         decs = lab.decisions_for(self.rule, closed, self.params or {}, {"interval": self.interval})
         self._decisions = {s: d[-1] for s, d in decs.items() if d}

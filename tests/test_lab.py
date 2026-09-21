@@ -146,6 +146,9 @@ class WalkForwardTests(unittest.TestCase):
         self.assertEqual(lab.verdict({"trades": 300, "profit_factor": 0.9, "tstat": -1.0})[0], "no edge")
         self.assertEqual(lab.verdict({"trades": 300, "profit_factor": 1.1, "tstat": 1.0})[0], "noise")
         self.assertEqual(lab.verdict({"trades": 300, "profit_factor": 1.6, "tstat": 3.0}, {"profit_factor": 2.0})[0], "worth a look")
+        # skewed returns: a weak per-trade t but a strong account path (Sharpe 1 over 5 years) also counts
+        self.assertEqual(lab.verdict({"trades": 600, "profit_factor": 1.4, "tstat": 1.2, "tstat_ts": 2.2})[0], "worth a look")
+        self.assertEqual(lab.verdict({"trades": 600, "profit_factor": 1.4, "tstat": 1.2, "tstat_ts": 1.5})[0], "noise")
 
 
 class EndToEndTests(unittest.TestCase):

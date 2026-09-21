@@ -541,7 +541,9 @@ def walk_forward(rule_name: str, data, grid: dict[str, list], costs: Costs, inte
                       "in_sample": best.as_dict(), "out_of_sample": test.as_dict()})
         oos_trades += test.log
     stitched = summarize_pool(oos_trades, len(markets))
-    return {"folds": folds, "steps": steps, "out_of_sample": stitched.as_dict(), "oos_trades": oos_trades,
+    years = max((_ms(dates[-1]) - _ms(dates[window])) / (365.25 * 86400 * 1000), 1e-9)
+    oos = {**stitched.as_dict(), "years": years, "tstat_ts": stitched.sharpe * math.sqrt(years)}  # time-series t: Sharpe x sqrt(years)
+    return {"folds": folds, "steps": steps, "out_of_sample": oos, "oos_trades": oos_trades,
             "benchmark": buy_and_hold(markets, dates[window])}  # holding the universe over the same out-of-sample span
 
 
@@ -562,19 +564,27 @@ def buy_and_hold(markets: Markets, start_date: str, end_date: str | None = None)
 
 # ---------------------------------------------------------------- verdict
 def verdict(oos: dict, best_is: dict | None = None) -> tuple[str, str]:
-    """(label, sentence) for a stitched out-of-sample record."""
+    """(label, sentence) for a stitched out-of-sample record.
+
+    Significance is judged two ways, because trade returns can be very skewed (trend following: a few huge
+    winners, many small losers) and the per-trade t-statistic then understates a real effect: the mean trade
+    against its standard error, and the Sharpe ratio times the square root of the years, which measures the
+    account's path instead. Either above two, with a profit factor of 1.3 or more, is worth a look."""
     n, pf, t = oos.get("trades", 0), oos.get("profit_factor", 0.0), oos.get("tstat", 0.0)
+    t_ts = oos.get("tstat_ts", 0.0)
     if n < 30:
         return "insufficient", f"only {n} out-of-sample trades: not enough to say anything."
     if pf < 1.0:
         return "no edge", f"out-of-sample profit factor {pf:.2f} over {n} trades: the rule loses money after costs."
-    if pf < 1.3 or t < 2.0:
-        return "noise", f"out-of-sample profit factor {pf:.2f} over {n} trades ({t:.1f} standard errors from zero): indistinguishable from luck."
+    if pf < 1.3 or max(t, t_ts) < 2.0:
+        return "noise", (f"out-of-sample profit factor {pf:.2f} over {n} trades ({t:.1f} standard errors from zero per trade, "
+                         f"{t_ts:.1f} on the account's path): indistinguishable from luck.")
     shrink = ""
     if best_is and best_is.get("profit_factor"):
         ratio = min(pf, 10.0) / min(best_is["profit_factor"], 10.0)
         shrink = f" It kept {ratio:.0%} of its in-sample profit factor out of sample."
-    return "worth a look", f"out-of-sample profit factor {pf:.2f} over {n} trades ({t:.1f} standard errors from zero).{shrink} Worth a paper-trade with a small size."
+    return "worth a look", (f"out-of-sample profit factor {pf:.2f} over {n} trades ({t:.1f} standard errors from zero per trade, "
+                            f"{t_ts:.1f} on the account's path).{shrink} Worth a paper-trade with a small size.")
 
 
 # ------------------------------------------------------------------- data
@@ -808,7 +818,8 @@ def format_report(report: dict, symbol: str, interval: str, top: int = 10) -> st
             i, o = s["in_sample"], s["out_of_sample"]
             lines.append(f"  {s['window']:6} {describe_params(s['params']):44} {min(i['profit_factor'], 99):6.2f} {i['trades']:5} {min(o['profit_factor'], 99):7.2f} {o['trades']:5} {o['expectancy']:+10.3%}  {s['test_to'][:10]}")
         o = wf["out_of_sample"]
-        lines.append(f"  stitched out-of-sample: PF {min(o['profit_factor'], 99):.2f}, expectancy {o['expectancy']:+.3%}/trade, {o['trades']} trades, net {o['net_return']:+.1%}, maxDD {o['max_drawdown']:.1%}, Sharpe {o['sharpe']:.2f}, {o['tstat']:.1f} standard errors from zero")
+        lines.append(f"  stitched out-of-sample: PF {min(o['profit_factor'], 99):.2f}, expectancy {o['expectancy']:+.3%}/trade, {o['trades']} trades, net {o['net_return']:+.1%}, maxDD {o['max_drawdown']:.1%}, "
+                     f"Sharpe {o['sharpe']:.2f} over {o.get('years', 0):.1f} years; standard errors from zero: {o['tstat']:.1f} per trade, {o.get('tstat_ts', 0):.1f} on the account's path")
         bh = wf.get("benchmark")
         if bh and bh["symbols"]:
             lines.append(f"  benchmark, just holding the universe over the same span: net {bh['net_return']:+.1%}, maxDD {bh['max_drawdown']:.1%}  (a long-only rule must beat this to be worth anything)")

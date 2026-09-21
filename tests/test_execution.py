@@ -406,6 +406,43 @@ class ThirdReviewTests(unittest.TestCase):
             self.assertEqual(t2.wallet.positions["QUEUSDT:rsi_oversold"]["model_version"], 2)
             brain.close()
 
+    def test_a_legacy_trade_misstamped_by_the_interim_release_is_retired(self):
+        """A version-2 position closed under 9308d5d was stamped 3 although it was opened under the old model.
+        Opening that database now must retire it with everything else from 3, not accept it as evidence."""
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.db")
+            brain = Brain(path)
+            brain.db.execute("UPDATE state SET value = '3' WHERE key = 'results_version'")  # 9308d5d had already upgraded it
+            brain.set_state("results_version_previous", 2)
+            for i in range(20):  # what 9308d5d retired but left on record
+                tr = trade("main", f"S{i}USDT", f"2026-08-{1 + i:02d} 00:00", 0.01, exit_time=f"2026-08-{1 + i:02d} 23:00")
+                pm.record(brain, tr, [], {})
+            brain.db.execute("UPDATE trades SET model_version = 2")
+            legacy = trade("main", "OLDUSDT", "2026-08-30 00:00", 0.02, exit_time="2026-09-01 04:00")  # opened under 2, closed by 9308d5d, stamped 3
+            pm.record(brain, legacy, [], {v: 0.02 for v in exits.VARIANTS}); pm.update_belief(brain, legacy)
+            exits.record(brain, "main", "rsi_oversold", {v: 0.02 for v in exits.VARIANTS})
+            brain.db.execute("UPDATE trades SET model_version = 3 WHERE symbol = 'OLDUSDT'")
+            stale_pos = {  # a position 9308d5d opened: no version stamp
+                "symbol": "P3USDT", "signal": "rsi_oversold", "entry_time": "2026-09-01 07:15", "entry_price": 100.05, "qty": 1.0, "notional": 100.05, "stop": 98.0,
+                "max_bars": 16, "exit_rule": "rsi_recovered", "context": {**CTX, "risk_pct": 0.02}, "explore": False, "side": 1, "margin": 33.35, "entry_fee": 0.05,
+                "path": [], "fund_path": [], "liq_path": [], "exit_variant": "rule", "mark": 100.0, "entry_slip": 0.05, "funding": 0.0, "last_funding_hour": "",
+            }
+            brain.set_state("trader:main", {"cash": 900.0, "start": 1000.0, "positions": {"P3USDT:rsi_oversold": stale_pos}, "last_bar": {}, "curve": [], "peak": 1000.0,
+                                            "max_drawdown": 0.0, "closed": 21, "log": [], "shadows": {}, "pending": {}, "market": "perps", "interval": "15m", "last_tick": ""})
+            brain.close()
+            brain = Brain(path)
+            self.assertEqual(brain.get_state("results_version"), brain.RESULTS_VERSION)
+            self.assertEqual(brain.get_state("results_version_previous"), 3)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            self.assertEqual(pm.belief(brain, "main", "rsi_oversold", "uptrend", "mid")["samples"], 0)
+            t = Trader(brain, book="main", market="perps", fetch_funding=lambda: {})
+            t.rebuild_stats()
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM exit_stats").fetchone()[0], 0)
+            self.assertEqual(brain.db.execute("SELECT COUNT(*) FROM beliefs").fetchone()[0], 0)
+            self.assertEqual(t.wallet.positions["P3USDT:rsi_oversold"]["model_version"], 3)  # finishes as a version-3 position: not evidence
+            brain.close()
+
     def test_the_upgrade_is_not_applied_when_the_snapshot_fails(self):
         import os, tempfile
         from bigbrain import backup

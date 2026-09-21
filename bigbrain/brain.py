@@ -235,9 +235,12 @@ class Brain:
         if self.db.in_transaction:
             self.db.commit()
 
-    RESULTS_VERSION = 3  # bump when execution or evaluation accounting changes; older evidence is retired, not reused
+    RESULTS_VERSION = 4  # bump when execution or evaluation accounting changes; older evidence is retired, not reused
     # 1: original; 2: chronological fills, gap-aware replay, block-based evidence; 3: rule tracked from entry,
-    # per-variant fills and fees with the liquidity of each exit candle, evidence counted from current trades only
+    # per-variant fills and fees with the liquidity of each exit candle, evidence counted from current trades only;
+    # 4: positions carry the version they were opened under (an interim release of 3 could stamp a legacy
+    # position's trade as 3, so every version-3 record is retired rather than guessed at), per-candle
+    # liquidity in catch-up, upgrades only after a verified snapshot
 
     def _upgrade_results_version(self) -> None:
         """Retire evidence measured under an earlier results version, after a verified snapshot.

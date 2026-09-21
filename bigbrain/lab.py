@@ -539,7 +539,23 @@ def walk_forward(rule_name: str, data, grid: dict[str, list], costs: Costs, inte
                       "in_sample": best.as_dict(), "out_of_sample": test.as_dict()})
         oos_trades += test.log
     stitched = summarize_pool(oos_trades, len(markets))
-    return {"folds": folds, "steps": steps, "out_of_sample": stitched.as_dict(), "oos_trades": oos_trades}
+    return {"folds": folds, "steps": steps, "out_of_sample": stitched.as_dict(), "oos_trades": oos_trades,
+            "benchmark": buy_and_hold(markets, dates[window])}  # holding the universe over the same out-of-sample span
+
+
+def buy_and_hold(markets: Markets, start_date: str, end_date: str | None = None) -> dict:
+    """Equal-weight holding of the universe from ``start_date``: what doing nothing clever returned over the same span,
+    so a long-only signal in a rising market is not mistaken for an edge."""
+    curves: dict[str, list[float]] = {}
+    for s, bars in markets.items():
+        window = [b for b in bars if b.date >= start_date and (end_date is None or b.date < end_date)]
+        if len(window) > 1:
+            curves[s] = [b.close / window[0].close for b in window]
+    if not curves:
+        return {"symbols": 0, "net_return": 0.0, "max_drawdown": 0.0}
+    n = max(len(c) for c in curves.values())
+    equity = [sum(c[min(i, len(c) - 1)] for c in curves.values()) / len(curves) for i in range(n)]
+    return {"symbols": len(curves), "net_return": equity[-1] - 1, "max_drawdown": ind.max_drawdown(equity)}
 
 
 # ---------------------------------------------------------------- verdict
@@ -564,10 +580,25 @@ def _ms(date: str) -> int:
     return int(datetime.strptime(date, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
+def _get_json(url: str, attempts: int = 6):
+    """Binance returns 429 (and 418 after abuse) when a burst of requests exceeds its weight limit: wait and try again."""
+    from bigbrain.net import HTTPStatusError, http_get
+
+    delay = 2.0
+    for attempt in range(attempts):
+        try:
+            return json.loads(http_get(url, headers={"Accept": "application/json"}).decode("utf-8"))
+        except HTTPStatusError as exc:
+            if exc.status not in (429, 418) or attempt == attempts - 1:
+                raise
+            retry_after = exc.headers.get("retry-after") or exc.headers.get("Retry-After")
+            time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else delay)
+            delay = min(delay * 2, 60.0)
+
+
 def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", cache_dir: str | Path | None = None, sleep: float = 0.25) -> list[Bar]:
     """``days`` of Binance candles, paginated (1,000 per request on spot, 1,500 on perps), cached on disk per day."""
     from bigbrain.ingest.market import BINANCE_HOSTS, FUTURES_HOST, parse_binance_klines
-    from bigbrain.net import http_get
 
     cache = None
     if cache_dir:
@@ -582,7 +613,7 @@ def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", c
     bars: list[Bar] = []
     while cursor < now_ms:
         url = f"{base}?symbol={symbol.upper()}&interval={interval}&startTime={cursor}&limit={limit}"
-        chunk = parse_binance_klines(json.loads(http_get(url, headers={"Accept": "application/json"}).decode("utf-8")))
+        chunk = parse_binance_klines(_get_json(url))
         if not chunk:
             break
         bars += chunk
@@ -605,7 +636,6 @@ def fetch_funding_history(symbol: str, interval: str, days: int, cache_dir: str 
     """Historical funding rates on a perp, keyed by the candle (of ``interval``) that opens at or contains the funding time.
     Daily candles collect all three of the day's payments."""
     from bigbrain.ingest.market import FUTURES_HOST
-    from bigbrain.net import http_get
 
     cache = None
     if cache_dir:
@@ -618,7 +648,7 @@ def fetch_funding_history(symbol: str, interval: str, days: int, cache_dir: str 
     out: dict[str, float] = {}
     while cursor < now_ms:
         url = f"{FUTURES_HOST}/fapi/v1/fundingRate?symbol={symbol.upper()}&startTime={cursor}&limit=1000"
-        rows = json.loads(http_get(url, headers={"Accept": "application/json"}).decode("utf-8"))
+        rows = _get_json(url)
         if not rows:
             break
         for r in rows:
@@ -636,12 +666,14 @@ def fetch_funding_history(symbol: str, interval: str, days: int, cache_dir: str 
 
 
 def resolve_symbols(spec: str, market: str) -> list[str]:
-    """'BTCUSDT,ETHUSDT' or 'top:30' (by 24h volume on the chosen market)."""
+    """'BTCUSDT,ETHUSDT', 'top:30' (by 24h volume on the chosen market), or 'top:31-80' (a slice: pairs a hypothesis was not found on)."""
     if spec.startswith("top:"):
         from bigbrain.ingest.market import top_usdt_pairs, top_usdt_perps
 
-        n = int(spec[4:])
-        return [u["symbol"] for u in (top_usdt_perps(n) if market == "perps" else top_usdt_pairs(n))]
+        lo, _, hi = spec[4:].partition("-")
+        first, last = (int(lo), int(hi)) if hi else (1, int(lo))
+        ranked = top_usdt_perps(last) if market == "perps" else top_usdt_pairs(last)
+        return [u["symbol"] for u in ranked[first - 1:last]]
     return [s.strip().upper() for s in spec.split(",") if s.strip()]
 
 
@@ -710,7 +742,8 @@ def learn_result(brain: Brain, report: dict, symbol: str, interval: str, days: i
     if wf:
         oos = wf["out_of_sample"]
         text += (f"Walk-forward over {wf['folds']} windows, choosing parameters on the past only: out-of-sample profit factor {min(oos['profit_factor'], 99):.2f}, "
-                 f"expectancy {oos['expectancy']:+.3%} per trade over {oos['trades']} trades, {oos['tstat']:.1f} standard errors from zero, maximum drawdown {oos['max_drawdown']:.1%}. ")
+                 f"expectancy {oos['expectancy']:+.3%} per trade over {oos['trades']} trades, {oos['tstat']:.1f} standard errors from zero, maximum drawdown {oos['max_drawdown']:.1%}, "
+                 f"net {oos['net_return']:+.1%} against {wf['benchmark']['net_return']:+.1%} for simply holding the same universe over the same span. ")
     text += f"Verdict: {report['verdict']}. {report['sentence']} A profit factor near one after costs means the rule has no edge on this market and timeframe, whatever a single week's chart suggests."
     title = f"Lab: {report['rule']} on {where} {interval} ({report['verdict']})"
     brain.forget(title=title)
@@ -740,5 +773,8 @@ def format_report(report: dict, symbol: str, interval: str, top: int = 10) -> st
             lines.append(f"  {s['window']:6} {describe_params(s['params']):44} {min(i['profit_factor'], 99):6.2f} {i['trades']:5} {min(o['profit_factor'], 99):7.2f} {o['trades']:5} {o['expectancy']:+10.3%}  {s['test_to'][:10]}")
         o = wf["out_of_sample"]
         lines.append(f"  stitched out-of-sample: PF {min(o['profit_factor'], 99):.2f}, expectancy {o['expectancy']:+.3%}/trade, {o['trades']} trades, net {o['net_return']:+.1%}, maxDD {o['max_drawdown']:.1%}, Sharpe {o['sharpe']:.2f}, {o['tstat']:.1f} standard errors from zero")
+        bh = wf.get("benchmark")
+        if bh and bh["symbols"]:
+            lines.append(f"  benchmark, just holding the universe over the same span: net {bh['net_return']:+.1%}, maxDD {bh['max_drawdown']:.1%}  (a long-only rule must beat this to be worth anything)")
     lines += ["", f"verdict: {report['verdict']}. {report['sentence']}"]
     return "\n".join(lines)

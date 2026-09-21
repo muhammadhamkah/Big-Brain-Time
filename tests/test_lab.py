@@ -271,5 +271,38 @@ class HypothesisTests(unittest.TestCase):
         self.assertIn("4 pairs", lab.format_report(report, "4 pairs", "1d"))
 
 
+class BenchmarkAndDataTests(unittest.TestCase):
+    def test_buy_and_hold_benchmark_and_ranges(self):
+        markets = {"AUSDT": [bar(i, 100 + i, 101 + i, 99 + i, 100 + i) for i in range(10)], "BUSDT": [bar(i, 100 - i, 101 - i, 99 - i, 100 - i) for i in range(10)]}
+        bh = lab.buy_and_hold(markets, "D0005")
+        self.assertEqual(bh["symbols"], 2)
+        self.assertAlmostEqual(bh["net_return"], ((109 / 105) + (91 / 95)) / 2 - 1)
+        self.assertLessEqual(bh["max_drawdown"], 0.0)
+        from unittest import mock
+        ranked = [{"symbol": f"S{i}USDT", "quote_volume": 100 - i, "last": 1.0} for i in range(80)]
+        with mock.patch("bigbrain.ingest.market.top_usdt_perps", return_value=ranked):
+            self.assertEqual(lab.resolve_symbols("top:3", "perps"), ["S0USDT", "S1USDT", "S2USDT"])
+            self.assertEqual(lab.resolve_symbols("top:31-33", "perps"), ["S30USDT", "S31USDT", "S32USDT"])
+        self.assertEqual(lab.resolve_symbols("btcusdt, ethusdt", "spot"), ["BTCUSDT", "ETHUSDT"])
+
+    def test_rate_limits_are_retried(self):
+        from unittest import mock
+        from bigbrain.net import HTTPStatusError
+        calls = {"n": 0}
+
+        def flaky(url, headers=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise HTTPStatusError(429, url, {"retry-after": "0"}, b"")
+            return b"[1, 2, 3]"
+
+        with mock.patch("bigbrain.net.http_get", side_effect=flaky):
+            self.assertEqual(lab._get_json("https://x/klines"), [1, 2, 3])
+        self.assertEqual(calls["n"], 3)
+        with mock.patch("bigbrain.net.http_get", side_effect=HTTPStatusError(404, "u", {}, b"")):
+            with self.assertRaises(HTTPStatusError):
+                lab._get_json("https://x/klines")
+
+
 if __name__ == "__main__":
     unittest.main()

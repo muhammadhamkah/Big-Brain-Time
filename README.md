@@ -147,8 +147,35 @@ Rules are small functions of past candles and parameters (`bigbrain/lab.py`). Ad
 | `funding_carry` | shorting when the crowd pays to be long, and the reverse, collecting funding | 4h perps, a universe |
 | `xs_momentum` | cross-sectional momentum: long the strongest of the universe, short the weakest, market neutral | 1d, a universe |
 | `psar`, `sma_cross`, `rsi_reversion` | the textbook indicators, for calibration | anything |
+| `vwap_fade`, `sweep`, `squeeze` | the scalping setups (below) | 1m to 15m, liquid perps |
 
 The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it. What it can do is reject nineteen ideas in twenty cheaply, so the live book only ever trades the twentieth.
+
+### Scalping: does any small, fast edge survive the toll?
+
+A scalper takes many small trades, so its edge per trade is a few basis points, and the round-trip cost (two fees, the spread, slippage) is of the same size. Most scalping ideas fail because they lose to that cost, not because they never predict anything. `bigbrain scalp` answers both questions at once:
+
+```bash
+bigbrain scalp                                                     # three setups on BTC, ETH, SOL perps, 1m and 5m, 14 days
+bigbrain scalp --symbols top:10 --intervals 1m,5m,15m --days 30    # wider and longer
+bigbrain scalp --fee 0.0002                                        # what if every fill paid the maker fee
+bigbrain scalp --rules sweep --intervals 5m --detail               # one setup, with the full lab report
+bigbrain scalp --synthetic                                         # offline demo on fair random walks: everything should fail
+```
+
+The three setups, each with a resting stop, a resting target and a time limit, long and short (long only on spot), optionally filtered by a trend average:
+
+| setup | the idea | stop | target |
+|---|---|---|---|
+| `vwap_fade` | a close stretched `entry_z` standard deviations from the rolling VWAP that starts to turn back | `sl_atr` ATRs away | the VWAP |
+| `sweep` | a candle runs the stops beyond the last `lookback` candles' low (high) and closes back in the top (bottom) half of its range: the breakout failed | just past the wick | `tp_r` times the risk |
+| `squeeze` | after a Bollinger squeeze, a close outside the band on `vol_mult` times average volume | `sl_atr` ATRs | `tp_atr` ATRs |
+
+Each runs through the lab's grid and walk-forward on the pooled symbols. The scan prints, out of sample: trades per day, win rate, profit factor, net per trade, and the split that matters for scalping, **gross** (what the setup caught between quoted prices) against **cost** (fees, spread, slippage, funding). A setup with a real gross edge smaller than its cost is a setup that needs a cheaper venue, maker fills or a slower timeframe; a setup with no gross edge needs nothing but deleting. Every verdict and cost check becomes a lesson the brain can recall.
+
+Two guards keep the numbers honest. A setup tracks its stop, target and time limit with the simulator's own fill order, so it can never believe it is flat while the simulator holds a position. And a test runs every setup and a random-entry bracket over fair random walks built tick by tick, where nothing can earn anything: an average out of line there means look-ahead. That test is also why `--synthetic` uses its own walk. On candles whose wicks are drawn independently of the path (or that have none), a crossed stop is a stop the price keeps running through, and filling it at its level books a phantom edge of about ten basis points per trade.
+
+Expect most scans to end in "no edge". At VIP 0 perps taker fees the toll is about 12 bp per round trip, and one-minute candles rarely move far enough between a sensible stop and target to pay it. If a setup comes back "worth a look", the next step is a small paper book, not money.
 
 ### Trading what survived: a strategy book
 
@@ -221,6 +248,7 @@ bigbrain/
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
   lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
+  scalp.py            scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) and the scan that says where their edge went
   strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

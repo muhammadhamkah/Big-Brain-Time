@@ -857,3 +857,6 @@ def format_report(report: dict, symbol: str, interval: str, top: int = 10) -> st
             lines.append(f"  benchmark, just holding the universe over the same span: net {bh['net_return']:+.1%}, maxDD {bh['max_drawdown']:.1%}  (a long-only rule must beat this to be worth anything)")
     lines += ["", f"verdict: {report['verdict']}. {report['sentence']}"]
     return "\n".join(lines)
+
+
+from bigbrain import scalp as _scalp  # noqa: E402,F401  registers the scalping setups as lab rules

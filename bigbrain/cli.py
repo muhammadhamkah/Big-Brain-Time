@@ -616,6 +616,56 @@ def cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scalp(args: argparse.Namespace) -> int:
+    from bigbrain import lab, scalp
+
+    rules = [r.strip() for r in args.rules.split(",") if r.strip()]
+    unknown = [r for r in rules if r not in lab.RULES]
+    if unknown:
+        print(f"unknown setup {', '.join(unknown)}; scalping setups: {', '.join(scalp.SCALP_RULES)} (any lab rule works)", file=sys.stderr)
+        return 2
+    intervals = [i.strip() for i in args.intervals.split(",") if i.strip()]
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    brain = open_brain(args.db)
+    cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
+    by_interval: dict = {}
+    if args.synthetic:
+        label = "synthetic"
+        for k, interval in enumerate(intervals):
+            by_interval[interval] = {f"WALK{j}": scalp.random_walk(f"WALK{j}", n=args.candles, seed=11 + 7 * j + k) for j in range(3)}
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        label = symbols[0] if len(symbols) == 1 else f"{len(symbols)} pairs"
+        for interval in intervals:
+            print(f"fetching {args.days} days of {interval} candles for {len(symbols)} symbol{'s' if len(symbols) != 1 else ''} from Binance {args.market} ...", flush=True)
+            markets, _ = lab.fetch_universe(symbols, interval, args.days, args.market, cache_dir=cache, workers=args.workers, log=print)
+            if markets:
+                by_interval[interval] = markets
+        if not by_interval:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+    print(f"scanning {len(rules)} setup{'s' if len(rules) != 1 else ''} on {', '.join(by_interval)} ...", flush=True)
+    try:
+        rows = scalp.scan(by_interval, costs, rules, long_only=args.market == "spot", folds=args.folds, workers=args.workers, log=print)
+    except ValueError as exc:
+        print(f"{exc}; fetch more history (--days) or use a shorter interval", file=sys.stderr)
+        return 1
+    print()
+    print(scalp.format_scan(rows, costs, f"{label} on Binance {args.market}" if not args.synthetic else "synthetic random walks (no edge exists here by construction)"))
+    if args.detail:
+        for r in rows:
+            print("\n" + lab.format_report(r["report"], label, r["interval"], top=5))
+    if not args.no_learn and not args.synthetic:
+        scalp.learn_scan(brain, rows, label, args.days)
+        print(f"\nthe brain remembers {len(rows)} scalp verdicts and their cost checks")
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -851,7 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_strategy)
 
     p = sub.add_parser("lab", help="test a trading rule honestly: parameter grid with plateau score, real costs, walk-forward, verdict")
-    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum (default psar)")
+    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum | scalp | vwap_fade | sweep | squeeze (default psar)")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--symbols", default="", help="a universe: 'BTCUSDT,ETHUSDT,...' or 'top:30' (by 24h volume); trades are pooled and judged on the same dates")
     p.add_argument("--rank-at-start", action="store_true", help="with --symbols top:N, choose the N by volume at the START of the history (what was knowable then), not today's winners")
@@ -867,6 +917,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=10, help="grid rows to print")
     p.add_argument("--no-learn", action="store_true", help="do not write the verdict into the brain")
     p.set_defaults(func=cmd_lab)
+
+    p = sub.add_parser("scalp", help="scan scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) honestly: walk-forward, costs, where the edge went")
+    p.add_argument("--rules", default="vwap_fade,sweep,squeeze", help="setups to scan (default all three; any lab rule works)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT", help="a list, or top:N by 24h volume; trades are pooled")
+    p.add_argument("--intervals", default="1m,5m", help="comma-separated candle intervals (default 1m,5m)")
+    p.add_argument("--days", type=int, default=14, help="history per interval (default 14 days)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"), help="perps (long and short, default) or spot (long only)")
+    p.add_argument("--fee", type=float, default=None, help="fee per side (default 0.05%% perps taker, 0.1%% spot; 0.0002 is perps maker)")
+    p.add_argument("--spread-bps", type=float, default=1.0, help="full bid-ask spread in basis points, half paid per fill (default 1)")
+    p.add_argument("--slippage-bps", type=float, default=0.5, help="slippage per fill in basis points (default 0.5: stops in a fast tape fill worse)")
+    p.add_argument("--folds", type=int, default=6)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--detail", action="store_true", help="also print each setup's full lab report")
+    p.add_argument("--synthetic", action="store_true", help="offline demo on random walks, where every setup should fail")
+    p.add_argument("--candles", type=int, default=3000, help="candles per synthetic market")
+    p.add_argument("--no-learn", action="store_true", help="do not write the verdicts into the brain")
+    p.set_defaults(func=cmd_scalp)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

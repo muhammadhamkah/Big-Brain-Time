@@ -36,6 +36,7 @@ import bisect
 import math
 import random
 from collections import deque
+from statistics import NormalDist
 from typing import Callable
 
 from bigbrain import lab
@@ -381,7 +382,10 @@ def format_scan(rows: list[dict], costs: lab.Costs, label: str) -> str:
         lines.append(f"the best candidate is {best['rule']} on {best['interval']}: paper-trade it small before believing it. Out-of-sample "
                      "edges shrink again live, and one good month is one sample.")
     else:
-        edges = [r for r in rows if r["edge"]["gross_t"] >= 2.0 and r["oos"].get("trades", 0) >= 30]  # a real move before costs, not a lucky one
+        # a real move before costs, not a lucky one: with many setups tested, one clears two standard errors by chance,
+        # so the bar rises with the count (a 5% chance of any false claim across the whole scan)
+        bar = NormalDist().inv_cdf(1 - 0.025 / max(len(rows), 1))
+        edges = [r for r in rows if r["edge"]["gross_t"] >= bar and r["oos"].get("trades", 0) >= 30]
         if edges:
             top = max(edges, key=lambda r: r["edge"]["gross_bps"])
             lines.append(f"nothing survived after costs. The strongest edge before costs was {top['rule']} on {top['interval']} at {top['edge']['gross_bps']:+.1f} bp per trade "
@@ -389,7 +393,8 @@ def format_scan(rows: list[dict], costs: lab.Costs, label: str) -> str:
                          f"{top['edge']['cost_bps']:.1f} bp of cost: it would only pay below about {top['edge']['breakeven_bps']:.1f} bp round trip (maker fees, a rebate tier, "
                          "a tighter market), or on a slower timeframe where each trade moves further.")
         else:
-            lines.append("nothing survived, and no setup caught a move distinguishable from zero even before costs: on these markets and timeframes these setups are noise.")
+            lines.append(f"nothing survived, and no setup caught a move distinguishable from zero even before costs ({bar:.1f} standard errors needed with "
+                         f"{len(rows)} setups tested): on these markets and timeframes these setups are noise.")
     return "\n".join(lines)
 
 

@@ -174,6 +174,18 @@ class ScanTests(unittest.TestCase):
         hits = brain.db.execute("SELECT COUNT(*) FROM cells WHERE title LIKE 'Scalp cost check:%'").fetchone()[0]
         self.assertEqual(hits, 3)
 
+    def test_a_lucky_gross_edge_is_not_announced(self):
+        costs = lab.Costs(fee=0.0005, spread_bps=1.0)
+
+        def row(name, gross_t):
+            return {"rule": name, "interval": "1m", "verdict": "no edge", "params": {}, "per_day": 0.0, "oos": {"trades": 200, "tstat": -1.0},
+                    "edge": {"gross_bps": 4.0, "cost_bps": 12.0, "net_bps": -8.0, "breakeven_bps": 4.0, "gross_win": 0.5, "gross_t": gross_t}}
+
+        rows = [row(f"r{k}", 0.5) for k in range(5)] + [row("lucky", 2.3)]  # the best of six clears 2.0 by chance often
+        self.assertIn("noise", scalp.format_scan(rows, costs, "x"))
+        rows[-1]["edge"]["gross_t"] = 4.0
+        self.assertIn("strongest edge before costs was lucky", scalp.format_scan(rows, costs, "x"))
+
     def test_spot_scans_long_only(self):
         markets = {"S": scalp.random_walk("S", n=1200, seed=4)}
         rows = scalp.scan({"1m": markets}, lab.Costs(), rules=("sweep",), long_only=True, workers=1)

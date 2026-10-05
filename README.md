@@ -187,13 +187,17 @@ The trader's signals propose trades; something has to decide which to take. `big
 | `beliefs` | the brain's memory | the trader's rule: skip a setup whose record in this context is losing |
 | `jev_blind` | the setup and the market, in words | [Jev](https://typesafe.ai), TypeSafe's decision model: LONG, SHORT or SKIP with probabilities |
 | `jev` | the same plus the brain's memory | Jev again, now shown this setup's record in this context, the record of fading it, and the lessons the brain recalls |
+| `llm_blind`, `llm` | the same as the two Jev deciders | a free model running on your own computer through [Ollama](https://ollama.com) (Llama, Qwen, ...), with `--llm MODEL` |
 
 ```bash
 export TYPESAFE_API_KEY=...                         # from typesafe.ai; without it Jev sits out and the rest still runs
 bigbrain decide                                     # 8 majors, 15m, 120 days, the last 1000 proposals decided
 bigbrain decide --symbols top:20 --days 180 --decisions 2000
 bigbrain decide --synthetic                         # offline: random walks, where no decider should make money
+bigbrain decide --llm llama3.1:8b --decisions 300   # a free local model instead of (or beside) Jev
 ```
+
+For the local model, install Ollama from ollama.com, then `ollama pull llama3.1:8b` (about 5 GB; `qwen2.5:7b` is a good alternative). It is shown exactly what Jev is shown and must answer with one of the same three choices, constrained to that form by Ollama. A laptop answers a question in a second or more, so start with a few hundred decisions; answers are cached, so a rerun is free.
 
 Jev cannot be trained: it is one hosted model, every call starts fresh, and it knows only the state it is handed. So the learning lives in the brain. Every proposal is graded when its trade would have closed (taken or not, so every decider sees the same memory), its outcome joins the record for that setup and context, and every ten trades the brain rewrites its lesson about it. `jev` against `jev_blind` is what the memory is worth; both against `take_all` and against zero is whether the decisions are worth anything; `beliefs` asks whether a plain rule on the same memory does as well for free. The report also shows the gain by quarter, to answer the question that matters most: does it get better as memory grows?
 

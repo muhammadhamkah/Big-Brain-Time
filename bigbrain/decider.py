@@ -9,6 +9,8 @@ Four deciders see exactly the same proposals:
 * ``jev_blind``: TypeSafe's Jev model, shown only the setup and the market context.
 * ``jev``: Jev shown the same plus the brain's memory: the record of this setup in this context, the record
   of fading it, and the lessons the brain recalls about it.
+* ``llm_blind`` and ``llm``: the same two, asked of a free local model (Llama, Qwen, ... through Ollama) instead
+  of Jev. It is shown exactly what Jev is shown and must answer with one of the same three choices.
 
 Jev cannot be trained; it is the same model for everyone and every call starts fresh. Whatever it learns, it
 learns through what the brain hands it, and the brain's memory grows with every graded trade. ``jev`` against
@@ -56,7 +58,8 @@ from bigbrain.ingest.market import Bar
 from bigbrain.trader import PLAYBOOK, Trader
 from bigbrain.watch import SIGNALS, detect, readings
 
-DECIDERS = ("take_all", "beliefs", "jev_blind", "jev")
+DECIDERS = ("take_all", "beliefs", "jev_blind", "jev", "llm_blind", "llm")
+MODELS = ("jev", "llm")  # deciders backed by a model; "<model>_blind" is the same model without the brain's memory
 DAY_CANDLES = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6, "1d": 1}  # synthetic candles have no calendar
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 CHOICES = ("LONG", "SHORT", "SKIP")
@@ -91,7 +94,7 @@ class Proposal:
     block: str = ""  # the day the decision falls on: the unit of independent evidence
     values: dict = field(default_factory=dict)  # decider -> result earned (0 for a skip)
     choices: dict = field(default_factory=dict)  # decider -> LONG | SHORT | SKIP
-    probabilities: dict = field(default_factory=dict)  # decider -> Jev's probabilities
+    probabilities: dict = field(default_factory=dict)  # decider -> the model's probabilities
 
 
 def _bucket(value, edges, words):
@@ -330,7 +333,7 @@ def request_body(p: Proposal, costs: lab.Costs, evidence: dict | None) -> dict:
 
 
 def validate(answer: dict) -> dict:
-    """A Jev answer is used only if it is a well-formed choice among the offered options."""
+    """A model's answer is used only if it is a well-formed choice among the offered options."""
     try:
         probs = answer["probabilities"]
         numbers = [*probs.values(), answer["confidence"]]
@@ -340,17 +343,16 @@ def validate(answer: dict) -> dict:
     except (KeyError, TypeError, AttributeError):
         ok = False
     if not ok:
-        raise ValueError(f"invalid Jev answer: {str(answer)[:200]}")
+        raise ValueError(f"invalid model answer: {str(answer)[:200]}")
     return answer
 
 
-class Jev:
-    """TypeSafe's Jev over HTTP, with a disk cache so a rerun of the same experiment is free and identical."""
+class Cached:
+    """A decision model behind a disk cache, so a rerun of the same experiment is free and gives identical answers."""
 
-    def __init__(self, key: str | None = None, cache: str | Path | None = None, timeout: float = 25.0) -> None:
-        self.key = key or os.environ.get("TYPESAFE_API_KEY", "")
-        if not self.key:
-            raise ValueError("Jev needs TYPESAFE_API_KEY (get one at typesafe.ai), e.g. export TYPESAFE_API_KEY=...")
+    name = "model"
+
+    def __init__(self, cache: str | Path | None = None) -> None:
         self.cache_path = Path(cache) if cache else None
         self.cache: dict[str, dict] = {}
         if self.cache_path and self.cache_path.exists():
@@ -360,20 +362,38 @@ class Jev:
                     self.cache[row["key"]] = row["answer"]
                 except (ValueError, KeyError):
                     continue
-        self.timeout = timeout
         self.calls = 0
 
     def ask(self, body: dict) -> dict:
-        key = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps([self.name, body], sort_keys=True).encode()).hexdigest()
         if key in self.cache:
             return self.cache[key]
-        answer = validate(self._post(body)["answers"]["decision"])
+        answer = validate(self._answer(body))
         self.cache[key] = answer
         if self.cache_path:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self.cache_path.open("a") as fh:
                 fh.write(json.dumps({"key": key, "answer": answer}) + "\n")
         return answer
+
+    def _answer(self, body: dict) -> dict:
+        raise NotImplementedError
+
+
+class Jev(Cached):
+    """TypeSafe's Jev over HTTP."""
+
+    name = "jev"
+
+    def __init__(self, key: str | None = None, cache: str | Path | None = None, timeout: float = 25.0) -> None:
+        self.key = key or os.environ.get("TYPESAFE_API_KEY", "")
+        if not self.key:
+            raise ValueError("Jev needs TYPESAFE_API_KEY (get one at typesafe.ai), e.g. export TYPESAFE_API_KEY=...")
+        super().__init__(cache)
+        self.timeout = timeout
+
+    def _answer(self, body: dict) -> dict:
+        return self._post(body)["answers"]["decision"]
 
     def _post(self, body: dict) -> dict:
         data = json.dumps(body).encode()
@@ -397,6 +417,62 @@ class Jev:
         raise RuntimeError("Jev unavailable")
 
 
+class Ollama(Cached):
+    """A free model running on this computer through Ollama (ollama.com): Llama, Qwen, Mistral, Gemma, ...
+
+    It gets the same state, options and rules as Jev, and must answer with JSON naming one of the options and
+    its confidence. Ollama constrains the output to that schema; temperature 0 and a fixed seed keep it repeatable.
+    A chat model does not return a probability for every option the way Jev does: the chosen option gets its
+    stated confidence and the rest share what is left."""
+
+    def __init__(self, model: str = "llama3.1:8b", url: str = "http://localhost:11434", cache: str | Path | None = None,
+                 timeout: float = 300.0) -> None:
+        super().__init__(cache)
+        self.model, self.url, self.timeout = model, url.rstrip("/"), timeout
+        self.name = f"ollama:{model}"
+
+    def _answer(self, body: dict) -> dict:
+        question = body["questions"]["decision"]
+        options = list(question["criteria"])
+        prompt = {"state": body["state"], "options": question["criteria"]}
+        request = {
+            "model": self.model, "stream": False,
+            "format": {"type": "object", "properties": {"choice": {"type": "string", "enum": options},
+                                                         "confidence": {"type": "number", "minimum": 0, "maximum": 1}},
+                       "required": ["choice", "confidence"]},
+            "options": {"temperature": 0, "seed": 7, "num_ctx": 8192},
+            "messages": [
+                {"role": "system", "content": question["instructions"]["rules"] + "\n\nAnswer only with JSON: "
+                 '{"choice": one of the option names, "confidence": how sure you are, from 0 to 1}.'},
+                {"role": "user", "content": json.dumps(prompt, indent=1)},
+            ],
+        }
+        req = urllib.request.Request(f"{self.url}/api/chat", data=json.dumps(request).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                self.calls += 1
+                reply = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode(errors="replace")
+            if exc.code == 404:
+                raise RuntimeError(f"Ollama does not have the model '{self.model}'; run: ollama pull {self.model}") from None
+            raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from None
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            raise RuntimeError(f"could not reach Ollama at {self.url} ({exc}); is it running? Install it from ollama.com, "
+                               f"then: ollama pull {self.model}") from None
+        try:
+            out = json.loads(reply["message"]["content"])
+            choice, conf = out["choice"], float(out["confidence"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"the local model did not answer in the required form: {str(reply)[:200]}") from None
+        if choice not in options:
+            raise ValueError(f"the local model chose '{choice}', which is not an option")
+        conf = min(max(conf if math.isfinite(conf) else 0.0, 0.0), 1.0)
+        rest = (1 - conf) / (len(options) - 1)
+        return {"choice": choice, "probabilities": {o: conf if o == choice else rest for o in options}, "confidence": conf}
+
+
 def beliefs_choice(p: Proposal, evidence: dict) -> str:
     """The trader's rule on the same memory: stand aside from a setup clearly losing in this context."""
     verdict = evidence["this_setup_in_this_context"]["verdict"]
@@ -407,7 +483,7 @@ def beliefs_choice(p: Proposal, evidence: dict) -> str:
 
 # ---------------------------------------------------------------- experiment
 def run(props: list[Proposal], costs: lab.Costs, deciders=DECIDERS, decisions: int = 1000, jev=None,
-        knowledge: Brain | None = None, workers: int = 8, log=None) -> dict:
+        knowledge: Brain | None = None, workers: int = 8, log=None, models: dict | None = None) -> dict:
     """Replay the proposals in order: memory learns from every graded outcome; the last ``decisions`` proposals
     are decided by every decider. Earlier proposals only teach memory (a warm-up the live brain would also have)."""
     memory = Memory(knowledge=knowledge)
@@ -421,6 +497,7 @@ def run(props: list[Proposal], costs: lab.Costs, deciders=DECIDERS, decisions: i
     if log:
         log(f"  memory: {sum(len(v) for v in memory.take.values())} graded trades and {memory.lessons} lessons written by the end")
 
+    models = {**({"jev": jev} if jev is not None else {}), **(models or {})}
     jobs = []
     for p, ev in evaluated:
         for d in deciders:
@@ -428,18 +505,22 @@ def run(props: list[Proposal], costs: lab.Costs, deciders=DECIDERS, decisions: i
                 p.choices[d] = "LONG" if p.side == 1 else "SHORT"
             elif d == "beliefs":
                 p.choices[d] = beliefs_choice(p, ev)
-            elif d in ("jev", "jev_blind"):
-                jobs.append((p, d, request_body(p, costs, ev if d == "jev" else None)))
+            elif d.removesuffix("_blind") in MODELS:
+                jobs.append((p, d, request_body(p, costs, None if d.endswith("_blind") else ev)))
             else:
                 raise ValueError(f"unknown decider '{d}'; deciders: {', '.join(DECIDERS)}")
-    if jobs:
-        if jev is None:
-            raise ValueError("the jev deciders need a Jev client")
+    for base in MODELS:
+        mine = [job for job in jobs if job[1].removesuffix("_blind") == base]
+        if not mine:
+            continue
+        client = models.get(base)
+        if client is None:
+            raise ValueError(f"the {base} deciders need a {base} client")
         if log:
-            log(f"  asking Jev {len(jobs)} questions ({workers} at a time; answers are cached) ...")
+            log(f"  asking {client.name} {len(mine)} questions ({workers} at a time; answers are cached) ...")
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            answers = list(pool.map(lambda job: jev.ask(job[2]), jobs))
-        for (p, d, _), a in zip(jobs, answers):
+            answers = list(pool.map(lambda job: client.ask(job[2]), mine))
+        for (p, d, _), a in zip(mine, answers):
             p.choices[d], p.probabilities[d] = a["choice"], a["probabilities"]
     for p, _ in evaluated:
         for d in deciders:
@@ -502,7 +583,7 @@ def _verdict(s: dict) -> str:
     """Plain sentences. A little over two standard errors is required, because several deciders are compared."""
     bar = 2.4
     parts = []
-    for d in ("jev", "beliefs", "jev_blind", "take_all"):
+    for d in ("jev", "llm", "beliefs", "jev_blind", "llm_blind", "take_all"):
         if d not in s:
             continue
         r = s[d]
@@ -511,13 +592,17 @@ def _verdict(s: dict) -> str:
             break
     else:
         parts.append("No decider made money distinguishable from luck: on these candles none beat doing nothing.")
-    if "jev" in s and "jev_blind" in s:
-        gap = s["jev"]["per_opportunity"] - s["jev_blind"]["per_opportunity"]
-        parts.append(f"The brain's memory changed Jev's result by {gap * 1e4:+.1f} bp per proposal (with memory minus without).")
-    if "jev" in s and "beliefs" in s:
-        gap = s["jev"]["per_opportunity"] - s["beliefs"]["per_opportunity"]
-        parts.append(f"Against the brain's plain belief rule on the same memory, Jev earned {gap * 1e4:+.1f} bp per proposal.")
-    for d in ("jev", "beliefs"):
+    for m, label in (("jev", "Jev"), ("llm", "the local model")):
+        if m in s and f"{m}_blind" in s:
+            gap = s[m]["per_opportunity"] - s[f"{m}_blind"]["per_opportunity"]
+            parts.append(f"The brain's memory changed {label}'s result by {gap * 1e4:+.1f} bp per proposal (with memory minus without).")
+        if m in s and "beliefs" in s:
+            gap = s[m]["per_opportunity"] - s["beliefs"]["per_opportunity"]
+            parts.append(f"Against the brain's plain belief rule on the same memory, {label} earned {gap * 1e4:+.1f} bp per proposal.")
+    if "jev" in s and "llm" in s:
+        gap = s["jev"]["per_opportunity"] - s["llm"]["per_opportunity"]
+        parts.append(f"With the same memory, Jev earned {gap * 1e4:+.1f} bp per proposal against the local model.")
+    for d in ("jev", "llm", "beliefs"):
         r = s.get(d)
         if r and r["skipped_would_have"] is not None and r["taken"]:
             wise = r["skipped_would_have"] < r["per_trade"]

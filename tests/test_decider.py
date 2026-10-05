@@ -25,8 +25,11 @@ def dated(bars, start_hour=0):
 class StubJev:
     """Stands in for TypeSafe: follows the memory it is shown, skips when there is none."""
 
+    name = "stub"
+
     def __init__(self):
         self.bodies = []
+        self.calls = 0
 
     def ask(self, body):
         self.bodies.append(body)
@@ -126,12 +129,12 @@ class RunTests(unittest.TestCase):
         markets = {f"W{j}": dated(scalp.random_walk(f"W{j}", n=3000, seed=40 + j, vol=0.004)) for j in range(2)}
         props = decider.proposals(markets, COSTS, "15m")
         jev = StubJev()
-        r = decider.run(props, COSTS, decider.DECIDERS, decisions=300, jev=jev)
+        r = decider.run(props, COSTS, ("take_all", "beliefs", "jev_blind", "jev"), decisions=300, jev=jev)
         decided = r["proposals"]
         self.assertEqual(len(decided), 300)
         self.assertEqual(len(jev.bodies), 600)  # jev and jev_blind, once per proposal
         for p in decided:
-            for d in decider.DECIDERS:
+            for d in ("take_all", "beliefs", "jev_blind", "jev"):
                 c = p.choices[d]
                 expect = 0.0 if c == "SKIP" else (p.take if (c == "LONG") == (p.side == 1) else p.fade)
                 self.assertEqual(p.values[d], expect)
@@ -178,7 +181,78 @@ class JevClientTests(unittest.TestCase):
                 decider.Jev()
 
 
+def ollama_reply(content):
+    reply = mock.MagicMock()
+    reply.__enter__.return_value.read.return_value = json.dumps({"message": {"role": "assistant", "content": content}}).encode()
+    return reply
+
+
+class OllamaTests(unittest.TestCase):
+    def body(self):
+        bars = dated(scalp.random_walk("SECRETCOIN", n=800, seed=3, vol=0.004))
+        p = decider.proposals({"SECRETCOINUSDT": bars}, COSTS, "15m")[-1]
+        return decider.request_body(p, COSTS, None), p
+
+    def test_asks_for_one_of_the_options_and_reads_the_answer(self):
+        body, p = self.body()
+        with mock.patch("urllib.request.urlopen", return_value=ollama_reply('{"choice": "SKIP", "confidence": 0.6}')) as urlopen:
+            answer = decider.Ollama("llama3.1:8b").ask(body)
+        self.assertEqual(answer["choice"], "SKIP")
+        self.assertAlmostEqual(sum(answer["probabilities"].values()), 1.0)
+        self.assertAlmostEqual(answer["probabilities"]["SKIP"], 0.6)
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.full_url, "http://localhost:11434/api/chat")
+        sent = json.loads(request.data)
+        self.assertEqual(sent["model"], "llama3.1:8b")
+        self.assertEqual(sorted(sent["format"]["properties"]["choice"]["enum"]), sorted(decider.CHOICES))
+        self.assertEqual(sent["options"]["temperature"], 0)
+        self.assertIn("with the signal", sent["messages"][1]["content"])
+        self.assertNotIn("SECRETCOIN", json.dumps(sent))  # the local model sees exactly what Jev sees: no symbol
+
+    def test_bad_answers_and_missing_models_say_what_to_do(self):
+        body, _ = self.body()
+        with mock.patch("urllib.request.urlopen", return_value=ollama_reply('{"choice": "BUY", "confidence": 0.9}')):
+            with self.assertRaises(ValueError):
+                decider.Ollama("m").ask(body)
+        with mock.patch("urllib.request.urlopen", return_value=ollama_reply("not json")):
+            with self.assertRaises(ValueError):
+                decider.Ollama("m").ask(body)
+        import urllib.error
+        missing = urllib.error.HTTPError("u", 404, "not found", {}, io.BytesIO(b'{"error":"model not found"}'))
+        with mock.patch("urllib.request.urlopen", side_effect=missing):
+            with self.assertRaisesRegex(RuntimeError, "ollama pull m"):
+                decider.Ollama("m").ask(body)
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            with self.assertRaisesRegex(RuntimeError, "ollama.com"):
+                decider.Ollama("m").ask(body)
+
+    def test_each_model_keeps_its_own_answers_in_the_cache(self):
+        body, _ = self.body()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = f"{tmp}/c.jsonl"
+            with mock.patch("urllib.request.urlopen", return_value=ollama_reply('{"choice": "SKIP", "confidence": 0.6}')) as first:
+                decider.Ollama("a", cache=cache).ask(body)
+                decider.Ollama("a", cache=cache).ask(body)
+                self.assertEqual(first.call_count, 1)
+            with mock.patch("urllib.request.urlopen", return_value=ollama_reply('{"choice": "LONG", "confidence": 0.7}')) as second:
+                self.assertEqual(decider.Ollama("b", cache=cache).ask(body)["choice"], "LONG")  # another model is asked afresh
+                self.assertEqual(second.call_count, 1)
+
+
 class CliTests(unittest.TestCase):
+    def test_runs_a_local_model_beside_the_others(self):
+        out = io.StringIO()
+        stub = StubJev()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}), \
+                mock.patch.object(decider.Ollama, "_answer", lambda self, body: stub.ask(body)), redirect_stdout(out):
+            code = main(["--db", ":memory:", "decide", "--synthetic", "--candles", "2500", "--decisions", "150", "--llm", "llama3.1:8b"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("llm_blind", text)
+        self.assertIn("the local model", text)
+        self.assertTrue(150 <= len(stub.bodies) <= 300)  # identical questions (same words, same memory) are asked once
+
     def test_runs_offline_without_a_key(self):
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}), redirect_stdout(out):

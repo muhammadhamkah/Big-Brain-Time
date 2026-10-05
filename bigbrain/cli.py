@@ -678,14 +678,22 @@ def cmd_decide(args: argparse.Namespace) -> int:
         return 2
     if "take_all" not in wanted:
         wanted.insert(0, "take_all")  # the baseline every comparison needs
-    jev = None
+    if args.llm:
+        wanted += [d for d in ("llm_blind", "llm") if d not in wanted]
+    cache_dir = Path(args.db).parent / "decider" if args.db != ":memory:" else None
+    models: dict = {}
     if any(d.startswith("jev") for d in wanted):
         if not os.environ.get("TYPESAFE_API_KEY"):
             print("TYPESAFE_API_KEY is not set, so Jev sits this one out (get a key at typesafe.ai, then: export TYPESAFE_API_KEY=...)")
             wanted = [d for d in wanted if not d.startswith("jev")]
         else:
-            brain_dir = Path(args.db).parent if args.db != ":memory:" else None
-            jev = decider.Jev(cache=brain_dir / "decider" / "jev-cache.jsonl" if brain_dir else None)
+            models["jev"] = decider.Jev(cache=cache_dir / "jev-cache.jsonl" if cache_dir else None)
+    if any(d.startswith("llm") for d in wanted):
+        if not args.llm:
+            print("the llm deciders need a local model: add --llm llama3.1:8b (or any model Ollama has)", file=sys.stderr)
+            return 2
+        models["llm"] = decider.Ollama(args.llm, args.ollama_url, cache=cache_dir / "ollama-cache.jsonl" if cache_dir else None)
+        print(f"local model: {args.llm} through Ollama at {args.ollama_url}; expect a second or more per question on a laptop")
     fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
     costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
     brain = open_brain(args.db)
@@ -712,19 +720,19 @@ def cmd_decide(args: argparse.Namespace) -> int:
           f"with {', '.join(wanted)} ...", flush=True)
     knowledge = brain if args.knowledge and brain.count_cells() else None
     try:
-        result = decider.run(props, costs, wanted, args.decisions, jev=jev, knowledge=knowledge, workers=args.workers, log=print)
+        result = decider.run(props, costs, wanted, args.decisions, knowledge=knowledge, workers=args.workers, log=print, models=models)
     except (RuntimeError, ValueError) as exc:
         print(f"stopped: {exc}", file=sys.stderr)
         return 1
     print()
     print(decider.format_report(result, label))
-    if jev is not None:
-        print(f"\nJev calls this run: {jev.calls} (the rest came from the cache)")
+    for client in models.values():
+        print(f"\n{client.name} calls this run: {client.calls} (the rest came from the cache)")
     if brain.path != ":memory:":
         name = "decisions-synthetic.jsonl" if args.synthetic else f"decisions-{args.interval}-{args.days}d.jsonl"
         log_path = Path(brain.path).parent / "decider" / name
         decider.save_log(result, log_path)
-        print(f"every decision{', with Jev' + chr(39) + 's probabilities' if jev is not None else ''} and its outcome: {log_path}")
+        print(f"every decision{', with the models' + chr(39) + ' probabilities' if models else ''} and its outcome: {log_path}")
     if not args.no_learn and not args.synthetic:
         print(f"the brain remembers this as '{decider.learn_result(brain, result, label)}'")
     return 0
@@ -1000,7 +1008,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_scalp)
 
     p = sub.add_parser("decide", help="does a decision model reading the brain's memory pick better trades? Jev vs the belief rule vs taking every signal")
-    p.add_argument("--deciders", default="take_all,beliefs,jev_blind,jev", help="take_all, beliefs, jev_blind (Jev without memory), jev (Jev with the brain's memory)")
+    p.add_argument("--deciders", default="take_all,beliefs,jev_blind,jev",
+                   help="take_all, beliefs, jev_blind (Jev without memory), jev (Jev with the brain's memory), llm_blind, llm (a local model)")
+    p.add_argument("--llm", default="", metavar="MODEL", help="also ask a free local model through Ollama, e.g. llama3.1:8b or qwen2.5:7b")
+    p.add_argument("--ollama-url", default="http://localhost:11434", help="where Ollama listens (default http://localhost:11434)")
     p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT", help="a list, or top:N")
     p.add_argument("--interval", default="15m", help="candle interval (default 15m, the live trader's)")
     p.add_argument("--days", type=int, default=120, help="history to replay (default 120 days)")
@@ -1009,7 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fee", type=float, default=None, help="fee per side (default 0.05%% perps taker, 0.1%% spot)")
     p.add_argument("--spread-bps", type=float, default=1.0)
     p.add_argument("--slippage-bps", type=float, default=0.5)
-    p.add_argument("--workers", type=int, default=8, help="Jev requests in flight at once")
+    p.add_argument("--workers", type=int, default=8, help="model requests in flight at once (a local model answers them in turn)")
     p.add_argument("--no-knowledge", dest="knowledge", action="store_false", help="do not show Jev evergreen knowledge recalled from the main brain")
     p.add_argument("--synthetic", action="store_true", help="offline run on random walks, where no decider should make money")
     p.add_argument("--candles", type=int, default=8000, help="candles per synthetic market")

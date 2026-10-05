@@ -177,6 +177,28 @@ Two guards keep the numbers honest. A setup tracks its stop, target and time lim
 
 Expect most scans to end in "no edge". At VIP 0 perps taker fees the toll is about 12 bp per round trip, and one-minute candles rarely move far enough between a sensible stop and target to pay it. If a setup comes back "worth a look", the next step is a small paper book, not money.
 
+### A decision model on top of the brain: the decider experiment
+
+The trader's signals propose trades; something has to decide which to take. `bigbrain decide` replays months of real candles and puts four deciders in front of exactly the same proposals:
+
+| decider | sees | decides by |
+|---|---|---|
+| `take_all` | nothing | taking every signal: the baseline |
+| `beliefs` | the brain's memory | the trader's rule: skip a setup whose record in this context is losing |
+| `jev_blind` | the setup and the market, in words | [Jev](https://typesafe.ai), TypeSafe's decision model: LONG, SHORT or SKIP with probabilities |
+| `jev` | the same plus the brain's memory | Jev again, now shown this setup's record in this context, the record of fading it, and the lessons the brain recalls |
+
+```bash
+export TYPESAFE_API_KEY=...                         # from typesafe.ai; without it Jev sits out and the rest still runs
+bigbrain decide                                     # 8 majors, 15m, 120 days, the last 1000 proposals decided
+bigbrain decide --symbols top:20 --days 180 --decisions 2000
+bigbrain decide --synthetic                         # offline: random walks, where no decider should make money
+```
+
+Jev cannot be trained: it is one hosted model, every call starts fresh, and it knows only the state it is handed. So the learning lives in the brain. Every proposal is graded when its trade would have closed (taken or not, so every decider sees the same memory), its outcome joins the record for that setup and context, and every ten trades the brain rewrites its lesson about it. `jev` against `jev_blind` is what the memory is worth; both against `take_all` and against zero is whether the decisions are worth anything; `beliefs` asks whether a plain rule on the same memory does as well for free. The report also shows the gain by quarter, to answer the question that matters most: does it get better as memory grows?
+
+The guards: an outcome enters memory only after its exit candle; Jev never sees a symbol or a date, so it cannot lean on anything it remembers about a market's history; only evergreen knowledge (concepts, papers, articles) is recalled from the main brain, never its lessons, some of which were written after the replayed candles; every number is computed in code and handed over as words, because Jev does not do arithmetic; and every standard error is computed across days, because trades open on the same day ride the same market. Without that last one, a single falling week makes any long signal look "clearly losing" with a t-statistic of four. Jev's answers are cached under `.brain/decider/`, so a rerun is free, and every decision is logged there with its probabilities and outcome.
+
 ### Trading what survived: a strategy book
 
 `bigbrain strategy` trades a lab rule live in its own book, with everything the playbook trader has (fills at live quotes or the next open, real funding, fees and slippage, atomic bookkeeping, the dashboard) and none of its learning: the rule decides, the book executes. Parameters are re-chosen every 30 days on all the history the book can see, with the same selection the lab's walk-forward used, so what runs is what was tested. A buy-and-hold control of the same coins from the same start runs beside it and `bigbrain portfolio --book trend` shows both.
@@ -249,6 +271,7 @@ bigbrain/
   exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
   lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
   scalp.py            scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) and the scan that says where their edge went
+  decider.py          the decider experiment: Jev (TypeSafe's decision model) reading the brain's memory, against the belief rule and taking every signal
   strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

@@ -666,6 +666,69 @@ def cmd_scalp(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decide(args: argparse.Namespace) -> int:
+    import os
+
+    from bigbrain import decider, lab, scalp
+
+    wanted = [d.strip() for d in args.deciders.split(",") if d.strip()]
+    unknown = [d for d in wanted if d not in decider.DECIDERS]
+    if unknown:
+        print(f"unknown decider {', '.join(unknown)}; deciders: {', '.join(decider.DECIDERS)}", file=sys.stderr)
+        return 2
+    if "take_all" not in wanted:
+        wanted.insert(0, "take_all")  # the baseline every comparison needs
+    jev = None
+    if any(d.startswith("jev") for d in wanted):
+        if not os.environ.get("TYPESAFE_API_KEY"):
+            print("TYPESAFE_API_KEY is not set, so Jev sits this one out (get a key at typesafe.ai, then: export TYPESAFE_API_KEY=...)")
+            wanted = [d for d in wanted if not d.startswith("jev")]
+        else:
+            brain_dir = Path(args.db).parent if args.db != ":memory:" else None
+            jev = decider.Jev(cache=brain_dir / "decider" / "jev-cache.jsonl" if brain_dir else None)
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    brain = open_brain(args.db)
+    if args.synthetic:
+        label = "synthetic random walks"
+        markets = {f"WALK{j}": scalp.random_walk(f"WALK{j}", n=args.candles, seed=31 + j, vol=0.004) for j in range(4)}
+        extras: dict = {}
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        label = f"{len(symbols)} Binance {args.market} pairs, {args.interval}, {args.days} days"
+        print(f"fetching {args.days} days of {args.interval} candles for {len(symbols)} symbols ...", flush=True)
+        cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
+        markets, extras = lab.fetch_universe(symbols, args.interval, args.days, args.market, cache_dir=cache, workers=4,
+                                             funding=args.market == "perps", log=print)
+        if not markets:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+    props = decider.proposals(markets, costs, args.interval, (extras or {}).get("funding"))
+    print(f"{len(props)} proposals from the trader's signals; replaying them in order, deciding the last {min(args.decisions, len(props))} "
+          f"with {', '.join(wanted)} ...", flush=True)
+    knowledge = brain if args.knowledge and brain.count_cells() else None
+    try:
+        result = decider.run(props, costs, wanted, args.decisions, jev=jev, knowledge=knowledge, workers=args.workers, log=print)
+    except (RuntimeError, ValueError) as exc:
+        print(f"stopped: {exc}", file=sys.stderr)
+        return 1
+    print()
+    print(decider.format_report(result, label))
+    if jev is not None:
+        print(f"\nJev calls this run: {jev.calls} (the rest came from the cache)")
+    if brain.path != ":memory:":
+        log_path = Path(brain.path).parent / "decider" / f"decisions-{args.interval}-{args.days}d.jsonl"
+        decider.save_log(result, log_path)
+        print(f"every decision, with Jev's probabilities and the outcome: {log_path}")
+    if not args.no_learn and not args.synthetic:
+        print(f"the brain remembers this as '{decider.learn_result(brain, result, label)}'")
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -934,6 +997,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--candles", type=int, default=3000, help="candles per synthetic market")
     p.add_argument("--no-learn", action="store_true", help="do not write the verdicts into the brain")
     p.set_defaults(func=cmd_scalp)
+
+    p = sub.add_parser("decide", help="does a decision model reading the brain's memory pick better trades? Jev vs the belief rule vs taking every signal")
+    p.add_argument("--deciders", default="take_all,beliefs,jev_blind,jev", help="take_all, beliefs, jev_blind (Jev without memory), jev (Jev with the brain's memory)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT", help="a list, or top:N")
+    p.add_argument("--interval", default="15m", help="candle interval (default 15m, the live trader's)")
+    p.add_argument("--days", type=int, default=120, help="history to replay (default 120 days)")
+    p.add_argument("--decisions", type=int, default=1000, help="decide the latest N proposals; earlier ones only teach memory (default 1000)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"))
+    p.add_argument("--fee", type=float, default=None, help="fee per side (default 0.05%% perps taker, 0.1%% spot)")
+    p.add_argument("--spread-bps", type=float, default=1.0)
+    p.add_argument("--slippage-bps", type=float, default=0.5)
+    p.add_argument("--workers", type=int, default=8, help="Jev requests in flight at once")
+    p.add_argument("--no-knowledge", dest="knowledge", action="store_false", help="do not show Jev evergreen knowledge recalled from the main brain")
+    p.add_argument("--synthetic", action="store_true", help="offline run on random walks, where no decider should make money")
+    p.add_argument("--candles", type=int, default=8000, help="candles per synthetic market")
+    p.add_argument("--no-learn", action="store_true", help="do not write the result into the brain")
+    p.set_defaults(func=cmd_decide)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

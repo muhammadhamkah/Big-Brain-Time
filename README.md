@@ -221,6 +221,22 @@ bigbrain study --learners rules           # the simple-rules learner alone, in a
 * **Classmates.** `take_all`, `beliefs`, and `rules`: simple rules learned from the same papers ("a long signal while momentum is positive and rising: take it"), adopted only at three standard errors across days because many candidate rules are checked. If Laya cannot beat the simple rules, it has added nothing.
 * **A test of the test.** `--practice` plants a rule in synthetic papers. The rules learner finds it and makes money on every exam; on random walks it adopts no rules at all. A learner that cannot find a planted rule will not find a real one.
 
+### Polymarket market making: record first, replay, then decide
+
+On Polymarket a maker pays no fee and earns rebates, while a taker pays up to 1.75% of the notional at 50 cents. So "a tiny profit, many times a day, without paying fees" means market making: rest a buy just under the price and a sell just over it, and earn the gap when both fill. The danger is the other side of each fill: resting orders are hit most often when someone knows more, and the price keeps going. Only data can say whether the gap beats that.
+
+```bash
+bigbrain poly markets                       # markets in the liquidity-rewards program, their reward rules
+caffeinate -i bigbrain poly record          # record 8 of them for 24 hours; public data, no account or key
+bigbrain poly simulate                      # replay the latest recording with you as the maker
+bigbrain poly simulate --size 20 --improve 1 --max-inventory 100
+```
+
+* **Recording.** Order books every 2 seconds and every trade, from Polymarket's public CLOB, as JSON lines under `.brain/polymarket/`. When a poll returns only trades never seen before, some may have been missed, and that is written down as a gap.
+* **Replay.** A maker rests a bid at the best bid (or `--improve` ticks better) and, once it holds shares, an ask at the best ask; it never sells what it does not hold and stops buying at `--max-inventory`. Quotes go live `--latency` seconds after the book they reacted to. Fills come only from recorded trades: a trade through the quote fills it; a trade at its price fills it once the shares queued ahead of it have traded. The strict model, which never fills at the price, is reported beside it.
+* **The cost of being picked off.** After every fill the report records where the mid was 10 and 60 seconds later. Anything still held at the end is valued at the mid and as if sold to the bid with the taker fee.
+* **Not counted:** rebates and liquidity rewards, which depend on everyone else; the report shows the reward-eligible time and each market's daily pool.
+
 ### Trading what survived: a strategy book
 
 `bigbrain strategy` trades a lab rule live in its own book, with everything the playbook trader has (fills at live quotes or the next open, real funding, fees and slippage, atomic bookkeeping, the dashboard) and none of its learning: the rule decides, the book executes. Parameters are re-chosen every 30 days on all the history the book can see, with the same selection the lab's walk-forward used, so what runs is what was tested. A buy-and-hold control of the same coins from the same start runs beside it and `bigbrain portfolio --book trend` shows both.
@@ -295,6 +311,7 @@ bigbrain/
   scalp.py            scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) and the scan that says where their edge went
   decider.py          the decider experiment: Jev (TypeSafe's decision model) reading the brain's memory, against the belief rule and taking every signal
   study.py            study: train Laya (and simple rules) on years of past trades, grade them on years they never saw
+  polymarket.py       Polymarket market making: record live books and trades, replay them with you as the maker
   strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

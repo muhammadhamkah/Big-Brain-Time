@@ -804,6 +804,79 @@ def cmd_study(args: argparse.Namespace) -> int:
     return 0
 
 
+def _poly_root(args: argparse.Namespace) -> Path:
+    return (Path(args.db).parent if args.db != ":memory:" else Path(".brain")) / "polymarket"
+
+
+def cmd_poly_markets(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    try:
+        markets = pm.reward_markets(args.limit)
+    except Exception as exc:
+        print(f"could not reach Polymarket: {exc}", file=sys.stderr)
+        return 1
+    print(f"{len(markets)} markets in the liquidity-rewards program, priced between 10 and 90 cents, richest reward pool first:")
+    for m in markets:
+        rules = f"reward pool {m.reward_per_day:.0f}/day, quotes within {m.reward_max_spread:g}c of the mid, at least {m.reward_min_size:g} shares" \
+            if m.reward_max_spread is not None else f"reward pool {m.reward_per_day:.0f}/day"
+        print(f"  {m.tokens[0]['outcome']} {m.tokens[0]['price']:.2f}  {m.question[:70]}\n      {m.condition_id}  tick {m.tick:g}, min {m.min_size:g} shares; {rules}")
+    return 0
+
+
+def cmd_poly_record(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    try:
+        if args.market:
+            markets = [m for m in (pm.market_by_id(c) for c in args.market) if m]
+        else:
+            markets = pm.reward_markets(args.markets)
+    except Exception as exc:
+        print(f"could not reach Polymarket: {exc}", file=sys.stderr)
+        return 1
+    if not markets:
+        print("no open markets to record", file=sys.stderr)
+        return 1
+    from datetime import datetime
+
+    out = _poly_root(args) / datetime.now().strftime("%Y%m%d-%H%M")
+    print(f"recording {len(markets)} markets for {args.hours:g} hours into {out} (books every {args.book_every:g}s, "
+          f"one market's trades every {args.trade_every:g}s; Ctrl+C stops early and keeps what was recorded):")
+    for m in markets:
+        print(f"  {m.question[:80]}")
+    rec = pm.Recorder(markets, out, book_every=args.book_every, trade_every=args.trade_every)
+    try:
+        stats = rec.run(args.hours, log=print)
+    except KeyboardInterrupt:
+        stats = rec.stats
+        print("\nstopped")
+    print(f"recorded {stats['books']} books and {stats['trades']} trades ({stats['gaps']} possible gaps, {stats['errors']} failed polls) in {out}")
+    print("replay it with: bigbrain poly simulate")
+    return 0
+
+
+def cmd_poly_simulate(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    if args.dir:
+        d = Path(args.dir)
+    else:
+        sessions = sorted(p for p in _poly_root(args).glob("*") if p.is_dir()) if _poly_root(args).exists() else []
+        if not sessions:
+            print("no recording yet: run bigbrain poly record first", file=sys.stderr)
+            return 1
+        d = sessions[-1]
+    kw = dict(size=args.size, improve=args.improve, max_inventory=args.max_inventory, latency=args.latency, taker_rate=args.taker_rate)
+    results = {model: pm.run(d, both=args.both, queue_model=model, **kw) for model in ("queue", "through")}
+    if not any(results.values()):
+        print(f"no books in {d}", file=sys.stderr)
+        return 1
+    print(f"replaying {d}")
+    print(pm.format_report(results, args.size))
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -1116,6 +1189,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smoke", action="store_true", help="a few minutes end to end: small practice papers, one exam, a short study (checks Laya runs)")
     p.add_argument("--no-learn", action="store_true")
     p.set_defaults(func=cmd_study)
+
+    poly = sub.add_parser("poly", help="Polymarket market making: list reward markets, record live books and trades, replay them as a maker").add_subparsers(dest="poly", required=True)
+    p = poly.add_parser("markets", help="markets in the liquidity-rewards program")
+    p.add_argument("--limit", type=int, default=15)
+    p.set_defaults(func=cmd_poly_markets)
+    p = poly.add_parser("record", help="record order books and trades (no account needed); leave it running")
+    p.add_argument("--markets", type=int, default=8, help="how many reward markets to record (default 8)")
+    p.add_argument("--market", action="append", default=[], metavar="CONDITION_ID", help="record this market instead (repeatable)")
+    p.add_argument("--hours", type=float, default=24.0)
+    p.add_argument("--book-every", type=float, default=2.0, help="seconds between order-book snapshots (default 2)")
+    p.add_argument("--trade-every", type=float, default=1.0, help="seconds between trade polls; markets take turns (default 1)")
+    p.set_defaults(func=cmd_poly_record)
+    p = poly.add_parser("simulate", help="replay a recording with you as the maker")
+    p.add_argument("--dir", default="", help="a recording folder (default: the latest)")
+    p.add_argument("--size", type=float, default=10.0, help="shares per quote (default 10: one cent of spread is 0.10 USDC)")
+    p.add_argument("--improve", type=int, default=0, help="ticks better than the best bid and ask (default 0: join them)")
+    p.add_argument("--max-inventory", type=float, default=50.0, help="stop buying once holding this many shares (default 50)")
+    p.add_argument("--latency", type=float, default=1.0, help="seconds before a new quote is live (default 1)")
+    p.add_argument("--taker-rate", type=float, default=0.07, help="fee rate for selling leftovers as a taker (default 0.07, crypto)")
+    p.add_argument("--both", action="store_true", help="quote both outcomes of every market, not just the first")
+    p.set_defaults(func=cmd_poly_simulate)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

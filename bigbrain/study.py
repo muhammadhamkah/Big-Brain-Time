@@ -166,10 +166,11 @@ class LayaLearner:
 
     def __init__(self, workdir: str | Path, model_id: str = "convaiinnovations/laya", train_size: int = 4000, epochs: int = 2,
                  micro_batch: int = 2, grad_accum: int = 16, train_layers: int = 0, device: str = "auto", max_len: int = 512,
-                 seed: int = 7) -> None:
+                 seed: int = 7, encoder_lr: float = 2.5e-5, head_lr: float = 1e-4) -> None:
         self.workdir, self.model_id = Path(workdir), model_id
         self.train_size, self.epochs, self.micro_batch, self.grad_accum = train_size, epochs, micro_batch, grad_accum
         self.train_layers, self.device_name, self.max_len, self.head_max_len, self.seed = train_layers, device, max_len, 128, seed
+        self.encoder_lr, self.head_lr = encoder_lr, head_lr  # Laya's own fine-tuning rates by default
         self.model = None
         _require_laya()
 
@@ -255,7 +256,7 @@ class LayaLearner:
             log(f"    studying {len(items)} papers on {device} for {self.epochs} epochs (a typical move is {scale * 1e4:.0f} bp) ...")
         enc = [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad]
         head = [p for n, p in model.named_parameters() if not n.startswith("encoder.") and p.requires_grad]
-        opt = torch.optim.AdamW([{"params": enc, "lr": 2.5e-5}, {"params": head, "lr": 1e-4}], weight_decay=0.01)
+        opt = torch.optim.AdamW([{"params": enc, "lr": self.encoder_lr}, {"params": head, "lr": self.head_lr}], weight_decay=0.01)
         updates = max(1, math.ceil(len(items) / self.micro_batch / self.grad_accum) * self.epochs)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=updates, eta_min=1e-6)
         for epoch in range(self.epochs):

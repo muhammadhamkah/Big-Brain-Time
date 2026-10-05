@@ -106,7 +106,8 @@ def tiny_laya(base: Path, words: list[str]) -> None:
     fast = PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="[UNK]", pad_token="[PAD]", cls_token="[CLS]", sep_token="[SEP]", mask_token="[MASK]")
     fast.save_pretrained(base / "tokenizer")
     ecfg = ModernBertConfig(vocab_size=len(vocab), hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=2,
-                            max_position_embeddings=1024, pad_token_id=0, cls_token_id=2, sep_token_id=3, global_attn_every_n_layers=1)
+                            max_position_embeddings=1024, pad_token_id=0, cls_token_id=2, sep_token_id=3, bos_token_id=2, eos_token_id=3,
+                            global_attn_every_n_layers=1)
     ecfg.save_pretrained(base / "encoder")
     torch.manual_seed(0)
     model = DecisionModel(AutoModel.from_config(ecfg), head_layers=1, n_act=2)
@@ -117,6 +118,8 @@ def tiny_laya(base: Path, words: list[str]) -> None:
 @unittest.skipUnless(_laya_available(), "needs pip install laya (PyTorch)")
 class LayaTests(unittest.TestCase):
     def test_the_training_loop_runs_and_learns_a_planted_rule(self):
+        """The official loss on a tiny stand-in trained from scratch (so with higher learning rates than Laya's fine-tuning):
+        it must come to favour the planted rule's trades. The real, pre-trained model is only examined on a Mac."""
         import re
         import tempfile
 
@@ -124,17 +127,17 @@ class LayaTests(unittest.TestCase):
         words = re.findall(r"\w+|[^\w\s]", json.dumps([e.state for e in examples]) + " " + study.INSTRUCTIONS + " " + json.dumps(study.CRITERIA))
         with tempfile.TemporaryDirectory() as tmp:
             tiny_laya(Path(tmp) / "laya_base", words)
-            learner = study.LayaLearner(tmp, train_size=1200, epochs=3, micro_batch=16, grad_accum=1, device="cpu")
+            learner = study.LayaLearner(tmp, train_size=2000, epochs=8, micro_batch=32, grad_accum=1, device="cpu", encoder_lr=1e-3, head_lr=1e-3)
             ws = study.windows(examples, exams=1, study_first=0.6)
             ws[0]["test"] = ws[0]["test"][:600]
             r = study.sit(ws, [learner])
-        laya = r["overall"]["laya"]
-        self.assertEqual(laya["opportunities"], 600)
-        self.assertEqual(sum(r["exams"][0]["summary"]["laya"][k] for k in ("taken", "skipped")), 600)
-        # even a tiny untrained-from-scratch model should learn to prefer the planted rule's trades over the rest
-        if laya["taken"] and laya["skipped_would_have"] is not None:
-            self.assertGreater(laya["per_trade"], laya["skipped_would_have"])
-
+        decided = r["exams"][0]["props"]
+        self.assertEqual(len(decided), 600)
+        rule = [p for p in decided if p.side == 1 and p.context["momentum"] == "positive and rising"]
+        other = [p for p in decided if p not in rule]
+        long_on_rule = sum(p.choices["laya"] == "LONG" for p in rule) / len(rule)
+        long_elsewhere = sum(p.choices["laya"] == "LONG" for p in other) / len(other)
+        self.assertGreater(long_on_rule, long_elsewhere + 0.25, (long_on_rule, long_elsewhere))
 
 if __name__ == "__main__":
     unittest.main()

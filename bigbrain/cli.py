@@ -1208,7 +1208,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", default="", help="a recording folder (default: the latest)")
     p.add_argument("--size", type=float, default=10.0, help="shares per quote (default 10: one cent of spread is 0.10 USDC)")
     p.add_argument("--improve", type=int, default=0, help="ticks better than the best bid and ask (default 0: join them)")
-    p.add_argument("--max-inventory", type=float, default=50.0, help="stop buying once holding this many shares (default 50)")
+    p.add_argument("--max-inventory", type=float, default=None, help="stop buying once holding this many shares (default: five times --size)")
     p.add_argument("--latency", type=float, default=1.0, help="seconds before a new quote is live (default 1)")
     p.add_argument("--taker-rate", type=float, default=0.07, help="fee rate for selling leftovers as a taker (default 0.07, crypto)")
     p.add_argument("--both", action="store_true", help="quote both outcomes of every market, not just the first")

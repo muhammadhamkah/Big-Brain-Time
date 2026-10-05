@@ -373,11 +373,13 @@ def load(directory: str | Path) -> tuple[list[dict], dict]:
     return rows, markets
 
 
-def simulate(rows: list[dict], asset: str, size: float = 10.0, improve: int = 0, max_inventory: float = 50.0,
+def simulate(rows: list[dict], asset: str, size: float = 10.0, improve: int = 0, max_inventory: float | None = None,
              latency: float = 1.0, queue_model: str = "queue", taker_rate: float = 0.07, lo: float = 0.05, hi: float = 0.95,
              meta: dict | None = None) -> SimResult:
     """Replay one token's recorded books and trades with a maker quoting it. See the module docstring for the rules."""
     meta = meta or {}
+    if max_inventory is None:
+        max_inventory = 5 * size  # five quotes' worth: a limit that always lets at least one bid rest
     r = SimResult(asset, meta.get("question", ""), meta.get("outcome", ""), reward_per_day=meta.get("reward_per_day", 0.0) or 0.0)
     books: list[Book] = []
     bid: Quote | None = None
@@ -501,19 +503,21 @@ def format_report(results: dict[str, list[SimResult]], size: float) -> str:
     days = max(hours / 24, 1e-9)
     lines.append(f"Polymarket maker replay: {len(first)} markets, {hours:.1f} hours recorded, quoting {size:g} shares a side "
                  f"(one cent of spread on {size:g} shares is {size * 0.01:.2f} USDC)")
+    if hours < 1:
+        lines.append(f"warning: only {hours * 60:.0f} minutes recorded; these markets can go quiet for hours, so let a recording run a full day before judging")
     gaps = sum(r.gaps for r in first)
     if gaps:
         lines.append(f"warning: {gaps} possible gaps where trades may have been missed; fills there are undercounted (record with a shorter --trade-every)")
     for model, rs in results.items():
         lines += ["", f"fill model '{model}'" + (" (fills only when a trade goes through the quote: the strict bound)" if model == "through"
                                                   else " (a trade at the quote's price fills it once the queue ahead of it has traded)"),
-                  f"  {'market':44} {'fills':>5} {'bought':>7} {'sold':>7} {'held':>6} {'P&L mid':>9} {'P&L sold':>9} {'markout60':>9} {'quoted':>7}"]
+                  f"  {'market':44} {'trades':>6} {'fills':>5} {'bought':>7} {'sold':>7} {'held':>6} {'P&L mid':>9} {'P&L sold':>9} {'markout60':>9} {'quoted':>7}"]
         for r in sorted(rs, key=lambda r: r.pnl_dump):
             mk = markout(r.fills)
             bought = sum(f.size for f in r.fills if f.side == "BUY")
             sold = sum(f.size for f in r.fills if f.side == "SELL")
             q = f"{r.quoted_s / 3600 / max(r.hours, 1e-9):.0%}" if r.hours else "-"
-            lines.append(f"  {(r.question or r.asset)[:44]:44} {len(r.fills):5} {bought:7.0f} {sold:7.0f} {r.inventory:6.0f} "
+            lines.append(f"  {(r.question or r.asset)[:44]:44} {r.trades:6} {len(r.fills):5} {bought:7.0f} {sold:7.0f} {r.inventory:6.0f} "
                          f"{r.pnl_mid:+9.2f} {r.pnl_dump:+9.2f} {(f'{mk:+.2f}c' if mk is not None else '-'):>9} {q:>7}")
         total_mid, total_dump = sum(r.pnl_mid for r in rs), sum(r.pnl_dump for r in rs)
         fills = [f for r in rs for f in r.fills]

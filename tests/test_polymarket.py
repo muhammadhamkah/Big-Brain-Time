@@ -193,6 +193,17 @@ class SimulateTests(unittest.TestCase):
         r = pm.simulate(rows, "A", size=10, max_inventory=10, latency=1)
         self.assertEqual(sum(f.size for f in r.fills if f.side == "BUY"), 10)  # stopped buying at the limit
 
+    def test_large_quotes_are_placed_by_default(self):
+        rows = [book(0, [[0.50, 0]], [[0.52, 10]]), trade(2, 0.49, 500)]
+        r = pm.simulate(rows, "A", size=200, latency=1)
+        self.assertEqual(sum(f.size for f in r.fills), 200)  # the inventory limit scales with the quote size
+
+    def test_reward_eligibility_needs_the_minimum_size_near_the_mid(self):
+        meta = {"reward_max_spread": 3.5, "reward_min_size": 200}
+        rows = [book(0, [[0.50, 0]], [[0.52, 0]]), book(60, [[0.50, 0]], [[0.52, 0]])]
+        self.assertEqual(pm.simulate(rows, "A", size=10, meta=meta).reward_s, 0)
+        self.assertEqual(pm.simulate(rows, "A", size=200, meta=meta).reward_s, 60)
+
     def test_never_sells_what_it_does_not_hold(self):
         rows = [book(0, [[0.50, 1000]], [[0.52, 0]]), trade(2, 0.60, 100)]
         r = pm.simulate(rows, "A", size=10, latency=1)

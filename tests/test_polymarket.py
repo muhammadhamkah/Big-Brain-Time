@@ -8,6 +8,7 @@ from unittest import mock
 
 from bigbrain import polymarket as pm
 from bigbrain.cli import main
+from bigbrain.net import HTTPStatusError
 
 
 def raw_market(cid, price, per_day=10.0, closed=False, accepting=True):
@@ -56,9 +57,12 @@ class RecorderTests(unittest.TestCase):
         self.now = [1_800_000_000.0]
         self.trades = []
 
-        def fetch(path):
-            assert path == "/live-activity/events/m1"
-            return list(self.trades)
+        self.urls = []
+
+        def fetch(url):
+            self.urls.append(url)
+            assert url == "https://data-api.polymarket.com/v2/trades?condition=m1&limit=100", url
+            return {"data": list(self.trades), "pagination": {"next_cursor": None}}
 
         def post(path, body):
             assert path == "/books"
@@ -77,8 +81,8 @@ class RecorderTests(unittest.TestCase):
         return [json.loads(line) for f in Path(self.dir.name).glob("*.jsonl") for line in f.read_text().splitlines()]
 
     def ev(self, tx, price, size, ts):
-        return {"market": {"condition_id": "m1", "asset_id": "m1-yes"}, "side": "SELL", "price": str(price), "size": str(size),
-                "timestamp": str(ts), "transaction_hash": tx, "fee_rate_bps": "0"}
+        return {"conditionId": "m1", "asset": "m1-yes", "side": "SELL", "price": price, "size": size, "timestamp": ts,
+                "transactionHash": tx, "outcome": "Yes", "outcomeIndex": 0}
 
     def test_books_are_sorted_best_first(self):
         self.rec.poll_books()
@@ -99,6 +103,57 @@ class RecorderTests(unittest.TestCase):
         self.rec.poll_trades(self.market)
         self.assertEqual(self.rec.stats["gaps"], 1)
         self.assertEqual(sum(r["type"] == "gap" for r in self.rows()), 1)
+
+    def test_a_retired_source_falls_through_to_the_next(self):
+        asked = []
+
+        def fetch(url):
+            asked.append(url)
+            if "/v2/" in url:
+                raise HTTPStatusError(404, url, {}, b"")
+            return [self.ev("t1", 0.5, 10, 1_800_000_000)]  # v1 answers a bare list
+
+        self.rec.fetch = fetch
+        self.rec.poll_trades(self.market)
+        self.rec.poll_trades(self.market)
+        self.assertEqual(sum("/v2/" in u for u in asked), 1)  # the retired source is not asked again
+        self.assertEqual(self.rec.stats["trades"], 1)
+        sample = json.loads((Path(self.dir.name) / "sample-trade.json").read_text())
+        self.assertIn("/trades?market=m1", sample["source"])
+
+        def gone(url):
+            raise HTTPStatusError(404, url, {}, b"")
+
+        self.rec.fetch, self.rec.source = gone, 0
+        with self.assertRaisesRegex(RuntimeError, "no public trade source"):
+            self.rec.poll_trades(self.market)
+
+    def test_trade_fields_are_read_under_any_of_their_names(self):
+        old_style = {"market": {"asset_id": "m1-no"}, "side": "BUY", "price": "0.41", "size": "3", "timestamp": "1800000000",
+                     "transaction_hash": "0xab"}
+        clob_style = {"asset_id": "m1-yes", "side": "SELL", "price": "0.6", "size": "2", "match_time": "1800000000000", "id": "x"}
+        by_index = {"outcomeIndex": 1, "price": 0.4, "size": 1, "timestamp": 1800000000}
+        self.assertEqual(pm.normalize_trade(old_style, self.market)["asset"], "m1-no")
+        t = pm.normalize_trade(clob_style, self.market)
+        self.assertEqual((t["asset"], t["ts"], t["id"]), ("m1-yes", 1_800_000_000.0, "x"))
+        self.assertEqual(pm.normalize_trade(by_index, self.market)["asset"], "m1-no")
+        self.assertIsNone(pm.normalize_trade({"side": "BUY"}, self.market))
+
+    def test_a_failing_market_does_not_block_the_others(self):
+        two = [self.market, pm.parse_market(raw_market("m2", 0.4))]
+        asked = []
+
+        def fetch(url):
+            asked.append(url)
+            if "m1" in url:
+                raise ConnectionError("timeout")
+            return {"data": []}
+
+        rec = pm.Recorder(two, self.dir.name, fetch=fetch, post=lambda p, b: [], clock=lambda: self.now[0],
+                          sleep=lambda s: self.now.__setitem__(0, self.now[0] + s))
+        rec.run(hours=10 / 3600)
+        self.assertTrue(any("m2" in u for u in asked))
+        self.assertGreater(rec.stats["errors"], 0)
 
     def test_run_stops_on_time_and_survives_errors(self):
         calls = {"n": 0}

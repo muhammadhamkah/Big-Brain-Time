@@ -851,6 +851,9 @@ def cmd_poly_record(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         stats = rec.stats
         print("\nstopped")
+    except RuntimeError as exc:
+        print(f"stopped: {exc}", file=sys.stderr)
+        return 1
     print(f"recorded {stats['books']} books and {stats['trades']} trades ({stats['gaps']} possible gaps, {stats['errors']} failed polls) in {out}")
     print("replay it with: bigbrain poly simulate")
     return 0

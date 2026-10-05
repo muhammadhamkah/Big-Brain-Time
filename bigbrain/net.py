@@ -32,6 +32,7 @@ HOST_INTERVALS: dict[str, float] = {
     "api.github.com": 1.0,
     "raw.githubusercontent.com": 1.0,
     "clob.polymarket.com": 0.2,
+    "data-api.polymarket.com": 0.2,
 }
 DEFAULT_INTERVAL = 1.0
 

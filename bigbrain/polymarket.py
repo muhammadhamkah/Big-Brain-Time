@@ -37,21 +37,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CLOB = "https://clob.polymarket.com"
+DATA = "https://data-api.polymarket.com"
 END_CURSOR = "LTE="
+# Public sources of a market's recent trades, tried in order: an endpoint that answers 404 is retired and the next is used.
+TRADE_SOURCES = (f"{DATA}/v2/trades?condition={{cid}}&limit=100", f"{DATA}/trades?market={{cid}}&limit=100",
+                 f"{CLOB}/live-activity/events/{{cid}}")
 
 
 # ------------------------------------------------------------------- http
 def _get(path: str):
+    """GET a CLOB path, or any full https URL."""
     from bigbrain.net import HTTPStatusError, http_json
 
     for attempt in range(5):
         try:
-            return http_json(CLOB + path)
+            return http_json(path if path.startswith("https://") else CLOB + path)
         except HTTPStatusError as exc:
             if exc.status in (429, 500, 502, 503, 504) and attempt < 4:
                 time.sleep(1.0 * 2 ** attempt)
                 continue
             raise
+
+
+def _status(exc: Exception) -> int | None:
+    return getattr(exc, "status", None)
 
 
 def _post(path: str, body):
@@ -140,6 +149,36 @@ def _when(ts) -> float:
             return 0.0
 
 
+def _first(d: dict, *names):
+    for n in names:
+        if d.get(n) not in (None, ""):
+            return d[n]
+    return None
+
+
+def normalize_trade(e: dict, m: Market) -> dict | None:
+    """One trade from any of the trade sources, in one shape. The sources name the same fields differently
+    (asset or asset_id, transactionHash or transaction_hash, timestamp or match_time), so every known name is read."""
+    if not isinstance(e, dict):
+        return None
+    mk = e.get("market") if isinstance(e.get("market"), dict) else {}
+    asset = _first(e, "asset", "asset_id", "assetId", "token_id", "tokenId") or mk.get("asset_id")
+    if not asset:
+        idx = _first(e, "outcomeIndex", "outcome_index")
+        if idx is not None and 0 <= int(idx) < len(m.tokens):
+            asset = m.tokens[int(idx)]["token_id"]
+        else:
+            name = str(e.get("outcome", "")).lower()
+            asset = next((t["token_id"] for t in m.tokens if t["outcome"].lower() == name and name), None)
+    price, size = _first(e, "price"), _first(e, "size", "shares")
+    if not asset or price is None or size is None:
+        return None
+    return {"asset": str(asset), "side": e.get("side"), "price": _num(price), "size": _num(size),
+            "ts": _when(_first(e, "timestamp", "match_time", "matchTime", "time", "created_at", "createdAt")),
+            "tx": _first(e, "transactionHash", "transaction_hash", "tx_hash", "txHash"), "id": _first(e, "id", "trade_id"),
+            "outcome": e.get("outcome"), "fee_bps": _first(e, "fee_rate_bps", "feeRateBps")}
+
+
 def _levels(rows, descending: bool, depth: int) -> list[list[float]]:
     lv = [[_num(r.get("price")), _num(r.get("size"))] for r in rows or [] if _num(r.get("size")) > 0]
     lv.sort(key=lambda x: -x[0] if descending else x[0])
@@ -156,6 +195,9 @@ class Recorder:
         self.fetch, self.post, self.clock, self.sleep = fetch, post, clock, sleep
         self.seen: dict[str, set] = {m.condition_id: set() for m in markets}
         self.stats = {"books": 0, "trades": 0, "gaps": 0, "errors": 0}
+        self.source = 0  # index into TRADE_SOURCES
+        self.sampled = False
+        self.log = None
         self.out.mkdir(parents=True, exist_ok=True)
         (self.out / "markets.json").write_text(json.dumps([asdict(m) for m in markets], indent=1))
 
@@ -174,45 +216,77 @@ class Recorder:
                              "tick": _num(b.get("tick_size")) or None, "min": _num(b.get("min_order_size")) or None})
                 self.stats["books"] += 1
 
+    def _fetch_trades(self, m: Market) -> list:
+        """Recent trades from the first source that still exists. A 404 means the endpoint was retired: move on."""
+        while self.source < len(TRADE_SOURCES):
+            url = TRADE_SOURCES[self.source].format(cid=m.condition_id)
+            try:
+                reply = self.fetch(url)
+            except Exception as exc:  # noqa: BLE001
+                if _status(exc) in (404, 410):
+                    if self.log:
+                        self.log(f"  trade source {url.split('?')[0]} answered {_status(exc)}; trying the next one")
+                    self.source += 1
+                    continue
+                raise
+            if isinstance(reply, dict):
+                reply = reply.get("data") or reply.get("trades") or []
+            return reply if isinstance(reply, list) else []
+        raise RuntimeError("no public trade source answered: Polymarket has moved its trades endpoint again")
+
     def poll_trades(self, m: Market) -> None:
         now = self.clock()
-        events = self.fetch(f"/live-activity/events/{m.condition_id}") or []
+        raw = self._fetch_trades(m)
+        events = [(e, normalize_trade(e, m)) for e in raw]
+        if raw and not self.sampled:  # show the first trade, so a changed format is caught on the first run
+            self.sampled = True
+            (self.out / "sample-trade.json").write_text(json.dumps({"source": TRADE_SOURCES[self.source].format(cid=m.condition_id), "raw": raw[0]}, indent=1, default=str))
+            if self.log:
+                ok = events[0][1]
+                self.log(f"  trades come from {TRADE_SOURCES[self.source].split('?')[0]}; fields: {', '.join(sorted(raw[0]))[:200]}")
+                self.log(f"  first trade read as: {ok}" if ok else "  WARNING: could not read the first trade; send sample-trade.json to fix the format")
+        events = [(e, t) for e, t in events if t]
         seen = self.seen[m.condition_id]
         fresh = []
-        for e in events:
-            mk = e.get("market") or {}
-            key = (e.get("transaction_hash"), mk.get("asset_id"), e.get("side"), e.get("price"), e.get("size"), e.get("timestamp"))
+        for e, t in events:
+            key = (t["id"], t["tx"], t["asset"], t["side"], t["price"], t["size"], t["ts"])
             if key not in seen:
-                fresh.append((key, e, mk))
+                fresh.append((key, t))
         if seen and events and len(fresh) == len(events):
             self._write({"type": "gap", "t": now, "market": m.condition_id})  # every trade returned is new: some may have been missed
             self.stats["gaps"] += 1
-        for key, e, mk in sorted(fresh, key=lambda x: _when(x[1].get("timestamp"))):
+        for key, t in sorted(fresh, key=lambda x: x[1]["ts"]):
             seen.add(key)
-            self._write({"type": "trade", "t": now, "ts": _when(e.get("timestamp")) or now, "asset": str(mk.get("asset_id")),
-                         "market": m.condition_id, "side": e.get("side"), "price": _num(e.get("price")), "size": _num(e.get("size")),
-                         "outcome": e.get("outcome"), "fee_bps": e.get("fee_rate_bps")})
+            self._write({"type": "trade", "t": now, "ts": t["ts"] or now, "asset": t["asset"], "market": m.condition_id, "side": t["side"],
+                         "price": t["price"], "size": t["size"], "outcome": t["outcome"], "fee_bps": t["fee_bps"]})
             self.stats["trades"] += 1
 
     def run(self, hours: float, log=None) -> dict:
+        self.log = log
         end = self.clock() + hours * 3600
         next_books, next_trade, k, last_log = 0.0, 0.0, 0, self.clock()
         while self.clock() < end:
             now = self.clock()
-            try:
-                if now >= next_books:
+            if now >= next_books:
+                try:
                     self.poll_books()
-                    next_books = now + self.book_every
-                if now >= next_trade and self.markets:
-                    self.poll_trades(self.markets[k % len(self.markets)])  # markets take turns, one per trade poll
-                    k += 1
-                    next_trade = now + self.trade_every
-            except Exception as exc:  # noqa: BLE001  a network hiccup must not end a day-long recording
-                self.stats["errors"] += 1
-                if log:
-                    log(f"  poll failed ({exc}); retrying")
-                self.sleep(5.0)
-                continue
+                except Exception as exc:  # noqa: BLE001  a network hiccup must not end a day-long recording
+                    self.stats["errors"] += 1
+                    if log:
+                        log(f"  book poll failed ({exc}); retrying")
+                next_books = now + self.book_every
+            if now >= next_trade and self.markets:
+                m = self.markets[k % len(self.markets)]
+                k += 1  # markets take turns, one per trade poll; a failure moves on to the next market
+                next_trade = now + self.trade_every
+                try:
+                    self.poll_trades(m)
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.stats["errors"] += 1
+                    if log:
+                        log(f"  trade poll failed for {m.question[:40]} ({exc})")
             if log and now - last_log >= 300:
                 log(f"  {datetime.now():%H:%M} recorded {self.stats['books']} books, {self.stats['trades']} trades, {self.stats['gaps']} possible gaps")
                 last_log = now

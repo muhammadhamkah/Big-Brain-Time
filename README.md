@@ -203,6 +203,24 @@ Jev cannot be trained: it is one hosted model, every call starts fresh, and it k
 
 The guards: an outcome enters memory only after its exit candle; Jev never sees a symbol or a date, so it cannot lean on anything it remembers about a market's history; only evergreen knowledge (concepts, papers, articles) is recalled from the main brain, never its lessons, some of which were written after the replayed candles; every number is computed in code and handed over as words, because Jev does not do arithmetic; and every standard error is computed across days, because trades open on the same day ride the same market. Without that last one, a single falling week makes any long signal look "clearly losing" with a t-statistic of four. Jev's answers are cached under `.brain/decider/`, so a rerun is free, and every decision is logged there with its probabilities and outcome.
 
+### Studying past papers: training a decision model on years of trades
+
+Jev cannot be trained, but [Laya](https://huggingface.co/convaiinnovations/laya) (Convai Innovations, Apache 2.0, about 1 GB, runs on a Mac) can. `bigbrain study` treats years of history like past exam papers: the model studies thousands of old trade proposals with what actually happened, then sits exams on stretches of time it never studied. Only the exams count.
+
+```bash
+pip install -e ".[laya]"                  # PyTorch and Laya; the model downloads on first use
+bigbrain study --smoke                    # a few minutes: proves Laya trains and answers on this machine
+bigbrain study --practice                 # practice papers with a hidden rule: can the learners find it?
+bigbrain study                            # 5 years of 15m candles on 8 majors, three exams (hours on a Mac)
+bigbrain study --learners rules           # the simple-rules learner alone, in a couple of minutes
+```
+
+* **Past papers.** Every signal the trader's playbook fired, described in words (the setup, the market, and the brain's record of that setup up to that moment), never with a symbol or a date.
+* **The answer key** is not one right answer: each of LONG, SHORT and SKIP gets a probability that grows with what it would have earned after costs, so a trade that made 80 bp says "take it" firmly and one that made 3 bp barely leans. Laya is trained on these soft targets exactly as its own Apple-silicon script trains it.
+* **Exams.** The first 40% of the timeline is study only; the rest is cut into exams. Each exam is sat by a fresh copy trained only on trades that had closed before the exam began.
+* **Classmates.** `take_all`, `beliefs`, and `rules`: simple rules learned from the same papers ("a long signal while momentum is positive and rising: take it"), adopted only at three standard errors across days because many candidate rules are checked. If Laya cannot beat the simple rules, it has added nothing.
+* **A test of the test.** `--practice` plants a rule in synthetic papers. The rules learner finds it and makes money on every exam; on random walks it adopts no rules at all. A learner that cannot find a planted rule will not find a real one.
+
 ### Trading what survived: a strategy book
 
 `bigbrain strategy` trades a lab rule live in its own book, with everything the playbook trader has (fills at live quotes or the next open, real funding, fees and slippage, atomic bookkeeping, the dashboard) and none of its learning: the rule decides, the book executes. Parameters are re-chosen every 30 days on all the history the book can see, with the same selection the lab's walk-forward used, so what runs is what was tested. A buy-and-hold control of the same coins from the same start runs beside it and `bigbrain portfolio --book trend` shows both.
@@ -276,6 +294,7 @@ bigbrain/
   lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
   scalp.py            scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) and the scan that says where their edge went
   decider.py          the decider experiment: Jev (TypeSafe's decision model) reading the brain's memory, against the belief rule and taking every signal
+  study.py            study: train Laya (and simple rules) on years of past trades, grade them on years they never saw
   strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

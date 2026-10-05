@@ -738,6 +738,72 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_study(args: argparse.Namespace) -> int:
+    import random
+
+    from bigbrain import decider, lab, study
+
+    wanted = [n.strip() for n in args.learners.split(",") if n.strip()]
+    unknown = [n for n in wanted if n not in study.LEARNERS]
+    if unknown:
+        print(f"unknown learner {', '.join(unknown)}; learners: {', '.join(study.LEARNERS)}", file=sys.stderr)
+        return 2
+    if args.smoke:
+        args.practice, args.exams, args.train_size, args.epochs, args.test_size, args.practice_days = True, 1, 300, 1, 300, 200
+    brain = open_brain(args.db)
+    workdir = Path(brain.path).parent / "study" if brain.path != ":memory:" else Path(".brain") / "study"
+    learners = []
+    for name in wanted:
+        if name == "rules":
+            learners.append(study.RulesLearner())
+        elif name == "laya":
+            try:
+                learners.append(study.LayaLearner(workdir, train_size=args.train_size, epochs=args.epochs, micro_batch=args.micro_batch,
+                                                  grad_accum=args.grad_accum, train_layers=args.train_layers, device=args.device))
+            except ImportError as exc:
+                print(f"{exc}\nLaya sits this one out; the other learners still sit the exams.")
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    if args.practice:
+        label = f"practice papers with a hidden rule ({study.PRACTICE_RULE})"
+        props = study.planted(days=args.practice_days)
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        days = int(args.years * 365)
+        label = f"{len(symbols)} Binance {args.market} pairs, {args.interval}, {args.years:g} years"
+        print(f"fetching {days} days of {args.interval} candles for {len(symbols)} symbols (cached after the first time) ...", flush=True)
+        markets, extras = lab.fetch_universe(symbols, args.interval, days, args.market, cache_dir=Path(brain.path).parent / "lab" if brain.path != ":memory:" else None,
+                                             workers=4, funding=args.market == "perps", log=print)
+        if not markets:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+        props = decider.proposals(markets, costs, args.interval, (extras or {}).get("funding"))
+    print(f"{len(props)} past papers; building what the brain knew at each one ...", flush=True)
+    examples = study.build(props)
+    try:
+        exams = study.windows(examples, exams=args.exams, study_first=args.study_first)
+    except ValueError as exc:
+        print(f"{exc}; use more history (--years) or fewer exams", file=sys.stderr)
+        return 1
+    if args.test_size:
+        for w in exams:
+            if len(w["test"]) > args.test_size:
+                w["test"] = sorted(random.Random(w["exam"]).sample(w["test"], args.test_size), key=lambda e: e.prop.date)
+    if any(lr.name == "laya" for lr in learners):
+        print(f"Laya studies up to {args.train_size} papers for {args.epochs} epochs per exam, from a fresh copy each time; on a Mac that is "
+              "tens of minutes per exam (the model, about 1 GB, downloads the first time)", flush=True)
+    result = study.sit(exams, learners, log=print)
+    print()
+    print(study.format_report(result, label))
+    if not args.no_learn and not args.practice:
+        print(f"\nthe brain remembers this as '{study.learn_result(brain, result, label)}'")
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -1026,6 +1092,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--candles", type=int, default=8000, help="candles per synthetic market")
     p.add_argument("--no-learn", action="store_true", help="do not write the result into the brain")
     p.set_defaults(func=cmd_decide)
+
+    p = sub.add_parser("study", help="train decision models on years of past trades and grade them on years they never saw (Laya, simple rules)")
+    p.add_argument("--learners", default="rules,laya", help="rules (simple rules learned from the papers), laya (the Laya model, fine-tuned)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT", help="a list, or top:N")
+    p.add_argument("--interval", default="15m")
+    p.add_argument("--years", type=float, default=5.0, help="history to study and examine (default 5 years)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"))
+    p.add_argument("--exams", type=int, default=3, help="unseen stretches of time to examine on (default 3)")
+    p.add_argument("--study-first", type=float, default=0.4, help="share of the timeline that is study only, before the first exam (default 0.4)")
+    p.add_argument("--train-size", type=int, default=4000, help="papers Laya studies per exam, sampled from all it may see (default 4000)")
+    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--micro-batch", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--train-layers", type=int, default=0, help="study only the top N encoder layers and the head (0 = all, as Laya's own script)")
+    p.add_argument("--device", default="auto", choices=("auto", "mps", "cuda", "cpu"))
+    p.add_argument("--test-size", type=int, default=0, help="questions per exam (default all; a sample keeps a Laya run shorter)")
+    p.add_argument("--fee", type=float, default=None)
+    p.add_argument("--spread-bps", type=float, default=1.0)
+    p.add_argument("--slippage-bps", type=float, default=0.5)
+    p.add_argument("--practice", action="store_true", help="practice papers with a hidden rule instead of market history: a learner that cannot find it will not find a real one")
+    p.add_argument("--practice-days", type=int, default=900)
+    p.add_argument("--smoke", action="store_true", help="a few minutes end to end: small practice papers, one exam, a short study (checks Laya runs)")
+    p.add_argument("--no-learn", action="store_true")
+    p.set_defaults(func=cmd_study)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

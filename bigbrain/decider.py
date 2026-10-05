@@ -248,8 +248,9 @@ class Memory:
     Every graded proposal is recorded, taken or not, so memory is the same whatever a decider chose. Each
     time a setup's record in a context grows by ten trades, the brain rewrites its lesson about it."""
 
-    def __init__(self, brain: Brain | None = None, knowledge: Brain | None = None, lesson_every: int = 10) -> None:
+    def __init__(self, brain: Brain | None = None, knowledge: Brain | None = None, lesson_every: int = 10, lessons: bool = True) -> None:
         self.brain = brain or Brain(":memory:")
+        self.write_lessons = lessons  # off for years of history: the records alone, without a lesson cell per ten trades
         self.knowledge = knowledge  # the main brain, read for evergreen knowledge only
         self.lesson_every = lesson_every
         self.take: dict[tuple, list[float]] = {}
@@ -276,7 +277,7 @@ class Memory:
             self.blocks.setdefault(p.key, []).append(p.block)
             self.by_signal.setdefault(p.signal, []).append(p.take)
             self.signal_blocks.setdefault(p.signal, []).append(p.block)
-            if len(self.take[p.key]) % self.lesson_every == 0:
+            if self.write_lessons and len(self.take[p.key]) % self.lesson_every == 0:
                 self._write_lesson(p.key)
 
     def _write_lesson(self, key: tuple) -> None:
@@ -299,7 +300,7 @@ class Memory:
                "betting_against_it_in_this_context": record(self.fade.get(p.key, []), blocks),
                "this_setup_in_any_context": record(self.by_signal.get(signal, []), self.signal_blocks.get(signal, []))}
         query = f"{signal} {regime} {vol} volatility decider memory"
-        lessons = [r.cell for r in self.brain.recall(query, k=3)]
+        lessons = [r.cell for r in self.brain.recall(query, k=3)] if self.write_lessons else []
         if lessons:
             out["lessons"] = [{"title": c.title, "text": c.content[:500]} for c in lessons]
         if self.knowledge is not None:

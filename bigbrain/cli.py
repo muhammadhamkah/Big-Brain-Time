@@ -721,9 +721,10 @@ def cmd_decide(args: argparse.Namespace) -> int:
     if jev is not None:
         print(f"\nJev calls this run: {jev.calls} (the rest came from the cache)")
     if brain.path != ":memory:":
-        log_path = Path(brain.path).parent / "decider" / f"decisions-{args.interval}-{args.days}d.jsonl"
+        name = "decisions-synthetic.jsonl" if args.synthetic else f"decisions-{args.interval}-{args.days}d.jsonl"
+        log_path = Path(brain.path).parent / "decider" / name
         decider.save_log(result, log_path)
-        print(f"every decision, with Jev's probabilities and the outcome: {log_path}")
+        print(f"every decision{', with Jev' + chr(39) + 's probabilities' if jev is not None else ''} and its outcome: {log_path}")
     if not args.no_learn and not args.synthetic:
         print(f"the brain remembers this as '{decider.learn_result(brain, result, label)}'")
     return 0

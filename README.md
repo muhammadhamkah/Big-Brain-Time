@@ -230,12 +230,16 @@ bigbrain poly markets                       # markets in the liquidity-rewards p
 caffeinate -i bigbrain poly record          # record 8 of them for 24 hours; public data, no account or key
 bigbrain poly simulate                      # replay the latest recording with you as the maker
 bigbrain poly simulate --size 20 --improve 1 --max-inventory 100
+caffeinate -i bigbrain poly record --all    # every reward market, a book a minute
+bigbrain poly simulate --size 200           # at the reward minimum size: estimated share of each reward pool
 ```
 
 * **Recording.** Order books every 2 seconds and every trade, from Polymarket's public CLOB, as JSON lines under `.brain/polymarket/`. When a poll returns only trades never seen before, some may have been missed, and that is written down as a gap.
 * **Replay.** A maker rests a bid at the best bid (or `--improve` ticks better) and, once it holds shares, an ask at the best ask; it never sells what it does not hold and stops buying at `--max-inventory`. Quotes go live `--latency` seconds after the book they reacted to. Fills come only from recorded trades: a trade through the quote fills it; a trade at its price fills it once the shares queued ahead of it have traded. The strict model, which never fills at the price, is reported beside it.
 * **The cost of being picked off.** After every fill the report records where the mid was 10 and 60 seconds later. Anything still held at the end is valued at the mid and as if sold to the bid with the taker fee.
-* **Not counted:** rebates and liquidity rewards, which depend on everyone else; the report shows the reward-eligible time and each market's daily pool.
+* **Liquidity rewards, estimated.** With `--size` at or above a market's minimum reward size, the replay scores a bid on each outcome with Polymarket's published formula (each sampled minute, every order within the maximum spread scores ((v - s) / v)^2 x size; side one is Yes bids plus No asks, side two the reverse; one-sided quoting counts a third, and only two-sided quoting counts outside 10 to 90 cents) against every other order in the recorded book, and reports the share and USDC a day as a range: the books add orders up by price, not by maker. `--reward-offset` rests the bids a set number of cents from the mid instead of at the best bid.
+* **Every market.** `bigbrain poly record --all` records every reward market, with a book a minute (rewards are sampled once a minute) into compressed files; the replay ranks markets by estimated rewards plus spread.
+* **Not counted:** maker rebates, which depend on everyone else's volume.
 
 ### Trading what survived: a strategy book
 

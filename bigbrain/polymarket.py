@@ -30,6 +30,7 @@ on Polymarket's scoring. The report shows the time quotes were eligible for rewa
 from __future__ import annotations
 
 import bisect
+import gzip
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -109,9 +110,9 @@ def parse_market(raw: dict) -> Market | None:
                   per_day, str(raw.get("end_date_iso") or ""))
 
 
-def reward_markets(limit: int = 10, lo: float = 0.10, hi: float = 0.90, fetch=_get, max_pages: int = 30) -> list[Market]:
+def reward_markets(limit: int = 10, lo: float = 0.10, hi: float = 0.90, fetch=_get, max_pages: int = 200) -> list[Market]:
     """Markets in Polymarket's liquidity-rewards program, priced away from the extremes (where a cent of spread is
-    most of the price and fills are rare), richest reward pool first."""
+    most of the price and fills are rare), richest reward pool first. ``limit=0`` returns every one."""
     out, cursor = [], "MA=="
     for _ in range(max_pages):
         page = fetch(f"/sampling-markets?next_cursor={cursor}")
@@ -123,7 +124,7 @@ def reward_markets(limit: int = 10, lo: float = 0.10, hi: float = 0.90, fetch=_g
         if cursor == END_CURSOR:
             break
     out.sort(key=lambda m: -m.reward_per_day)
-    return out[:limit]
+    return out[:limit] if limit else out
 
 
 def market_by_id(condition_id: str, fetch=_get) -> Market | None:
@@ -198,19 +199,34 @@ class Recorder:
         self.source = 0  # index into TRADE_SOURCES
         self.sampled = False
         self.log = None
+        self._fh = None
+        self._day = None
+        self._flushed = 0.0
         self.out.mkdir(parents=True, exist_ok=True)
         (self.out / "markets.json").write_text(json.dumps([asdict(m) for m in markets], indent=1))
 
     def _write(self, row: dict) -> None:
+        """Rows go to a compressed file per UTC day, flushed every half minute, so a crash loses at most that much."""
         day = datetime.fromtimestamp(row["t"], timezone.utc).strftime("%Y-%m-%d")
-        with (self.out / f"{day}.jsonl").open("a") as fh:
-            fh.write(json.dumps(row) + "\n")
+        if day != self._day:
+            self.close()
+            self._fh = gzip.open(self.out / f"{day}.jsonl.gz", "at")
+            self._day = day
+        self._fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+        if row["t"] - self._flushed >= 30:
+            self._fh.flush()
+            self._flushed = row["t"]
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh, self._day = None, None
 
     def poll_books(self) -> None:
         tokens = [t["token_id"] for m in self.markets for t in m.tokens]
         now = self.clock()
-        for start in range(0, len(tokens), 20):
-            for b in self.post("/books", [{"token_id": t} for t in tokens[start:start + 20]]) or []:
+        for start in range(0, len(tokens), 50):
+            for b in self.post("/books", [{"token_id": t} for t in tokens[start:start + 50]]) or []:
                 self._write({"type": "book", "t": now, "asset": str(b.get("asset_id")), "market": str(b.get("market", "")),
                              "bids": _levels(b.get("bids"), True, self.depth), "asks": _levels(b.get("asks"), False, self.depth),
                              "tick": _num(b.get("tick_size")) or None, "min": _num(b.get("min_order_size")) or None})
@@ -262,6 +278,12 @@ class Recorder:
             self.stats["trades"] += 1
 
     def run(self, hours: float, log=None) -> dict:
+        try:
+            return self._run(hours, log)
+        finally:
+            self.close()
+
+    def _run(self, hours: float, log=None) -> dict:
         self.log = log
         end = self.clock() + hours * 3600
         next_books, next_trade, k, last_log = 0.0, 0.0, 0, self.clock()
@@ -343,6 +365,7 @@ class SimResult:
     quoted_s: float = 0.0
     reward_s: float = 0.0
     reward_per_day: float = 0.0
+    rewards: dict = field(default_factory=dict)  # the liquidity-reward estimate, when both outcomes were recorded
 
     def as_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if k != "fills"} | {"fills": len(self.fills)}
@@ -353,17 +376,28 @@ def taker_fee(shares: float, price: float, rate: float) -> float:
     return round(shares * rate * price * (1 - price), 5)
 
 
+def read_rows(directory: str | Path) -> list[dict]:
+    """Every row of a recording (plain or compressed files), oldest first. A file cut short by a crash is read up to the cut."""
+    rows = []
+    for f in sorted(Path(directory).glob("*.jsonl*")):
+        opener = gzip.open if f.suffix == ".gz" else open
+        try:
+            with opener(f, "rt") as fh:
+                for line in fh:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except (EOFError, OSError):
+            pass
+    rows.sort(key=lambda r: r.get("ts", r["t"]) if r.get("type") == "trade" else r["t"])
+    return rows
+
+
 def load(directory: str | Path) -> tuple[list[dict], dict]:
     """Every row of a recording, oldest first, and its markets by token id."""
     d = Path(directory)
-    rows = []
-    for f in sorted(d.glob("*.jsonl")):
-        for line in f.read_text().splitlines():
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-    rows.sort(key=lambda r: r.get("ts", r["t"]) if r.get("type") == "trade" else r["t"])
+    rows = read_rows(d)
     markets = {}
     mfile = d / "markets.json"
     if mfile.exists():
@@ -483,15 +517,96 @@ def markout(fills: list[Fill], attr: str = "mid60") -> float | None:
     return sum(vals) / shares if shares else None
 
 
-def run(directory: str | Path, both: bool = False, **kw) -> list[SimResult]:
+def _cutoff_best(levels: list, min_size: float) -> float | None:
+    """The best price with at least ``min_size`` shares resting: Polymarket's size-cutoff-adjusted midpoint ignores smaller orders."""
+    for p, sz in levels:
+        if sz >= min_size:
+            return p
+    return None
+
+
+def score(v: float, s: float, size: float) -> float:
+    """Polymarket's order score: ((v - s) / v)^2 x size, for an order s cents from the adjusted mid when v is the maximum spread."""
+    return ((v - s) / v) ** 2 * size if 0 <= s < v else 0.0
+
+
+def reward_estimate(yes: list[dict], no: list[dict], meta: dict, size: float, offset: float | None = None) -> dict:
+    """Your share of a market's liquidity rewards, sample by sample, with Polymarket's published formula.
+
+    You rest a bid on each outcome (a bid on No is an ask on Yes) at the best bid, or ``offset`` cents from the adjusted
+    mid. Each book sample scores every level within the maximum spread. Side one is bids on Yes plus asks on No, side
+    two the reverse; a maker's score is the smaller side, or a third of the larger if that is more, while the mid is
+    between 10 and 90 cents (outside, only two-sided quoting counts). The books show orders added up by price, not by
+    maker, so everyone else's total is known only within bounds: the share is reported as a range, its middle assuming
+    the competition quotes both sides evenly. Orders below the minimum size are counted as competition, so the share
+    is understated where many small orders rest."""
+    v, cut, pool = meta.get("reward_max_spread"), meta.get("reward_min_size") or 0.0, meta.get("reward_per_day") or 0.0
+    out = {"samples": 0, "eligible": 0, "share": 0.0, "share_low": 0.0, "share_high": 0.0, "per_day": 0.0, "per_day_low": 0.0, "per_day_high": 0.0}
+    if not v or size < cut:
+        return out
+    by_t = {r["t"]: r for r in no}
+    sums = [0.0, 0.0, 0.0]
+    for y in yes:
+        n = by_t.get(y["t"])
+        if n is None:
+            continue
+        yb, ya = _cutoff_best(y["bids"], cut), _cutoff_best(y["asks"], cut)
+        nb, na = _cutoff_best(n["bids"], cut), _cutoff_best(n["asks"], cut)
+        if None in (yb, ya, nb, na):
+            continue
+        out["samples"] += 1
+        my, mn = (yb + ya) / 2, (nb + na) / 2
+
+        def total(levels, mid, bids):
+            return sum(score(v, ((mid - p) if bids else (p - mid)) * 100, sz) for p, sz in levels)
+
+        t1 = total(y["bids"], my, True) + total(n["asks"], mn, False)
+        t2 = total(y["asks"], my, False) + total(n["bids"], mn, True)
+        bid_yes = yb if offset is None else my - offset / 100
+        bid_no = nb if offset is None else mn - offset / 100
+        q1, q2 = score(v, (my - bid_yes) * 100, size), score(v, (mn - bid_no) * 100, size)
+        two_sided_only = not (0.10 <= my <= 0.90)
+        mine = min(q1, q2) if two_sided_only else max(min(q1, q2), max(q1, q2) / 3)
+        if mine <= 0:
+            continue
+        out["eligible"] += 1
+        if two_sided_only:
+            central, few, many = min(t1, t2), min(t1, t2) / 2, min(t1, t2)
+        else:
+            central, few, many = max(min(t1, t2), max(t1, t2) / 3), max(t1, t2) / 3, min(t1, t2) + max(t1, t2) / 3
+        sums[0] += mine / (mine + central)
+        sums[1] += mine / (mine + many)
+        sums[2] += mine / (mine + few)
+    if out["samples"]:
+        out["share"], out["share_low"], out["share_high"] = (x / out["samples"] for x in sums)
+        out["per_day"], out["per_day_low"], out["per_day_high"] = pool * out["share"], pool * out["share_low"], pool * out["share_high"]
+    return out
+
+
+def run(directory: str | Path, both: bool = False, rewards: bool = True, reward_offset: float | None = None, **kw) -> list[SimResult]:
     rows, markets = load(directory)
-    assets = sorted({r["asset"] for r in rows if r.get("type") == "book"})
+    by_asset: dict[str, list[dict]] = {}
+    gaps: dict[str, list[dict]] = {}
+    for r in rows:  # one pass: each token's rows, in time order, and each market's gaps
+        if r.get("type") == "gap":
+            gaps.setdefault(r.get("market"), []).append(r)
+        elif r.get("asset"):
+            by_asset.setdefault(r["asset"], []).append(r)
+    del rows
     out = []
-    for a in assets:
+    for a in sorted(x for x, rs in by_asset.items() if any(r.get("type") == "book" for r in rs)):
         meta = markets.get(a, {})
         if not both and meta.get("index", 0) != 0:
             continue  # quote one outcome per market: a bid on YES is the same as an ask on NO
-        out.append(simulate(rows, a, meta=meta, **kw))
+        mine = by_asset[a] + gaps.get(meta.get("condition_id"), [])
+        mine.sort(key=lambda r: r.get("ts", r["t"]) if r.get("type") == "trade" else r["t"])
+        res = simulate(mine, a, meta=meta, **kw)
+        if rewards and meta.get("tokens"):
+            other = next((t["token_id"] for t in meta["tokens"] if t["token_id"] != a), None)
+            yes_books = [r for r in by_asset[a] if r.get("type") == "book"]
+            no_books = [r for r in by_asset.get(other, []) if r.get("type") == "book"]
+            res.rewards = reward_estimate(yes_books, no_books, meta, kw.get("size", 10.0), reward_offset)
+        out.append(res)
     return out
 
 
@@ -530,8 +645,29 @@ def format_report(results: dict[str, list[SimResult]], size: float) -> str:
             lines.append(f"  markout: 60 seconds after a fill the mid had moved {mk:+.2f} cents per share "
                          f"{'in our favour' if mk > 0 else 'against us (the cost of being picked off)'}")
     pool = sum(r.reward_per_day for r in first)
-    eligible = sum(r.reward_s for r in first) / 3600
-    lines += ["", f"not counted: maker rebates, and liquidity rewards (these markets share {pool:.0f} USDC a day among all eligible makers; "
-                  f"your quotes were reward-eligible for {eligible:.1f} market-hours)",
-              "a real maker also competes on speed: this replay assumes your quote rests where you placed it and nobody reacts to you"]
+    est = [r for r in first if r.rewards and r.rewards.get("samples")]
+    if est:
+        spread = {r.asset: r.pnl_dump / days for r in results.get("queue", first)}
+        lines += ["", f"liquidity rewards, estimated with Polymarket's scoring formula: a bid of {size:g} shares on each outcome at the best bid",
+                  "  (your share each sampled minute = your score / everyone's; the books show orders by price, not by maker, so it is a range)",
+                  f"  {'market':44} {'pool/day':>8} {'eligible':>8} {'share':>16} {'rewards/day':>18} {'+spread/day':>11}"]
+        ranked = sorted(est, key=lambda r: -(r.rewards["per_day"] + spread.get(r.asset, 0.0)))
+        for r in ranked[:40]:
+            w = r.rewards
+            lines.append(f"  {(r.question or r.asset)[:44]:44} {r.reward_per_day:8.0f} {w['eligible'] / w['samples']:8.0%} "
+                         f"{w['share']:6.1%} ({w['share_low']:.1%}-{w['share_high']:.1%}) {w['per_day']:7.2f} ({w['per_day_low']:.2f}-{w['per_day_high']:.2f}) "
+                         f"{spread.get(r.asset, 0.0):+11.2f}")
+        if len(ranked) > 40:
+            lines.append(f"  ... and {len(ranked) - 40} more")
+        tot = [sum(r.rewards[k] for r in est) for k in ("per_day", "per_day_low", "per_day_high")]
+        tot_spread = sum(spread.get(r.asset, 0.0) for r in est)
+        capital = sum(size * 2 * 0.5 for _ in est)
+        lines.append(f"  total: about {tot[0]:.2f} USDC a day in rewards (range {tot[1]:.2f} to {tot[2]:.2f}) plus {tot_spread:+.2f} from the spread, "
+                     f"quoting {len(est)} markets with roughly {capital:,.0f} USDC resting in orders")
+        lines.append("  rewards are paid on Polymarket's own sampling; this assumes your orders rest all day, are never filled away, and that others do not change their quotes because of yours")
+    else:
+        eligible = sum(r.reward_s for r in first) / 3600
+        lines += ["", f"not counted: liquidity rewards (these markets share {pool:.0f} USDC a day; your quotes were reward-eligible for {eligible:.1f} market-hours);"
+                      " to estimate your share, quote at least each market's minimum reward size (see bigbrain poly markets)"]
+    lines.append("not counted: maker rebates. A real maker also competes on speed: this replay assumes your quote rests where you placed it and nobody reacts to you")
     return "\n".join(lines)

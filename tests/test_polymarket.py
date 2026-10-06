@@ -78,7 +78,8 @@ class RecorderTests(unittest.TestCase):
         self.dir.cleanup()
 
     def rows(self):
-        return [json.loads(line) for f in Path(self.dir.name).glob("*.jsonl") for line in f.read_text().splitlines()]
+        self.rec.close()  # the recorder buffers compressed output; closing writes it out
+        return pm.read_rows(self.dir.name)
 
     def ev(self, tx, price, size, ts):
         return {"conditionId": "m1", "asset": "m1-yes", "side": "SELL", "price": price, "size": size, "timestamp": ts,
@@ -171,6 +172,67 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(stats["errors"], 1)
 
 
+class FileTests(unittest.TestCase):
+    def test_compressed_files_are_read_even_when_cut_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = pm.Recorder([pm.parse_market(raw_market("m1", 0.5))], tmp, fetch=lambda u: [], post=lambda p, b: [])
+            for i in range(200):
+                rec._write({"type": "book", "t": 1_800_000_000 + i, "asset": "x", "bids": [[0.5, 1]], "asks": [[0.6, 1]]})
+            rec.close()
+            self.assertEqual(len(pm.read_rows(tmp)), 200)
+            f = next(Path(tmp).glob("*.jsonl.gz"))
+            data = f.read_bytes()
+            f.write_bytes(data[: len(data) // 2])  # a crash mid-write
+            self.assertLess(len(pm.read_rows(tmp)), 200)
+            (Path(tmp) / "old.jsonl").write_text(json.dumps({"type": "book", "t": 1, "asset": "y", "bids": [], "asks": []}) + "\n")
+            self.assertEqual(pm.read_rows(tmp)[0]["asset"], "y")  # plain files from earlier recordings still load
+
+
+class RewardTests(unittest.TestCase):
+    META = {"reward_max_spread": 3.5, "reward_min_size": 200, "reward_per_day": 100.0}
+
+    def books(self, yb, ya, nb, na, t=0):
+        return {"type": "book", "t": t, "asset": "Y", "bids": yb, "asks": ya}, {"type": "book", "t": t, "asset": "N", "bids": nb, "asks": na}
+
+    def test_score_is_polymarkets_quadratic(self):
+        self.assertAlmostEqual(pm.score(4.5, 0, 200), 200)
+        self.assertAlmostEqual(pm.score(4.5, 1.5, 100), (3 / 4.5) ** 2 * 100)
+        self.assertEqual(pm.score(4.5, 4.5, 100), 0)
+        self.assertEqual(pm.score(4.5, -1, 100), 0)
+
+    def test_share_against_a_known_book(self):
+        y, n = self.books([[0.49, 500]], [[0.51, 500]], [[0.49, 500]], [[0.51, 500]])
+        w = pm.reward_estimate([y], [n], self.META, 200)
+        mine = ((3.5 - 1) / 3.5) ** 2 * 200
+        rest = ((3.5 - 1) / 3.5) ** 2 * 500 * 2  # Yes bids plus No asks on one side, the same on the other
+        self.assertEqual((w["samples"], w["eligible"]), (1, 1))
+        self.assertAlmostEqual(w["share"], mine / (mine + rest))
+        self.assertAlmostEqual(w["share_high"], mine / (mine + rest / 3))
+        self.assertAlmostEqual(w["share_low"], mine / (mine + rest + rest / 3))
+        self.assertAlmostEqual(w["per_day"], 100 * w["share"])
+        self.assertLess(w["share_low"], w["share"])
+        self.assertLess(w["share"], w["share_high"])
+
+    def test_too_small_or_too_far_earns_nothing(self):
+        y, n = self.books([[0.49, 500]], [[0.51, 500]], [[0.49, 500]], [[0.51, 500]])
+        self.assertEqual(pm.reward_estimate([y], [n], self.META, 100)["per_day"], 0)  # below the minimum size
+        wide_y, wide_n = self.books([[0.40, 500]], [[0.60, 500]], [[0.40, 500]], [[0.60, 500]])
+        w = pm.reward_estimate([wide_y], [wide_n], self.META, 200)  # best bid 10c from the mid: outside 3.5c
+        self.assertEqual((w["samples"], w["eligible"], w["per_day"]), (1, 0, 0))
+        close = pm.reward_estimate([wide_y], [wide_n], self.META, 200, offset=1.0)  # but resting 1c from the mid scores
+        self.assertGreater(close["per_day"], 0)
+
+    def test_small_orders_do_not_set_the_mid(self):
+        y, n = self.books([[0.50, 10], [0.48, 500]], [[0.52, 500]], [[0.48, 500]], [[0.50, 10], [0.52, 500]])
+        w = pm.reward_estimate([y], [n], self.META, 200)
+        self.assertEqual(w["eligible"], 1)  # the adjusted mid is 0.50, from the 0.48 bid and 0.52 ask
+
+    def test_unmatched_samples_are_skipped(self):
+        y, _ = self.books([[0.49, 500]], [[0.51, 500]], [[0.49, 500]], [[0.51, 500]], t=0)
+        _, n = self.books([[0.49, 500]], [[0.51, 500]], [[0.49, 500]], [[0.51, 500]], t=5)
+        self.assertEqual(pm.reward_estimate([y], [n], self.META, 200)["samples"], 0)
+
+
 class SimulateTests(unittest.TestCase):
     def test_queue_fills_then_a_trade_through_sells(self):
         rows = [book(0, [[0.50, 100]], [[0.52, 100]]),
@@ -238,6 +300,14 @@ class EndToEndTests(unittest.TestCase):
             results = pm.run(session, size=10)
             self.assertEqual([r.asset for r in results], ["m1-yes"])  # one outcome per market
             self.assertAlmostEqual(results[0].pnl_mid, 0.20)
+            both = [book(t, [[0.49, 500]], [[0.51, 500]], asset=a) for t in (10, 70) for a in ("m1-yes", "m1-no")]
+            (session / "2026-10-06b.jsonl").write_text("\n".join(json.dumps(r) for r in both))
+            big = pm.run(session, size=200)
+            self.assertEqual(big[0].rewards["samples"], 2)
+            self.assertGreater(big[0].rewards["per_day"], 0)
+            with redirect_stdout(io.StringIO()) as out200:
+                main(["--db", str(Path(tmp) / "brain.db"), "poly", "simulate", "--size", "200"])
+            self.assertIn("liquidity rewards, estimated", out200.getvalue())
             out = io.StringIO()
             with redirect_stdout(out):
                 code = main(["--db", str(Path(tmp) / "brain.db"), "poly", "simulate"])
@@ -246,6 +316,17 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("Polymarket maker replay", text)
             self.assertIn("fill model 'through'", text)
             self.assertIn("Will m1 happen?", text)
+
+    def test_record_all_uses_a_wide_recording(self):
+        many = [pm.parse_market(raw_market(f"m{i}", 0.5)) for i in range(30)]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pm, "reward_markets", return_value=many) as rm, \
+                mock.patch.object(pm.Recorder, "run", return_value={"books": 0, "trades": 0, "gaps": 0, "errors": 0}):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(main(["--db", str(Path(tmp) / "brain.db"), "poly", "record", "--all", "--hours", "0.01"]), 0)
+            self.assertEqual(rm.call_args[0][0], 0)  # every market
+            self.assertIn("books every 60s", out.getvalue())
+            self.assertIn("and 10 more", out.getvalue())
 
     def test_markets_command_handles_an_unreachable_api(self):
         err = io.StringIO()

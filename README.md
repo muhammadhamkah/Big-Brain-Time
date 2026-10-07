@@ -147,8 +147,99 @@ Rules are small functions of past candles and parameters (`bigbrain/lab.py`). Ad
 | `funding_carry` | shorting when the crowd pays to be long, and the reverse, collecting funding | 4h perps, a universe |
 | `xs_momentum` | cross-sectional momentum: long the strongest of the universe, short the weakest, market neutral | 1d, a universe |
 | `psar`, `sma_cross`, `rsi_reversion` | the textbook indicators, for calibration | anything |
+| `vwap_fade`, `sweep`, `squeeze` | the scalping setups (below) | 1m to 15m, liquid perps |
 
 The lab cannot tune a rule to catch tops and bottoms; anything that appears to has been fitted to the past, and the walk-forward is there to show it. What it can do is reject nineteen ideas in twenty cheaply, so the live book only ever trades the twentieth.
+
+### Scalping: does any small, fast edge survive the toll?
+
+A scalper takes many small trades, so its edge per trade is a few basis points, and the round-trip cost (two fees, the spread, slippage) is of the same size. Most scalping ideas fail because they lose to that cost, not because they never predict anything. `bigbrain scalp` answers both questions at once:
+
+```bash
+bigbrain scalp                                                     # three setups on BTC, ETH, SOL perps, 1m and 5m, 14 days
+bigbrain scalp --symbols top:10 --intervals 1m,5m,15m --days 30    # wider and longer
+bigbrain scalp --fee 0.0002                                        # what if every fill paid the maker fee
+bigbrain scalp --rules sweep --intervals 5m --detail               # one setup, with the full lab report
+bigbrain scalp --synthetic                                         # offline demo on fair random walks: everything should fail
+```
+
+The three setups, each with a resting stop, a resting target and a time limit, long and short (long only on spot), optionally filtered by a trend average:
+
+| setup | the idea | stop | target |
+|---|---|---|---|
+| `vwap_fade` | a close stretched `entry_z` standard deviations from the rolling VWAP that starts to turn back | `sl_atr` ATRs away | the VWAP |
+| `sweep` | a candle runs the stops beyond the last `lookback` candles' low (high) and closes back in the top (bottom) half of its range: the breakout failed | just past the wick | `tp_r` times the risk |
+| `squeeze` | after a Bollinger squeeze, a close outside the band on `vol_mult` times average volume | `sl_atr` ATRs | `tp_atr` ATRs |
+
+Each runs through the lab's grid and walk-forward on the pooled symbols. The scan prints, out of sample: trades per day, win rate, profit factor, net per trade, and the split that matters for scalping, **gross** (what the setup caught between quoted prices) against **cost** (fees, spread, slippage, funding). A setup with a real gross edge smaller than its cost is a setup that needs a cheaper venue, maker fills or a slower timeframe; a setup with no gross edge needs nothing but deleting. Every verdict and cost check becomes a lesson the brain can recall.
+
+Two guards keep the numbers honest. A setup tracks its stop, target and time limit with the simulator's own fill order, so it can never believe it is flat while the simulator holds a position. And a test runs every setup and a random-entry bracket over fair random walks built tick by tick, where nothing can earn anything: an average out of line there means look-ahead. That test is also why `--synthetic` uses its own walk. On candles whose wicks are drawn independently of the path (or that have none), a crossed stop is a stop the price keeps running through, and filling it at its level books a phantom edge of about ten basis points per trade.
+
+Expect most scans to end in "no edge". At VIP 0 perps taker fees the toll is about 12 bp per round trip, and one-minute candles rarely move far enough between a sensible stop and target to pay it. If a setup comes back "worth a look", the next step is a small paper book, not money.
+
+### A decision model on top of the brain: the decider experiment
+
+The trader's signals propose trades; something has to decide which to take. `bigbrain decide` replays months of real candles and puts four deciders in front of exactly the same proposals:
+
+| decider | sees | decides by |
+|---|---|---|
+| `take_all` | nothing | taking every signal: the baseline |
+| `beliefs` | the brain's memory | the trader's rule: skip a setup whose record in this context is losing |
+| `jev_blind` | the setup and the market, in words | [Jev](https://typesafe.ai), TypeSafe's decision model: LONG, SHORT or SKIP with probabilities |
+| `jev` | the same plus the brain's memory | Jev again, now shown this setup's record in this context, the record of fading it, and the lessons the brain recalls |
+| `llm_blind`, `llm` | the same as the two Jev deciders | a free model running on your own computer through [Ollama](https://ollama.com) (Llama, Qwen, ...), with `--llm MODEL` |
+
+```bash
+export TYPESAFE_API_KEY=...                         # from typesafe.ai; without it Jev sits out and the rest still runs
+bigbrain decide                                     # 8 majors, 15m, 120 days, the last 1000 proposals decided
+bigbrain decide --symbols top:20 --days 180 --decisions 2000
+bigbrain decide --synthetic                         # offline: random walks, where no decider should make money
+bigbrain decide --llm llama3.1:8b --decisions 300   # a free local model instead of (or beside) Jev
+```
+
+For the local model, install Ollama from ollama.com, then `ollama pull llama3.1:8b` (about 5 GB; `qwen2.5:7b` is a good alternative). It is shown exactly what Jev is shown and must answer with one of the same three choices, constrained to that form by Ollama. A laptop answers a question in a second or more, so start with a few hundred decisions; answers are cached, so a rerun is free.
+
+Jev cannot be trained: it is one hosted model, every call starts fresh, and it knows only the state it is handed. So the learning lives in the brain. Every proposal is graded when its trade would have closed (taken or not, so every decider sees the same memory), its outcome joins the record for that setup and context, and every ten trades the brain rewrites its lesson about it. `jev` against `jev_blind` is what the memory is worth; both against `take_all` and against zero is whether the decisions are worth anything; `beliefs` asks whether a plain rule on the same memory does as well for free. The report also shows the gain by quarter, to answer the question that matters most: does it get better as memory grows?
+
+The guards: an outcome enters memory only after its exit candle; Jev never sees a symbol or a date, so it cannot lean on anything it remembers about a market's history; only evergreen knowledge (concepts, papers, articles) is recalled from the main brain, never its lessons, some of which were written after the replayed candles; every number is computed in code and handed over as words, because Jev does not do arithmetic; and every standard error is computed across days, because trades open on the same day ride the same market. Without that last one, a single falling week makes any long signal look "clearly losing" with a t-statistic of four. Jev's answers are cached under `.brain/decider/`, so a rerun is free, and every decision is logged there with its probabilities and outcome.
+
+### Studying past papers: training a decision model on years of trades
+
+Jev cannot be trained, but [Laya](https://huggingface.co/convaiinnovations/laya) (Convai Innovations, Apache 2.0, about 1 GB, runs on a Mac) can. `bigbrain study` treats years of history like past exam papers: the model studies thousands of old trade proposals with what actually happened, then sits exams on stretches of time it never studied. Only the exams count.
+
+```bash
+pip install -e ".[laya]"                  # PyTorch and Laya; the model downloads on first use
+bigbrain study --smoke                    # a few minutes: proves Laya trains and answers on this machine
+bigbrain study --practice                 # practice papers with a hidden rule: can the learners find it?
+bigbrain study                            # 5 years of 15m candles on 8 majors, three exams (hours on a Mac)
+bigbrain study --learners rules           # the simple-rules learner alone, in a couple of minutes
+```
+
+* **Past papers.** Every signal the trader's playbook fired, described in words (the setup, the market, and the brain's record of that setup up to that moment), never with a symbol or a date.
+* **The answer key** is not one right answer: each of LONG, SHORT and SKIP gets a probability that grows with what it would have earned after costs, so a trade that made 80 bp says "take it" firmly and one that made 3 bp barely leans. Laya is trained on these soft targets exactly as its own Apple-silicon script trains it.
+* **Exams.** The first 40% of the timeline is study only; the rest is cut into exams. Each exam is sat by a fresh copy trained only on trades that had closed before the exam began.
+* **Classmates.** `take_all`, `beliefs`, and `rules`: simple rules learned from the same papers ("a long signal while momentum is positive and rising: take it"), adopted only at three standard errors across days because many candidate rules are checked. If Laya cannot beat the simple rules, it has added nothing.
+* **A test of the test.** `--practice` plants a rule in synthetic papers. The rules learner finds it and makes money on every exam; on random walks it adopts no rules at all. A learner that cannot find a planted rule will not find a real one.
+
+### Polymarket market making: record first, replay, then decide
+
+On Polymarket a maker pays no fee and earns rebates, while a taker pays up to 1.75% of the notional at 50 cents. So "a tiny profit, many times a day, without paying fees" means market making: rest a buy just under the price and a sell just over it, and earn the gap when both fill. The danger is the other side of each fill: resting orders are hit most often when someone knows more, and the price keeps going. Only data can say whether the gap beats that.
+
+```bash
+bigbrain poly markets                       # markets in the liquidity-rewards program, their reward rules
+caffeinate -i bigbrain poly record          # record 8 of them for 24 hours; public data, no account or key
+bigbrain poly simulate                      # replay the latest recording with you as the maker
+bigbrain poly simulate --size 20 --improve 1 --max-inventory 100
+caffeinate -i bigbrain poly record --all    # every reward market, a book a minute
+bigbrain poly simulate --size 200           # at the reward minimum size: estimated share of each reward pool
+```
+
+* **Recording.** Order books every 2 seconds and every trade, from Polymarket's public CLOB, as JSON lines under `.brain/polymarket/`. When a poll returns only trades never seen before, some may have been missed, and that is written down as a gap.
+* **Replay.** A maker rests a bid at the best bid (or `--improve` ticks better) and, once it holds shares, an ask at the best ask; it never sells what it does not hold and stops buying at `--max-inventory`. Quotes go live `--latency` seconds after the book they reacted to. Fills come only from recorded trades: a trade through the quote fills it; a trade at its price fills it once the shares queued ahead of it have traded. The strict model, which never fills at the price, is reported beside it.
+* **The cost of being picked off.** After every fill the report records where the mid was 10 and 60 seconds later. Anything still held at the end is valued at the mid and as if sold to the bid with the taker fee.
+* **Liquidity rewards, estimated.** With `--size` at or above a market's minimum reward size, the replay scores a bid on each outcome with Polymarket's published formula (each sampled minute, every order within the maximum spread scores ((v - s) / v)^2 x size; side one is Yes bids plus No asks, side two the reverse; one-sided quoting counts a third, and only two-sided quoting counts outside 10 to 90 cents) against every other order in the recorded book, and reports the share and USDC a day as a range: the books add orders up by price, not by maker. `--reward-offset` rests the bids a set number of cents from the mid instead of at the best bid.
+* **Every market.** `bigbrain poly record --all` records every reward market, with a book a minute (rewards are sampled once a minute) into compressed files; the replay ranks markets by estimated rewards plus spread.
+* **Not counted:** maker rebates, which depend on everyone else's volume.
 
 ### Trading what survived: a strategy book
 
@@ -221,6 +312,10 @@ bigbrain/
   postmortem.py       lenses that explain each closed trade, the belief table, post-mortem and summary lessons
   exits.py            exit learning: counterfactual exits on every trade, per-signal exit policies
   lab.py              the lab: honest simulator, rule grid with plateau score, walk-forward, verdicts the brain keeps
+  scalp.py            scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) and the scan that says where their edge went
+  decider.py          the decider experiment: Jev (TypeSafe's decision model) reading the brain's memory, against the belief rule and taking every signal
+  study.py            study: train Laya (and simple rules) on years of past trades, grade them on years they never saw
+  polymarket.py       Polymarket market making: record live books and trades, replay them with you as the maker
   strategy.py         a strategy book: a lab rule traded live with the trader's machinery, monthly refit, buy-and-hold control
   cli.py              the `bigbrain` command
   net.py              polite HTTP: curl-shaped requests, per-host rate limits, proxy support

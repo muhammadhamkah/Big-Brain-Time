@@ -640,23 +640,39 @@ def _get_json(url: str, attempts: int = 6):
             delay = min(delay * 2, 60.0)
 
 
-def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", cache_dir: str | Path | None = None, sleep: float = 0.25) -> list[Bar]:
-    """``days`` of Binance candles, paginated (1,000 per request on spot, 1,500 on perps), cached on disk per day."""
+ARCHIVE_HOST = "https://data.binance.vision"
+
+
+def _date(ms: int) -> str:
+    """The candle date of a time in milliseconds, rounded up to the minute: a candle opens at or after ``ms`` exactly
+    when its date sorts at or after this one."""
+    return datetime.fromtimestamp(-(-ms // 60000) * 60, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _months(start: int, until: int):
+    """(year, month, first ms, end ms) of each calendar month that overlaps [start, until)."""
+    d = datetime.fromtimestamp(start / 1000, tz=timezone.utc)
+    y, m = d.year, d.month
+    while True:
+        first = int(datetime(y, m, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        if first >= until:
+            return
+        y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+        yield y, m, first, int(datetime(y2, m2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        y, m = y2, m2
+
+
+def _api_klines(symbol: str, interval: str, market: str, start: int, until: int, sleep: float) -> list[Bar]:
+    """Candles opening in [start, until) from the REST API, paginated (1,000 per request on spot, 1,500 on perps)."""
     from bigbrain.ingest.market import BINANCE_HOSTS, FUTURES_HOST, parse_binance_klines
 
-    cache = None
-    if cache_dir:
-        cache = Path(cache_dir) / f"{symbol.upper()}-{market}-{interval}-{days}d-{datetime.now(timezone.utc):%Y%m%d}.json"
-        if cache.exists():
-            return [Bar(**row) for row in json.loads(cache.read_text())]
     step = INTERVAL_SECONDS[interval] * 1000
-    now_ms = int(time.time() * 1000)
-    cursor = now_ms - days * 86400 * 1000
     limit = 1500 if market == "perps" else 1000
     base = f"{FUTURES_HOST}/fapi/v1/klines" if market == "perps" else f"{BINANCE_HOSTS[0]}/api/v3/klines"
     bars: list[Bar] = []
-    while cursor < now_ms:
-        url = f"{base}?symbol={quote(symbol.upper())}&interval={interval}&startTime={cursor}&limit={limit}"
+    cursor = start
+    while cursor < until:
+        url = f"{base}?symbol={quote(symbol.upper())}&interval={interval}&startTime={cursor}&endTime={until - 1}&limit={limit}"
         chunk = parse_binance_klines(_get_json(url))
         if not chunk:
             break
@@ -665,15 +681,127 @@ def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", c
         if len(chunk) < limit:
             break
         time.sleep(sleep)
-    seen, unique = set(), []
-    for b in bars:
-        if b.date not in seen:
-            seen.add(b.date)
-            unique.append(b)
-    if cache:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps([b.__dict__ for b in unique]))
-    return unique
+    return bars
+
+
+def _archive_month(symbol: str, interval: str, market: str, year: int, month: int) -> list[Bar]:
+    """One calendar month of candles from Binance's public archive (data.binance.vision): one file instead of six to
+    nine API requests, and it does not count against the API's request weight. Raises when the file is not there
+    (before the listing, or a month not yet published)."""
+    import csv
+    import io
+    import zipfile
+
+    from bigbrain.ingest.market import parse_binance_klines
+    from bigbrain.net import http_get
+
+    name = f"{symbol.upper()}-{interval}-{year:04d}-{month:02d}"
+    kind = "futures/um" if market == "perps" else "spot"
+    body = http_get(f"{ARCHIVE_HOST}/data/{kind}/monthly/klines/{symbol.upper()}/{interval}/{name}.zip")
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        text = z.read(z.namelist()[0]).decode("utf-8")
+    rows = []
+    for row in csv.reader(io.StringIO(text)):
+        if not row or not row[0].strip().isdigit():
+            continue  # the header row of newer files
+        opened = int(row[0])
+        if opened > 10**14:
+            opened //= 1000  # spot files from 2025 on are in microseconds
+        rows.append([opened, *row[1:]])
+    return parse_binance_klines(rows)
+
+
+def _fetch_range(symbol: str, interval: str, market: str, start: int, until: int, sleep: float, archive: bool) -> list[Bar]:
+    """Candles opening in [start, until): whole months from the archive, the rest (and any month it lacks) from the API."""
+    step = INTERVAL_SECONDS[interval] * 1000
+    bars: list[Bar] = []
+    gaps: list[tuple[int, int]] = []
+    gap_from = start
+    if archive:
+        for year, month, _, month_end in _months(start, until):
+            if month_end > until:
+                break  # the month still under way is not archived
+            try:
+                got = _archive_month(symbol, interval, market, year, month)
+            except Exception:
+                got = []  # not published, or not listed yet: the API covers it
+            got = [b for b in got if b.date >= _date(start)]
+            if not got:
+                continue
+            first = _ms(got[0].date)
+            if first > gap_from:
+                gaps.append((gap_from, first))
+            bars += got
+            gap_from = _ms(got[-1].date) + step
+    if gap_from < until:
+        gaps.append((gap_from, until))
+    for lo, hi in gaps:
+        bars += _api_klines(symbol, interval, market, lo, hi, sleep)
+    return bars
+
+
+def _candle_cache(cache_dir: str | Path, symbol: str, market: str, interval: str) -> Path:
+    return Path(cache_dir) / f"{symbol.upper()}-{market}-{interval}.json"
+
+
+def _legacy_caches(cache_dir: str | Path, symbol: str, market: str, interval: str) -> list[tuple[int, Path]]:
+    """Files from before the cache kept candles across days (SYMBOL-market-interval-<days>d-<YYYYMMDD>.json), each with
+    the time it is complete from, counted from the end of the day it was fetched (the latest it could have started)."""
+    import re
+
+    pattern = re.compile(rf"{re.escape(symbol.upper())}-{re.escape(market)}-{re.escape(interval)}-(\d+)d-(\d{{8}})\.json$")
+    found = []
+    for path in Path(cache_dir).glob(f"{symbol.upper()}-{market}-{interval}-*d-*.json"):
+        m = pattern.match(path.name)
+        if m:
+            fetched = int(datetime.strptime(m.group(2), "%Y%m%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+            found.append((fetched + 86400 * 1000 - int(m.group(1)) * 86400 * 1000, path))
+    return found
+
+
+def _load_candles(cache_dir: str | Path, symbol: str, market: str, interval: str) -> tuple[int | None, list[Bar]]:
+    """What is saved for this market: the time it is complete from, and its candles. With no cache yet, the widest of
+    the old per-day files seeds it, so the switch does not download everything again."""
+    path = _candle_cache(cache_dir, symbol, market, interval)
+    if path.exists():
+        saved = json.loads(path.read_text())
+        return saved["from"], [Bar(**row) for row in saved["bars"]]
+    legacy = _legacy_caches(cache_dir, symbol, market, interval)
+    if not legacy:
+        return None, []
+    complete_from, oldest = min(legacy, key=lambda item: item[0])
+    return complete_from, [Bar(**row) for row in json.loads(oldest.read_text())]
+
+
+def fetch_history(symbol: str, interval: str, days: int, market: str = "spot", cache_dir: str | Path | None = None,
+                  sleep: float = 0.25, archive: bool = True) -> list[Bar]:
+    """``days`` of Binance candles: whole past months from Binance's archive, the rest from the API. With a cache, every
+    candle fetched is kept per symbol, market and interval, and a later run fetches only what is newer (or older) than
+    what is saved. The newest saved candle is fetched again, since it may still have been open."""
+    step = INTERVAL_SECONDS[interval] * 1000
+    now_ms = int(time.time() * 1000)
+    start = now_ms - days * 86400 * 1000
+    complete_from, saved = _load_candles(cache_dir, symbol, market, interval) if cache_dir else (None, [])
+    by_date = {b.date: b for b in saved}
+    if not saved or complete_from is None or complete_from > start:
+        until = _ms(saved[0].date) if saved else now_ms + step
+        for b in _fetch_range(symbol, interval, market, start, until, sleep, archive):
+            by_date.setdefault(b.date, b)
+        complete_from = start if complete_from is None else min(complete_from, start)
+    if saved:
+        for b in _fetch_range(symbol, interval, market, _ms(saved[-1].date), now_ms + step, sleep, archive):
+            by_date[b.date] = b
+    bars = [by_date[d] for d in sorted(by_date)]
+    if cache_dir and bars:
+        path = _candle_cache(cache_dir, symbol, market, interval)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"from": complete_from, "bars": [b.__dict__ for b in bars]}))
+        tmp.replace(path)
+        for _, old in _legacy_caches(cache_dir, symbol, market, interval):
+            old.unlink(missing_ok=True)  # everything in it is in the new cache
+    first = _date(start)
+    return [b for b in bars if b.date >= first]
 
 
 def fetch_funding_history(symbol: str, interval: str, days: int, cache_dir: str | Path | None = None, sleep: float = 0.25) -> dict[str, float]:
@@ -857,3 +985,6 @@ def format_report(report: dict, symbol: str, interval: str, top: int = 10) -> st
             lines.append(f"  benchmark, just holding the universe over the same span: net {bh['net_return']:+.1%}, maxDD {bh['max_drawdown']:.1%}  (a long-only rule must beat this to be worth anything)")
     lines += ["", f"verdict: {report['verdict']}. {report['sentence']}"]
     return "\n".join(lines)
+
+
+from bigbrain import scalp as _scalp  # noqa: E402,F401  registers the scalping setups as lab rules

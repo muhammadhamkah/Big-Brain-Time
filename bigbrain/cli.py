@@ -616,6 +616,280 @@ def cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scalp(args: argparse.Namespace) -> int:
+    from bigbrain import lab, scalp
+
+    rules = [r.strip() for r in args.rules.split(",") if r.strip()]
+    unknown = [r for r in rules if r not in lab.RULES]
+    if unknown:
+        print(f"unknown setup {', '.join(unknown)}; scalping setups: {', '.join(scalp.SCALP_RULES)} (any lab rule works)", file=sys.stderr)
+        return 2
+    intervals = [i.strip() for i in args.intervals.split(",") if i.strip()]
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    brain = open_brain(args.db)
+    cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
+    by_interval: dict = {}
+    if args.synthetic:
+        label = "synthetic"
+        for k, interval in enumerate(intervals):
+            by_interval[interval] = {f"WALK{j}": scalp.random_walk(f"WALK{j}", n=args.candles, seed=11 + 7 * j + k) for j in range(3)}
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        label = symbols[0] if len(symbols) == 1 else f"{len(symbols)} pairs"
+        for interval in intervals:
+            print(f"fetching {args.days} days of {interval} candles for {len(symbols)} symbol{'s' if len(symbols) != 1 else ''} from Binance {args.market} ...", flush=True)
+            markets, _ = lab.fetch_universe(symbols, interval, args.days, args.market, cache_dir=cache, workers=args.workers, log=print)
+            if markets:
+                by_interval[interval] = markets
+        if not by_interval:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+    print(f"scanning {len(rules)} setup{'s' if len(rules) != 1 else ''} on {', '.join(by_interval)} ...", flush=True)
+    try:
+        rows = scalp.scan(by_interval, costs, rules, long_only=args.market == "spot", folds=args.folds, workers=args.workers, log=print)
+    except ValueError as exc:
+        print(f"{exc}; fetch more history (--days) or use a shorter interval", file=sys.stderr)
+        return 1
+    print()
+    print(scalp.format_scan(rows, costs, f"{label} on Binance {args.market}" if not args.synthetic else "synthetic random walks (no edge exists here by construction)"))
+    if args.detail:
+        for r in rows:
+            print("\n" + lab.format_report(r["report"], label, r["interval"], top=5))
+    if not args.no_learn and not args.synthetic:
+        scalp.learn_scan(brain, rows, label, args.days)
+        print(f"\nthe brain remembers {len(rows)} scalp verdicts and their cost checks")
+    return 0
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    import os
+
+    from bigbrain import decider, lab, scalp
+
+    wanted = [d.strip() for d in args.deciders.split(",") if d.strip()]
+    unknown = [d for d in wanted if d not in decider.DECIDERS]
+    if unknown:
+        print(f"unknown decider {', '.join(unknown)}; deciders: {', '.join(decider.DECIDERS)}", file=sys.stderr)
+        return 2
+    if "take_all" not in wanted:
+        wanted.insert(0, "take_all")  # the baseline every comparison needs
+    if args.llm:
+        wanted += [d for d in ("llm_blind", "llm") if d not in wanted]
+    cache_dir = Path(args.db).parent / "decider" if args.db != ":memory:" else None
+    models: dict = {}
+    if any(d.startswith("jev") for d in wanted):
+        if not os.environ.get("TYPESAFE_API_KEY"):
+            print("TYPESAFE_API_KEY is not set, so Jev sits this one out (get a key at typesafe.ai, then: export TYPESAFE_API_KEY=...)")
+            wanted = [d for d in wanted if not d.startswith("jev")]
+        else:
+            models["jev"] = decider.Jev(cache=cache_dir / "jev-cache.jsonl" if cache_dir else None)
+    if any(d.startswith("llm") for d in wanted):
+        if not args.llm:
+            print("the llm deciders need a local model: add --llm llama3.1:8b (or any model Ollama has)", file=sys.stderr)
+            return 2
+        models["llm"] = decider.Ollama(args.llm, args.ollama_url, cache=cache_dir / "ollama-cache.jsonl" if cache_dir else None)
+        print(f"local model: {args.llm} through Ollama at {args.ollama_url}; expect a second or more per question on a laptop")
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    brain = open_brain(args.db)
+    if args.synthetic:
+        label = "synthetic random walks"
+        markets = {f"WALK{j}": scalp.random_walk(f"WALK{j}", n=args.candles, seed=31 + j, vol=0.004) for j in range(4)}
+        extras: dict = {}
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        label = f"{len(symbols)} Binance {args.market} pairs, {args.interval}, {args.days} days"
+        print(f"fetching {args.days} days of {args.interval} candles for {len(symbols)} symbols ...", flush=True)
+        cache = Path(brain.path).parent / "lab" if brain.path != ":memory:" else None
+        markets, extras = lab.fetch_universe(symbols, args.interval, args.days, args.market, cache_dir=cache, workers=4,
+                                             funding=args.market == "perps", log=print)
+        if not markets:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+    props = decider.proposals(markets, costs, args.interval, (extras or {}).get("funding"))
+    print(f"{len(props)} proposals from the trader's signals; replaying them in order, deciding the last {min(args.decisions, len(props))} "
+          f"with {', '.join(wanted)} ...", flush=True)
+    knowledge = brain if args.knowledge and brain.count_cells() else None
+    try:
+        result = decider.run(props, costs, wanted, args.decisions, knowledge=knowledge, workers=args.workers, log=print, models=models)
+    except (RuntimeError, ValueError) as exc:
+        print(f"stopped: {exc}", file=sys.stderr)
+        return 1
+    print()
+    print(decider.format_report(result, label))
+    for client in models.values():
+        print(f"\n{client.name} calls this run: {client.calls} (the rest came from the cache)")
+    if brain.path != ":memory:":
+        name = "decisions-synthetic.jsonl" if args.synthetic else f"decisions-{args.interval}-{args.days}d.jsonl"
+        log_path = Path(brain.path).parent / "decider" / name
+        decider.save_log(result, log_path)
+        print(f"every decision{', with the models' + chr(39) + ' probabilities' if models else ''} and its outcome: {log_path}")
+    if not args.no_learn and not args.synthetic:
+        print(f"the brain remembers this as '{decider.learn_result(brain, result, label)}'")
+    return 0
+
+
+def cmd_study(args: argparse.Namespace) -> int:
+    import random
+
+    from bigbrain import decider, lab, study
+
+    wanted = [n.strip() for n in args.learners.split(",") if n.strip()]
+    unknown = [n for n in wanted if n not in study.LEARNERS]
+    if unknown:
+        print(f"unknown learner {', '.join(unknown)}; learners: {', '.join(study.LEARNERS)}", file=sys.stderr)
+        return 2
+    if args.smoke:
+        args.practice, args.exams, args.train_size, args.epochs, args.test_size, args.practice_days = True, 1, 300, 1, 300, 200
+    brain = open_brain(args.db)
+    workdir = Path(brain.path).parent / "study" if brain.path != ":memory:" else Path(".brain") / "study"
+    learners = []
+    for name in wanted:
+        if name == "rules":
+            learners.append(study.RulesLearner())
+        elif name == "laya":
+            try:
+                learners.append(study.LayaLearner(workdir, train_size=args.train_size, epochs=args.epochs, micro_batch=args.micro_batch,
+                                                  grad_accum=args.grad_accum, train_layers=args.train_layers, device=args.device))
+            except ImportError as exc:
+                print(f"{exc}\nLaya sits this one out; the other learners still sit the exams.")
+    fee = args.fee if args.fee is not None else (0.0005 if args.market == "perps" else 0.001)
+    costs = lab.Costs(fee=fee, spread_bps=args.spread_bps, slippage_bps=args.slippage_bps)
+    if args.practice:
+        label = f"practice papers with a hidden rule ({study.PRACTICE_RULE})"
+        props = study.planted(days=args.practice_days)
+    else:
+        try:
+            symbols = lab.resolve_symbols(args.symbols, args.market)
+        except Exception as exc:
+            print(f"could not resolve the universe: {exc}", file=sys.stderr)
+            return 1
+        days = int(args.years * 365)
+        label = f"{len(symbols)} Binance {args.market} pairs, {args.interval}, {args.years:g} years"
+        print(f"fetching {days} days of {args.interval} candles for {len(symbols)} symbols (cached after the first time) ...", flush=True)
+        markets, extras = lab.fetch_universe(symbols, args.interval, days, args.market, cache_dir=Path(brain.path).parent / "lab" if brain.path != ":memory:" else None,
+                                             workers=4, funding=args.market == "perps", log=print)
+        if not markets:
+            print("no candles fetched", file=sys.stderr)
+            return 1
+        props = decider.proposals(markets, costs, args.interval, (extras or {}).get("funding"))
+    print(f"{len(props)} past papers; building what the brain knew at each one ...", flush=True)
+    examples = study.build(props)
+    try:
+        exams = study.windows(examples, exams=args.exams, study_first=args.study_first)
+    except ValueError as exc:
+        print(f"{exc}; use more history (--years) or fewer exams", file=sys.stderr)
+        return 1
+    if args.test_size:
+        for w in exams:
+            if len(w["test"]) > args.test_size:
+                w["test"] = sorted(random.Random(w["exam"]).sample(w["test"], args.test_size), key=lambda e: e.prop.date)
+    if any(lr.name == "laya" for lr in learners):
+        print(f"Laya studies up to {args.train_size} papers for {args.epochs} epochs per exam, from a fresh copy each time; on a Mac that is "
+              "tens of minutes per exam (the model, about 1 GB, downloads the first time)", flush=True)
+    result = study.sit(exams, learners, log=print)
+    print()
+    print(study.format_report(result, label))
+    if not args.no_learn and not args.practice:
+        print(f"\nthe brain remembers this as '{study.learn_result(brain, result, label)}'")
+    return 0
+
+
+def _poly_root(args: argparse.Namespace) -> Path:
+    return (Path(args.db).parent if args.db != ":memory:" else Path(".brain")) / "polymarket"
+
+
+def cmd_poly_markets(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    try:
+        markets = pm.reward_markets(args.limit)
+    except Exception as exc:
+        print(f"could not reach Polymarket: {exc}", file=sys.stderr)
+        return 1
+    total = sum(m.reward_per_day for m in markets)
+    print(f"{len(markets)} markets in the liquidity-rewards program, priced between 10 and 90 cents, richest reward pool first "
+          f"(together {total:,.0f} USDC a day):")
+    for m in markets:
+        rules = f"reward pool {m.reward_per_day:.0f}/day, quotes within {m.reward_max_spread:g}c of the mid, at least {m.reward_min_size:g} shares" \
+            if m.reward_max_spread is not None else f"reward pool {m.reward_per_day:.0f}/day"
+        print(f"  {m.tokens[0]['outcome']} {m.tokens[0]['price']:.2f}  {m.question[:70]}\n      {m.condition_id}  tick {m.tick:g}, min {m.min_size:g} shares; {rules}")
+    return 0
+
+
+def cmd_poly_record(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    try:
+        if args.market:
+            markets = [m for m in (pm.market_by_id(c) for c in args.market) if m]
+        elif args.all:
+            markets = pm.reward_markets(0, lo=0.03, hi=0.97)
+        else:
+            markets = pm.reward_markets(args.markets)
+    except Exception as exc:
+        print(f"could not reach Polymarket: {exc}", file=sys.stderr)
+        return 1
+    if not markets:
+        print("no open markets to record", file=sys.stderr)
+        return 1
+    from datetime import datetime
+
+    out = _poly_root(args) / datetime.now().strftime("%Y%m%d-%H%M")
+    many = len(markets) > 20
+    book_every = args.book_every or (60.0 if many else 2.0)  # rewards are sampled once a minute: that is all a wide recording needs
+    trade_every = args.trade_every or (0.25 if many else 1.0)
+    print(f"recording {len(markets)} markets for {args.hours:g} hours into {out} (books every {book_every:g}s, "
+          f"each market's trades every {trade_every * len(markets):.0f}s; Ctrl+C stops early and keeps what was recorded):")
+    for m in markets[:20]:
+        print(f"  {m.question[:80]}")
+    if many:
+        print(f"  ... and {len(markets) - 20} more; the files are compressed, roughly {len(markets) * 2 * 86400 / book_every * 120 / 1e6:.0f} MB a day")
+    rec = pm.Recorder(markets, out, book_every=book_every, trade_every=trade_every)
+    try:
+        stats = rec.run(args.hours, log=print)
+    except KeyboardInterrupt:
+        stats = rec.stats
+        print("\nstopped")
+    except RuntimeError as exc:
+        print(f"stopped: {exc}", file=sys.stderr)
+        return 1
+    print(f"recorded {stats['books']} books and {stats['trades']} trades ({stats['gaps']} possible gaps, {stats['errors']} failed polls) in {out}")
+    print("replay it with: bigbrain poly simulate")
+    return 0
+
+
+def cmd_poly_simulate(args: argparse.Namespace) -> int:
+    from bigbrain import polymarket as pm
+
+    if args.dir:
+        d = Path(args.dir)
+    else:
+        sessions = sorted(p for p in _poly_root(args).glob("*") if p.is_dir()) if _poly_root(args).exists() else []
+        if not sessions:
+            print("no recording yet: run bigbrain poly record first", file=sys.stderr)
+            return 1
+        d = sessions[-1]
+    kw = dict(size=args.size, improve=args.improve, max_inventory=args.max_inventory, latency=args.latency, taker_rate=args.taker_rate)
+    results = {"queue": pm.run(d, both=args.both, queue_model="queue", reward_offset=args.reward_offset, **kw),
+               "through": pm.run(d, both=args.both, queue_model="through", rewards=False, **kw)}
+    if not any(results.values()):
+        print(f"no books in {d}", file=sys.stderr)
+        return 1
+    print(f"replaying {d}")
+    print(pm.format_report(results, args.size))
+    return 0
+
+
 def cmd_calls(args: argparse.Namespace) -> int:
     from bigbrain.watch import Watcher
 
@@ -851,7 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_strategy)
 
     p = sub.add_parser("lab", help="test a trading rule honestly: parameter grid with plateau score, real costs, walk-forward, verdict")
-    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum (default psar)")
+    p.add_argument("--rule", default="psar", help="psar | sma_cross | rsi_reversion | playbook | trend_vt | funding_carry | xs_momentum | scalp | vwap_fade | sweep | squeeze (default psar)")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--symbols", default="", help="a universe: 'BTCUSDT,ETHUSDT,...' or 'top:30' (by 24h volume); trades are pooled and judged on the same dates")
     p.add_argument("--rank-at-start", action="store_true", help="with --symbols top:N, choose the N by volume at the START of the history (what was knowable then), not today's winners")
@@ -867,6 +1141,90 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=10, help="grid rows to print")
     p.add_argument("--no-learn", action="store_true", help="do not write the verdict into the brain")
     p.set_defaults(func=cmd_lab)
+
+    p = sub.add_parser("scalp", help="scan scalping setups (VWAP fade, stop-sweep reversal, squeeze breakout) honestly: walk-forward, costs, where the edge went")
+    p.add_argument("--rules", default="vwap_fade,sweep,squeeze", help="setups to scan (default all three; any lab rule works)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT", help="a list, or top:N by 24h volume; trades are pooled")
+    p.add_argument("--intervals", default="1m,5m", help="comma-separated candle intervals (default 1m,5m)")
+    p.add_argument("--days", type=int, default=14, help="history per interval (default 14 days)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"), help="perps (long and short, default) or spot (long only)")
+    p.add_argument("--fee", type=float, default=None, help="fee per side (default 0.05%% perps taker, 0.1%% spot; 0.0002 is perps maker)")
+    p.add_argument("--spread-bps", type=float, default=1.0, help="full bid-ask spread in basis points, half paid per fill (default 1)")
+    p.add_argument("--slippage-bps", type=float, default=0.5, help="slippage per fill in basis points (default 0.5: stops in a fast tape fill worse)")
+    p.add_argument("--folds", type=int, default=6)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--detail", action="store_true", help="also print each setup's full lab report")
+    p.add_argument("--synthetic", action="store_true", help="offline demo on random walks, where every setup should fail")
+    p.add_argument("--candles", type=int, default=3000, help="candles per synthetic market")
+    p.add_argument("--no-learn", action="store_true", help="do not write the verdicts into the brain")
+    p.set_defaults(func=cmd_scalp)
+
+    p = sub.add_parser("decide", help="does a decision model reading the brain's memory pick better trades? Jev vs the belief rule vs taking every signal")
+    p.add_argument("--deciders", default="take_all,beliefs,jev_blind,jev",
+                   help="take_all, beliefs, jev_blind (Jev without memory), jev (Jev with the brain's memory), llm_blind, llm (a local model)")
+    p.add_argument("--llm", default="", metavar="MODEL", help="also ask a free local model through Ollama, e.g. llama3.1:8b or qwen2.5:7b")
+    p.add_argument("--ollama-url", default="http://localhost:11434", help="where Ollama listens (default http://localhost:11434)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT", help="a list, or top:N")
+    p.add_argument("--interval", default="15m", help="candle interval (default 15m, the live trader's)")
+    p.add_argument("--days", type=int, default=120, help="history to replay (default 120 days)")
+    p.add_argument("--decisions", type=int, default=1000, help="decide the latest N proposals; earlier ones only teach memory (default 1000)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"))
+    p.add_argument("--fee", type=float, default=None, help="fee per side (default 0.05%% perps taker, 0.1%% spot)")
+    p.add_argument("--spread-bps", type=float, default=1.0)
+    p.add_argument("--slippage-bps", type=float, default=0.5)
+    p.add_argument("--workers", type=int, default=8, help="model requests in flight at once (a local model answers them in turn)")
+    p.add_argument("--no-knowledge", dest="knowledge", action="store_false", help="do not show Jev evergreen knowledge recalled from the main brain")
+    p.add_argument("--synthetic", action="store_true", help="offline run on random walks, where no decider should make money")
+    p.add_argument("--candles", type=int, default=8000, help="candles per synthetic market")
+    p.add_argument("--no-learn", action="store_true", help="do not write the result into the brain")
+    p.set_defaults(func=cmd_decide)
+
+    p = sub.add_parser("study", help="train decision models on years of past trades and grade them on years they never saw (Laya, simple rules)")
+    p.add_argument("--learners", default="rules,laya", help="rules (simple rules learned from the papers), laya (the Laya model, fine-tuned)")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT", help="a list, or top:N")
+    p.add_argument("--interval", default="15m")
+    p.add_argument("--years", type=float, default=5.0, help="history to study and examine (default 5 years)")
+    p.add_argument("--market", default="perps", choices=("spot", "perps"))
+    p.add_argument("--exams", type=int, default=3, help="unseen stretches of time to examine on (default 3)")
+    p.add_argument("--study-first", type=float, default=0.4, help="share of the timeline that is study only, before the first exam (default 0.4)")
+    p.add_argument("--train-size", type=int, default=4000, help="papers Laya studies per exam, sampled from all it may see (default 4000)")
+    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--micro-batch", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--train-layers", type=int, default=0, help="study only the top N encoder layers and the head (0 = all, as Laya's own script)")
+    p.add_argument("--device", default="auto", choices=("auto", "mps", "cuda", "cpu"))
+    p.add_argument("--test-size", type=int, default=0, help="questions per exam (default all; a sample keeps a Laya run shorter)")
+    p.add_argument("--fee", type=float, default=None)
+    p.add_argument("--spread-bps", type=float, default=1.0)
+    p.add_argument("--slippage-bps", type=float, default=0.5)
+    p.add_argument("--practice", action="store_true", help="practice papers with a hidden rule instead of market history: a learner that cannot find it will not find a real one")
+    p.add_argument("--practice-days", type=int, default=900)
+    p.add_argument("--smoke", action="store_true", help="a few minutes end to end: small practice papers, one exam, a short study (checks Laya runs)")
+    p.add_argument("--no-learn", action="store_true")
+    p.set_defaults(func=cmd_study)
+
+    poly = sub.add_parser("poly", help="Polymarket market making: list reward markets, record live books and trades, replay them as a maker").add_subparsers(dest="poly", required=True)
+    p = poly.add_parser("markets", help="markets in the liquidity-rewards program")
+    p.add_argument("--limit", type=int, default=15, help="how many to list (0 = all)")
+    p.set_defaults(func=cmd_poly_markets)
+    p = poly.add_parser("record", help="record order books and trades (no account needed); leave it running")
+    p.add_argument("--markets", type=int, default=8, help="how many reward markets to record (default 8)")
+    p.add_argument("--all", action="store_true", help="record every reward market priced between 3 and 97 cents")
+    p.add_argument("--market", action="append", default=[], metavar="CONDITION_ID", help="record this market instead (repeatable)")
+    p.add_argument("--hours", type=float, default=24.0)
+    p.add_argument("--book-every", type=float, default=None, help="seconds between order-book snapshots (default 2, or 60 for more than 20 markets)")
+    p.add_argument("--trade-every", type=float, default=None, help="seconds between trade polls; markets take turns (default 1, or 0.25 for more than 20)")
+    p.set_defaults(func=cmd_poly_record)
+    p = poly.add_parser("simulate", help="replay a recording with you as the maker")
+    p.add_argument("--dir", default="", help="a recording folder (default: the latest)")
+    p.add_argument("--size", type=float, default=10.0, help="shares per quote (default 10: one cent of spread is 0.10 USDC)")
+    p.add_argument("--improve", type=int, default=0, help="ticks better than the best bid and ask (default 0: join them)")
+    p.add_argument("--max-inventory", type=float, default=None, help="stop buying once holding this many shares (default: five times --size)")
+    p.add_argument("--latency", type=float, default=1.0, help="seconds before a new quote is live (default 1)")
+    p.add_argument("--taker-rate", type=float, default=0.07, help="fee rate for selling leftovers as a taker (default 0.07, crypto)")
+    p.add_argument("--both", action="store_true", help="quote both outcomes of every market, not just the first")
+    p.add_argument("--reward-offset", type=float, default=None, help="for the reward estimate, rest bids this many cents from the mid (default: at the best bid)")
+    p.set_defaults(func=cmd_poly_simulate)
 
     p = sub.add_parser("paper", help="paper trading accounts: equity, drawdown, trades per strategy")
     p.add_argument("--symbol")

@@ -27,10 +27,13 @@ HOST_INTERVALS: dict[str, float] = {
     "api.binance.com": 0.15,
     "fapi.binance.com": 0.15,
     "data-api.binance.vision": 0.15,
+    "data.binance.vision": 0.1,
     "www.reddit.com": 2.0,
     "oauth.reddit.com": 2.0,
     "api.github.com": 1.0,
     "raw.githubusercontent.com": 1.0,
+    "clob.polymarket.com": 0.2,
+    "data-api.polymarket.com": 0.2,
 }
 DEFAULT_INTERVAL = 1.0
 
@@ -128,6 +131,37 @@ def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 
     merged = {"Accept": "application/json"}
     merged.update(headers or {})
     return json.loads(http_get(url, timeout=timeout, headers=merged).decode("utf-8"))
+
+
+def http_post_json(url: str, payload: Any, timeout: float = 30.0, user_agent: str = USER_AGENT) -> Any:
+    """POST ``payload`` as JSON to ``url`` and return the decoded JSON reply. Raises HTTPStatusError on non-200."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError(f"only https URLs are supported: {url}")
+    host = parts.hostname or ""
+    _wait_for_host(host)
+    data = json.dumps(payload).encode("utf-8")
+    conn = _connect(host, parts.port or 443, timeout)
+    try:
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", host)
+        conn.putheader("User-Agent", user_agent)
+        conn.putheader("Accept", "application/json")
+        conn.putheader("Accept-Encoding", "gzip")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(data)))
+        conn.endheaders(data)
+        resp = conn.getresponse()
+        body = resp.read()
+        resp_headers = {k: v for k, v in resp.getheaders()}
+    finally:
+        conn.close()
+    if resp_headers.get("Content-Encoding", "").lower() == "gzip" or resp_headers.get("content-encoding", "").lower() == "gzip":
+        body = gzip.decompress(body)
+    if resp.status != 200:
+        raise HTTPStatusError(resp.status, url, resp_headers, body)
+    return json.loads(body.decode("utf-8"))
 
 
 def http_text(url: str, headers: dict[str, str] | None = None, timeout: float = 30.0) -> str:

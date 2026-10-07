@@ -27,6 +27,7 @@ HOST_INTERVALS: dict[str, float] = {
     "api.binance.com": 0.15,
     "fapi.binance.com": 0.15,
     "data-api.binance.vision": 0.15,
+    "data.binance.vision": 0.1,
     "www.reddit.com": 2.0,
     "oauth.reddit.com": 2.0,
     "api.github.com": 1.0,

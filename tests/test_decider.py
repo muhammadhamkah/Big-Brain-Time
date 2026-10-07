@@ -82,6 +82,24 @@ class MemoryTests(unittest.TestCase):
         self.assertGreater(se_days, 1.5 * se_trades)  # trades that move together are not independent evidence
         self.assertEqual(decider.record([0.01] * 20, ["one day"] * 20)["verdict"], "too few trades to judge")
 
+    def test_the_running_tally_matches_a_full_recount(self):
+        import random
+        rng = random.Random(3)
+        tally, rets, blocks = decider.Tally(), [], []
+        for i in range(3000):
+            v, b = rng.gauss(0.0004, 0.01), f"day{rng.randrange(40 + i // 50)}"
+            tally.add(v, b)
+            rets.append(v)
+            blocks.append(b)
+            if i % 97 == 0 or i < 30:
+                mean, se, k = decider.clustered(rets, blocks)
+                got = tally.clustered()
+                self.assertAlmostEqual(got[0], mean, places=12)
+                self.assertAlmostEqual(got[1], se, delta=1e-9 + 1e-7 * se)
+                self.assertEqual(got[2], k)
+                want = {"trades": len(rets), "days": k, "won": f"{sum(x > 0 for x in rets) / len(rets):.0%}"}
+                self.assertEqual({key: tally.record()[key] for key in want}, want)
+
 
 class RequestTests(unittest.TestCase):
     def setUp(self):

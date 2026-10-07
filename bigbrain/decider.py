@@ -225,21 +225,62 @@ def clustered(values: list[float], blocks: list[str]) -> tuple[float, float, int
     return mean, se, k
 
 
+class Tally:
+    """A running record of trades, kept so that adding a trade and reading the record both cost the same however many
+    trades came before: years of five-minute candles give millions of papers, and recounting every one for each
+    new paper would take days. The standard error is clustered by block (day), as in ``clustered``."""
+
+    __slots__ = ("n", "total", "wins", "block_sum", "block_n", "sq", "cross", "nsq")
+
+    def __init__(self) -> None:
+        self.n, self.total, self.wins = 0, 0.0, 0
+        self.block_sum: dict[str, float] = {}
+        self.block_n: dict[str, int] = {}
+        self.sq = self.cross = 0.0  # sums over blocks of S_b^2 and n_b * S_b, where S_b is the block's total
+        self.nsq = 0  # and of n_b^2
+
+    def add(self, value: float, block: str) -> None:
+        s, c = self.block_sum.get(block, 0.0), self.block_n.get(block, 0)
+        self.block_sum[block], self.block_n[block] = s + value, c + 1
+        self.sq += (s + value) ** 2 - s * s
+        self.cross += (c + 1) * (s + value) - c * s
+        self.nsq += 2 * c + 1
+        self.n += 1
+        self.total += value
+        self.wins += value > 0
+
+    def clustered(self) -> tuple[float, float, int]:
+        n, k = self.n, len(self.block_n)
+        if n == 0:
+            return 0.0, 0.0, 0
+        mean = self.total / n
+        if k < 2:
+            return mean, 0.0, k
+        spread = max(self.sq - 2 * mean * self.cross + mean * mean * self.nsq, 0.0)  # sum over blocks of (S_b - n_b * mean)^2
+        return mean, math.sqrt(k / (k - 1) * spread) / n, k
+
+    def record(self) -> dict:
+        """A record in words: how many trades, how often they won, the average, and whether that is evidence."""
+        n = self.n
+        if n == 0:
+            return {"trades": 0, "verdict": "no trades yet"}
+        mean, se, days = self.clustered()
+        out = {"trades": n, "days": days, "won": f"{self.wins / n:.0%}", "average": f"{mean * 1e4:+.0f} bp per trade after costs"}
+        if n < 10 or days < 5:
+            out["verdict"] = "too few trades to judge"
+            return out
+        t = mean / (se or 1e-12)
+        out["verdict"] = ("clearly profitable" if t >= 2 else "leaning profitable" if t >= 1 else "clearly losing" if t <= -2
+                          else "leaning losing" if t <= -1 else "no clear edge")
+        return out
+
+
 def record(rets: list[float], blocks: list[str]) -> dict:
     """A record in words: how many trades, how often they won, the average, and whether that is evidence."""
-    n = len(rets)
-    if n == 0:
-        return {"trades": 0, "verdict": "no trades yet"}
-    mean, se, days = clustered(rets, blocks)
-    wins = sum(1 for x in rets if x > 0) / n
-    out = {"trades": n, "days": days, "won": f"{wins:.0%}", "average": f"{mean * 1e4:+.0f} bp per trade after costs"}
-    if n < 10 or days < 5:
-        out["verdict"] = "too few trades to judge"
-        return out
-    t = mean / (se or 1e-12)
-    out["verdict"] = ("clearly profitable" if t >= 2 else "leaning profitable" if t >= 1 else "clearly losing" if t <= -2
-                      else "leaning losing" if t <= -1 else "no clear edge")
-    return out
+    tally = Tally()
+    for v, b in zip(rets, blocks):
+        tally.add(v, b)
+    return tally.record()
 
 
 class Memory:
@@ -258,6 +299,7 @@ class Memory:
         self.blocks: dict[tuple, list[str]] = {}
         self.by_signal: dict[str, list[float]] = {}
         self.signal_blocks: dict[str, list[str]] = {}
+        self.tallies: dict[tuple, Tally] = {}  # the same records, kept running: (kind, key) -> Tally
         self.pending: list[Proposal] = []  # every proposal, by the time its outcome becomes known
         self.next = 0
         self.lessons = 0
@@ -277,12 +319,17 @@ class Memory:
             self.blocks.setdefault(p.key, []).append(p.block)
             self.by_signal.setdefault(p.signal, []).append(p.take)
             self.signal_blocks.setdefault(p.signal, []).append(p.block)
+            for kind, key, value in (("take", p.key, p.take), ("fade", p.key, p.fade), ("signal", p.signal, p.take)):
+                tally = self.tallies.get((kind, key))
+                if tally is None:
+                    tally = self.tallies[(kind, key)] = Tally()
+                tally.add(value, p.block)
             if self.write_lessons and len(self.take[p.key]) % self.lesson_every == 0:
                 self._write_lesson(p.key)
 
     def _write_lesson(self, key: tuple) -> None:
         signal, regime, vol = key
-        take, fade = record(self.take[key], self.blocks[key]), record(self.fade[key], self.blocks[key])
+        take, fade = self._record("take", key), self._record("fade", key)
         title = f"Decider memory: {signal} in a {regime}, {vol} volatility"
         text = (f"When {signal} fired ({SIGNALS[signal][1]}) in a {regime} with {vol} volatility, taking the signal's side "
                 f"won {take['won']} of {take['trades']} trades and averaged {take['average']}: {take['verdict']}. "
@@ -292,13 +339,16 @@ class Memory:
         self.brain.learn("lesson", title, text, source="decider", extra_concepts=[signal, regime, f"{vol} volatility"])
         self.lessons += 1
 
+    def _record(self, kind: str, key) -> dict:
+        tally = self.tallies.get((kind, key))
+        return tally.record() if tally else Tally().record()
+
     def evidence(self, p: Proposal) -> dict:
         """What the brain hands a decider about this proposal."""
         signal, regime, vol = p.key
-        blocks = self.blocks.get(p.key, [])
-        out = {"this_setup_in_this_context": record(self.take.get(p.key, []), blocks),
-               "betting_against_it_in_this_context": record(self.fade.get(p.key, []), blocks),
-               "this_setup_in_any_context": record(self.by_signal.get(signal, []), self.signal_blocks.get(signal, []))}
+        out = {"this_setup_in_this_context": self._record("take", p.key),
+               "betting_against_it_in_this_context": self._record("fade", p.key),
+               "this_setup_in_any_context": self._record("signal", signal)}
         query = f"{signal} {regime} {vol} volatility decider memory"
         lessons = [r.cell for r in self.brain.recall(query, k=3)] if self.write_lessons else []
         if lessons:
